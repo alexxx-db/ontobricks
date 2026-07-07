@@ -2,7 +2,7 @@
   <img src="src/front/static/global/img/ontobricks-icon.svg" alt="OntoBricks Logo" width="120" height="120">
 </p>
 
-<h1 align="center">OntoBricks 0.6.0</h1>
+<h1 align="center">OntoBricks 0.6.1</h1>
 
 <p align="center">
   <strong>Knowledge Graph Builder for Databricks</strong>
@@ -83,7 +83,7 @@ scripts/start.sh
 brew install databricks            # or curl -fsSL https://databricks.com/install.sh | sh
 databricks auth login --host https://<workspace>
 
-# Edit scripts/deploy.config.sh (warehouse, registry catalog/schema,
+# Edit scripts/deploy.config.sh (CLI profile, warehouse, registry catalog/schema,
 # Lakebase project/branch/database — see the file header) and then:
 make deploy
 # Or directly: scripts/deploy.sh
