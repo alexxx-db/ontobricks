@@ -40,7 +40,7 @@ DEFAULT_APP_NAME="ontobricks-060"
 # Databricks CLI profile (`databricks auth profiles`). Leave empty to use
 # the CLI default profile. Exported as DATABRICKS_CONFIG_PROFILE for all
 # `databricks` invocations when this file is sourced (make deploy, bootstrap, …).
-DEFAULT_DATABRICKS_PROFILE="fe-vm-bcayla-demos"
+DEFAULT_DATABRICKS_PROFILE="${DEFAULT_DATABRICKS_PROFILE:-DEFAULT}"
 
 # SQL Warehouse
 DEFAULT_WAREHOUSE_ID="d2096aa075ad44a3"
