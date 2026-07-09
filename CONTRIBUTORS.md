@@ -10,12 +10,16 @@ Thank you to everyone who has contributed to OntoBricks!
 | Dermot Smyth | [@dermotsmyth-db](https://github.com/dermotsmyth-db) | Contributor |
 | Hugues Journeau | [@hourdays](https://github.com/hourdays) | Contributor |
 | Eric Poilvet | [@epoilvet](https://github.com/epoilvet) | Contributor |
+| Fiifi Botchway | [@FiifiB](https://github.com/FiifiB) | Contributor |
+
 
 ## Community Contributors
 
 | Name | GitHub | Contribution |
 |------|--------|--------------|
 | Andreas Niehaus | [@a-niehaus](https://github.com/a-niehaus) | Fix for Claude serving endpoints returning list-style `message.content` ([#107](https://github.com/databrickslabs/ontobricks/issues/107), [#109](https://github.com/databrickslabs/ontobricks/pull/109)) |
+| Ulrik Møller | [@ulsmo](https://github.com/ulsmo) | Contributor |
+| Mitul | [@kmitul](https://github.com/kmitul) | Contributor |
 
 ## How to Contribute
 
