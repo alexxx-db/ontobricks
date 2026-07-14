@@ -2,7 +2,7 @@
 
 **Release date:** 2026-07-14
 **Type:** Patch release (v0.6.1 → v0.6.2)
-**Test status:** 3003 passed, 275 skipped, 5 deselected (`uv run pytest -q -m "not scenario"`).
+**Test status:** 3007 passed, 275 skipped, 5 deselected (`uv run pytest -q -m "not scenario"`).
 
 ---
 
@@ -16,13 +16,18 @@ idle UX** (resume control moves into the L2 subnav). Developer ergonomics improv
 with **hermetic unit tests** (`.env` Lakebase vars no longer leak into pytest) and
 **PAT-based deploy** when the CLI profile is intentionally left empty.
 
-No breaking API changes. One **operational note** for existing Lakebase graphs: graphs
-built before the `object_hash` layout need a full KG rebuild (see Upgrade Notes).
+No breaking API changes. One **operational note** for existing Lakebase graphs: run a
+**full Knowledge Graph rebuild** after upgrading so companion tables migrate to the
+`object_hash` layout (automatic on build — see Upgrade Notes).
 
 ---
 
 ## Highlights
 
+- **Lakebase `object_hash` KG build fixes** — interactive managed_synced builds open
+  the graph store before VIEW creation, refresh the Lakeflow source VIEW with
+  `object_hash`, and auto-migrate legacy `__app` companion tables that still keyed
+  on full `object` text (fixes `column "object_hash" does not exist` on rebuild).
 - **Lakebase long literals ([#108](https://github.com/databrickslabs/ontobricks/issues/108))** —
   composite keys and Lakeflow sync use a generated `object_hash` so literal values
   longer than the Postgres btree index limit no longer abort triple-store sync.
@@ -62,13 +67,36 @@ indexes on `object` could not index long text columns.
   `object_hash`.
 - `docs/lakebase-graphdb.md` — document long-literal support and rebuild requirement.
 
+### Interactive managed_synced KG build (`object_hash`)
+
+KG builds on existing domains could fail with `Could not register Lakebase synced
+table: column "object_hash" does not exist` even when Lakeflow registration succeeded.
+Two root causes:
+
+1. **Warehouse VIEW** — the interactive build pipeline created the UC VIEW before
+   opening the graph store, so sync-mode resolution could skip the Lakeflow wrapper
+   that adds `object_hash` to the source VIEW.
+2. **Legacy companion table** — pre-0.6.2 `__app` tables were left in place by
+   `CREATE TABLE IF NOT EXISTS`; index DDL then referenced `object_hash` on a table
+   that still had primary key `(subject, predicate, object)`.
+
+- `src/back/objects/digitaltwin/_build_pipeline.py` — open graph store before VIEW
+  creation; treat `store.is_synced` as source of truth for wrapping; refresh source
+  VIEW with `object_hash` before `SyncedTableManager.ensure`; split companion vs
+  synced-table error messages.
+- `src/back/core/graphdb/lakebase/_companion_ddl.py` —
+  `upgrade_legacy_triple_table_to_object_hash()` migrates existing companions
+  (add generated column, drop legacy PK, re-key on `object_hash`) before indexes.
+- `tests/units/dtwin/test_build_pipeline_streaming.py`,
+  `tests/units/core/test_lakebase_flat_store.py` — regression coverage.
+
 ### Scheduled managed_synced VIEW builds ([#108](https://github.com/databrickslabs/ontobricks/issues/108))
 
 Scheduled registry builds created the warehouse VIEW without `object_hash` while Lakeflow
 keyed the synced table on that column.
 
-- `src/back/objects/digitaltwin/_build_pipeline.py` — resolve graph store before VIEW
-  creation; wrap SQL for `managed_synced`, matching the interactive DT build pipeline.
+- `src/back/objects/registry/scheduler.py` — resolve graph store before VIEW creation;
+  wrap SQL for `managed_synced` via `_view_sql_for_graph_store()`.
 
 ### Lakeflow `_sync` table indexes ([#112](https://github.com/databrickslabs/ontobricks/issues/112))
 
@@ -147,8 +175,9 @@ tables are required for this release.
 
 **Knowledge Graph graphs on Lakebase:** if your companion triple-store tables were
 created before the `object_hash` layout, run a **full Knowledge Graph rebuild** on each
-affected domain version so sync keys and indexes match the new DDL. See
-`docs/lakebase-graphdb.md` §6.4.
+affected domain version. v0.6.2 migrates legacy `__app` companions automatically during
+the build (adds `object_hash`, re-keys the PK, recreates indexes). No manual Postgres DDL
+is required. See `docs/lakebase-graphdb.md` §6.4.
 
 If you deploy with a Personal Access Token instead of a CLI OAuth profile, you can run:
 
@@ -171,6 +200,7 @@ Upgrade through v0.6.1 first (see `releases/ReleaseNotes_V0.6.1.md`), then apply
 | Area | Key files | Change type |
 |------|-----------|-------------|
 | Lakebase long literal PK | `_companion_ddl.py`, `LakebaseFlatStore.py`, `_build_pipeline.py`, `scheduler.py` | Fix |
+| `object_hash` KG build (VIEW + companion migration) | `_build_pipeline.py`, `_companion_ddl.py` | Fix |
 | Lakeflow `_sync` indexes | `_companion_ddl.py`, `ensure_synced_union_view` | Fix |
 | Claude endpoint content | `agents/engine_base.py` | Fix |
 | Lakebase alias expansion perf | `LakebaseFlatStore.py` | Enhancement |

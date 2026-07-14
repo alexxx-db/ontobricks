@@ -34,3 +34,53 @@ Modified files:
 - scripts/deploy.config.sh
 
 Tests: (same run as above — 3003 passed)
+
+## Fix managed_synced VIEW missing object_hash at Lakeflow registration
+
+Context: Deployed KG builds failed with ``Could not register Lakebase synced
+table: column "object_hash" does not exist`` when Lakeflow validated the UC
+source VIEW. v0.6.2 keys synced tables on ``object_hash``, but the interactive
+build pipeline created the warehouse VIEW before opening the graph store, so
+mode resolution could disagree with the store and skip the Lakeflow wrapper.
+
+Changes:
+
+1. src/back/objects/digitaltwin/_build_pipeline.py
+   Open the graph store before VIEW creation; treat ``store.is_synced`` as the
+   source of truth for wrapping; refresh the source VIEW with ``object_hash``
+   immediately before ``SyncedTableManager.ensure``.
+2. tests/units/dtwin/test_build_pipeline_streaming.py
+   Cover store-driven VIEW wrapping and Lakeflow source refresh; set ``parts``
+   on bare pipeline fixtures.
+
+Modified files:
+- src/back/objects/digitaltwin/_build_pipeline.py
+- tests/units/dtwin/test_build_pipeline_streaming.py
+
+Tests: uv run pytest -q -m "not scenario" → 3005 passed, 275 skipped, 5 deselected, 23 warnings in 23.69s
+
+## Migrate legacy Lakebase companion tables to object_hash
+
+Context: KG builds still failed locally with ``column "object_hash" does not exist``
+even after the VIEW-wrap fix. Logs showed Lakeflow registration succeeded
+(``Synced table already exists — reusing``) and the failure was in
+``ensure_synced_companion``: pre-0.6.2 ``__app`` tables were left in place by
+``CREATE TABLE IF NOT EXISTS``, then ``ensure_graph_indexes`` tried to index
+``object_hash`` on a table that only had ``(subject, predicate, object)``.
+
+Changes:
+
+1. src/back/core/graphdb/lakebase/_companion_ddl.py
+   Add ``upgrade_legacy_triple_table_to_object_hash`` (add generated column,
+   drop legacy PK, re-key on ``object_hash``) before index creation.
+2. src/back/objects/digitaltwin/_build_pipeline.py
+   Split synced-table vs companion error handling for clearer failure messages.
+3. tests/units/core/test_lakebase_flat_store.py
+   Unit tests for legacy companion migration DDL.
+
+Modified files:
+- src/back/core/graphdb/lakebase/_companion_ddl.py
+- src/back/objects/digitaltwin/_build_pipeline.py
+- tests/units/core/test_lakebase_flat_store.py
+
+Tests: uv run pytest -q -m "not scenario" → 3007 passed, 275 skipped, 5 deselected, 23 warnings in 20.81s
