@@ -299,6 +299,35 @@ class _BuildPipeline:
         """Return ``True`` when bulk data movement should be delegated to Lakeflow."""
         return self._is_lakebase_synced
 
+    def _sync_flags_from_store(self) -> None:
+        """Align build flags with the opened graph store (authoritative sync mode)."""
+        if self._store_is_synced():
+            if not self._is_lakebase_synced:
+                logger.warning(
+                    "[DT-BUILD %s] graph store reports managed_synced but mode "
+                    "resolution did not — using store sync_mode for VIEW/Lakeflow",
+                    self.task_id,
+                )
+            self._is_lakebase_synced = True
+
+    def _store_is_synced(self) -> bool:
+        """Return ``True`` only when the opened store is in managed_synced mode."""
+        if self.store is None:
+            return False
+        return getattr(self.store, "is_synced", False) is True
+
+    def _wrap_view_sql_for_lakeflow(self) -> bool:
+        """Return ``True`` when the warehouse VIEW must expose ``object_hash``."""
+        if self._store_is_synced():
+            return True
+        return self._lakebase_managed_synced()
+
+    def _uses_synced_pipeline(self) -> bool:
+        """Return ``True`` when the apply phase should delegate bulk sync to Lakeflow."""
+        if self._store_is_synced():
+            return True
+        return self._lakebase_managed_synced()
+
     def _count_view_triples(self) -> int:
         """Return the number of triples in the VIEW (server-side COUNT)."""
         logger.debug(
@@ -341,6 +370,10 @@ class _BuildPipeline:
 
             self._resolve_lakebase_mode()
 
+            if not self._open_store():
+                return
+            self._sync_flags_from_store()
+
             t_phase = time.time()
             if not self._create_view():
                 return
@@ -349,9 +382,6 @@ class _BuildPipeline:
 
             t_phase = time.time()
             self._announce_apply_step()
-
-            if not self._open_store():
-                return
 
             if not self._apply_full_rebuild():
                 return
@@ -495,6 +525,17 @@ class _BuildPipeline:
         )
         return True
 
+    def _view_sql_for_build(self) -> str:
+        """Return warehouse VIEW DDL, including ``object_hash`` when Lakeflow sync is active."""
+        view_sql = self.spark_sql or ""
+        if self._wrap_view_sql_for_lakeflow():
+            from back.core.graphdb.lakebase._companion_ddl import (
+                wrap_triple_view_sql_for_lakeflow,
+            )
+
+            view_sql = wrap_triple_view_sql_for_lakeflow(view_sql)
+        return view_sql
+
     def _create_view(self) -> bool:
         """Create or replace the Spark VIEW. Returns ``False`` on failure."""
         from back.objects.digitaltwin.DigitalTwin import DigitalTwin
@@ -508,8 +549,9 @@ class _BuildPipeline:
         )
         try:
             catalog, schema, vname = self.parts
+            view_sql = self._view_sql_for_build()
             view_ok, view_msg = self.source_client.create_or_replace_view(
-                catalog, schema, vname, self.spark_sql
+                catalog, schema, vname, view_sql
             )
             if not view_ok:
                 if self.is_api:
@@ -558,6 +600,56 @@ class _BuildPipeline:
             )
             self.tm.fail_task(self.task_id, f"Failed to create VIEW: {detail}")
             return False
+
+    def _ensure_lakeflow_source_view(self) -> bool:
+        """Refresh the UC source VIEW so Lakeflow PK columns exist before registration."""
+        if not self._uses_synced_pipeline():
+            return True
+        from back.objects.digitaltwin.DigitalTwin import DigitalTwin
+
+        catalog, schema, vname = self.parts
+        view_sql = self._view_sql_for_build()
+        logger.info(
+            "[DT-BUILD %s] refreshing Lakeflow source VIEW %s (object_hash required)",
+            self.task_id,
+            self.view_table,
+        )
+        try:
+            view_ok, view_msg = self.source_client.create_or_replace_view(
+                catalog, schema, vname, view_sql
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[DT-BUILD %s] failed to refresh Lakeflow source VIEW %s: %s",
+                self.task_id,
+                self.view_table,
+                exc,
+            )
+            self.tm.fail_task(
+                self.task_id,
+                f"Could not refresh Lakeflow source VIEW: {exc}",
+            )
+            return False
+        if view_ok:
+            return True
+        detail = (
+            view_msg
+            if self.is_api
+            else DigitalTwin.diagnose_view_error(
+                view_msg, self.entity_mappings, self.relationship_mappings
+            )
+        )
+        logger.error(
+            "[DT-BUILD %s] failed to refresh Lakeflow source VIEW %s: %s",
+            self.task_id,
+            self.view_table,
+            detail,
+        )
+        self.tm.fail_task(
+            self.task_id,
+            f"Could not refresh Lakeflow source VIEW: {detail}",
+        )
+        return False
 
     def _post_create_view_progress(self) -> None:
         if self.is_api:
@@ -613,7 +705,7 @@ class _BuildPipeline:
         :meth:`_apply_via_synced_pipeline` — the Lakeflow snapshot pipeline
         rewrites the synced PG table and the app does not iterate triples.
         """
-        if self._lakebase_managed_synced():
+        if self._uses_synced_pipeline():
             return self._apply_via_synced_pipeline()
 
         t_fetch = time.time()
@@ -880,6 +972,8 @@ class _BuildPipeline:
 
             # Step 3 — register/reuse the Lakebase synced table.
             t_step = time.time()
+            if not self._ensure_lakeflow_source_view():
+                return False
             logger.debug(
                 "[DT-BUILD %s] step 3/7: registering synced table %s "
                 "(source=%s sync_mode=%s)",
@@ -888,10 +982,14 @@ class _BuildPipeline:
                 self.view_table,
                 self.store.sync_table_mode,
             )
+            from back.core.graphdb.lakebase._companion_ddl import (
+                LAKEFLOW_SYNC_PRIMARY_KEY,
+            )
+
             _synced_obj = mgr.ensure(
                 synced_uc,
                 source_table_full_name=self.view_table,
-                primary_key_columns=["subject", "predicate", "object"],
+                primary_key_columns=list(LAKEFLOW_SYNC_PRIMARY_KEY),
                 sync_mode=self.store.sync_table_mode,
             )
             # ensure() may have used a fallback name (ghost control-plane state);
@@ -913,12 +1011,31 @@ class _BuildPipeline:
                 self.task_id,
                 time.time() - t_step,
             )
+        except OperationCancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[DT-BUILD %s] failed to register synced table %s: %s "
+                "(source_view=%s pg_schema=%s sync_table_mode=%s)",
+                self.task_id,
+                synced_uc,
+                exc,
+                self.view_table,
+                getattr(self.store, "graph_schema", "?"),
+                getattr(self.store, "sync_table_mode", "?"),
+            )
+            self.tm.fail_task(
+                self.task_id,
+                f"Could not register Lakebase synced table: {exc}",
+            )
+            return False
 
-            _raise_if_cancelled(self._is_cancelled)
-            _adv()  # → "Creating companion table"
+        _raise_if_cancelled(self._is_cancelled)
+        _adv()  # → "Creating companion table"
 
-            # Step 4 — create companion table in Postgres.
-            t_step = time.time()
+        # Step 4 — create companion table in Postgres.
+        t_step = time.time()
+        try:
             logger.debug(
                 "[DT-BUILD %s] step 4/7: creating companion table for %s "
                 "(pg schema=%s)",
@@ -936,18 +1053,16 @@ class _BuildPipeline:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.exception(
-                "[DT-BUILD %s] failed to register synced table %s: %s "
-                "(source_view=%s pg_schema=%s sync_table_mode=%s)",
+                "[DT-BUILD %s] failed to upgrade companion table for %s: %s "
+                "(pg_schema=%s)",
                 self.task_id,
-                synced_uc,
+                self.graph_name,
                 exc,
-                self.view_table,
                 getattr(self.store, "graph_schema", "?"),
-                getattr(self.store, "sync_table_mode", "?"),
             )
             self.tm.fail_task(
                 self.task_id,
-                f"Could not register Lakebase synced table: {exc}",
+                f"Could not prepare Lakebase companion table: {exc}",
             )
             return False
 
@@ -1382,8 +1497,24 @@ class _BuildPipeline:
             duration,
             exc,
         )
-        if self.is_api:
-            self.tm.fail_task(self.task_id, str(exc))
-        else:
-            self.tm.fail_task(self.task_id, "Triple store sync failed")
+        self.tm.fail_task(self.task_id, self._sync_failure_message(exc))
         self._record_build_run("error", error=str(exc))
+
+    def _sync_failure_message(self, exc: Exception) -> str:
+        from back.core.errors import InfrastructureError
+        from back.core.graphdb.lakebase.LakebaseFlatStore import (
+            _is_index_row_size_error,
+        )
+
+        if isinstance(exc, InfrastructureError):
+            return str(exc)
+        if _is_index_row_size_error(exc):
+            return (
+                "Triple store sync failed: a mapped literal object exceeds the "
+                "Postgres btree index size limit. Run a full Knowledge Graph rebuild "
+                "to apply the object_hash schema fix, or exclude very long text "
+                "columns from mapping."
+            )
+        if self.is_api:
+            return str(exc)
+        return f"Triple store sync failed: {exc}"
