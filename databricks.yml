@@ -139,20 +139,20 @@ variables:
   # change DEFAULT_APP_NAME there.
   app_name:
     description: "Databricks Apps name for the main FastAPI UI app"
-    default: "ontobricks-030"
+    default: "ontobricks-abacus"
   mcp_app_name:
     description: "Databricks Apps name for the MCP companion server"
-    default: "mcp-ontobricks"
+    default: "mcp-ontobricks-abacus"
 
   warehouse_id:
     description: "SQL Warehouse ID for query execution"
-    default: "d2096aa075ad44a3"
+    default: "337986b7fa599984"  # demo-genesis-warehouse
   registry_catalog:
     description: "Unity Catalog catalog for the domain registry"
-    default: "benoit_cayla"
+    default: "genie_agents"
   registry_schema:
     description: "Unity Catalog schema for the domain registry"
-    default: "ontobricks_030"
+    default: "ontobricks"
 
   # ── Lakebase resource binding (Autoscaling-only) ────────────────
   # OntoBricks targets **Lakebase Autoscaling** exclusively (the
@@ -200,10 +200,10 @@ variables:
   # ``app.yaml`` / ``src/mcp-server/app.yaml`` as ``LAKEBASE_SCHEMA``.
   lakebase_project:
     description: "Lakebase Autoscaling project id (``projects/<this>/…``)"
-    default: "ontobricks-app"
+    default: "ontobricks-abacus"
   lakebase_branch:
     description: "Branch id within the project (resource segment after ``…/branches/``, e.g. ``production``)"
-    default: "v030"
+    default: "production"
   lakebase_database_resource_segment:
     description: "Final segment of Postgres API ``name`` (``db-…``) for the Apps ``postgres.database`` path — from ``list-databases``, not ``datname``"
     # Example: row with ``status.postgres_database`` ``ontobricks_registry`` (or
@@ -221,7 +221,10 @@ variables:
     #   databricks postgres list-databases "projects/ontobricks-app/branches/production" -o json | python3 -c "import json,sys;[print(r['name'].split('/')[-1], (r.get('status')or{}).get('postgres_database')) for r in json.load(sys.stdin)]"
     #
     # Replace ``ontobricks-app`` / ``production`` with your ``lakebase_project`` / ``lakebase_branch`` when they differ.
-    default: "db-8u4l-0na72ub5sp"
+    # Not known until the database ontobricks_registry exists. scripts/deploy.sh
+    # resolves it automatically; replace this placeholder after the first
+    # deploy if you run `databricks bundle` commands directly.
+    default: "db-unresolved-run-deploy-sh"
   lakebase_registry_schema:
     description: "OntoBricks registry schema inside Postgres (``LAKEBASE_SCHEMA`` in app.yaml)"
     default: "ontobricks_registry"

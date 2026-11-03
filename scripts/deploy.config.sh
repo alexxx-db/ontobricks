@@ -36,7 +36,7 @@
 # Lowercase alphanumeric + hyphens only (becomes part of the app name
 # and the DAB target: ``dev-lakebase-<id>``).
 # Env-overridable: ``DEFAULT_INSTANCE_ID=080 make deploy``.
-DEFAULT_INSTANCE_ID="${DEFAULT_INSTANCE_ID:-09x}"
+DEFAULT_INSTANCE_ID="${DEFAULT_INSTANCE_ID:-abacus}"
 
 # Optional: force a DAB target instead of the auto ``ontobricks-<id>``.
 # Use only to keep managing a pre-INSTANCE_ID deploy whose local state
@@ -49,28 +49,32 @@ DEFAULT_INSTANCE_ID="${DEFAULT_INSTANCE_ID:-09x}"
 # Databricks CLI profile (`databricks auth profiles`). Leave empty to use
 # the CLI default profile. Exported as DATABRICKS_CONFIG_PROFILE for all
 # `databricks` invocations when this file is sourced (make deploy, bootstrap, …).
-DEFAULT_DATABRICKS_PROFILE="${DEFAULT_DATABRICKS_PROFILE-DEFAULT}"
+DEFAULT_DATABRICKS_PROFILE="${DEFAULT_DATABRICKS_PROFILE-demo-build}"
 
 # SQL Warehouse. Leave empty to use the workspace Serverless Starter Warehouse
 # (resolved at deploy time). A set id is never replaced.
-DEFAULT_WAREHOUSE_ID="d2096aa075ad44a3"
+# demo-genesis-warehouse (serverless PRO). Must stay explicit: the Serverless
+# Starter Warehouse fallback in this workspace does not start.
+DEFAULT_WAREHOUSE_ID="337986b7fa599984"
 
 # Unity Catalog
-DEFAULT_REGISTRY_CATALOG="benoit_cayla"
+DEFAULT_REGISTRY_CATALOG="genie_agents"
 # UC schema for the registry Delta objects (Knowledge Graph builds)
-DEFAULT_REGISTRY_SCHEMA="ontobricks_demo_09_repository"
+DEFAULT_REGISTRY_SCHEMA="ontobricks"
 
 # Lakebase Autoscaling project + branch
-DEFAULT_LAKEBASE_PROJECT="ontobricks-demo-09-registry"
+# New dedicated project, created by setup-lakebase.sh (instances API) if missing.
+# Fallback (app_managed sync only): "payment-integration".
+DEFAULT_LAKEBASE_PROJECT="ontobricks-abacus"
 DEFAULT_LAKEBASE_BRANCH="production"
 # Postgres database (datname) on the shared Lakebase instance — the value of
 # status.postgres_database from list-databases (underscores OK). Do NOT copy the
 # hyphenated database_id from the resource path name; those differ when the
 # datname contains underscores (API uses hyphens only in database_id / RFC-1123).
 # Each app gets its own SCHEMA inside this database.
-DEFAULT_LAKEBASE_DATABASE="ontobricks_demo_09_registry_db"
+DEFAULT_LAKEBASE_DATABASE="ontobricks_registry"
 # Postgres schema inside the Lakebase database, Each instance should have its own schema for isolation.
-DEFAULT_LAKEBASE_SCHEMA="ontobricks_demo_09_registry_sc"
+DEFAULT_LAKEBASE_SCHEMA="ontobricks_registry"
 # Example — reuse existing schema: DEFAULT_LAKEBASE_SCHEMA="ontobricks_demo"
 
 # ── 0c. Derived defaults (auto-computed — do NOT edit) ────────────────
@@ -164,7 +168,7 @@ export APP_LAKEBASE_BRANCH="${APP_LAKEBASE_BRANCH:-$LAKEBASE_BRANCH}"
 
 # Lakebase managed-synced UC catalog (leave empty to auto-resolve).
 # Intentionally NOT using :- so stale exports never bleed through.
-export APP_SYNC_UC_CATALOG=""
+export APP_SYNC_UC_CATALOG="genie_agents"
 
 # MLflow tracking URI.
 export APP_MLFLOW_TRACKING_URI="${APP_MLFLOW_TRACKING_URI:-$DEFAULT_APP_MLFLOW_TRACKING_URI}"
