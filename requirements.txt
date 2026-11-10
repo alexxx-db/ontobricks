@@ -1,6 +1,9 @@
 # OntoBricks — Databricks Apps deployment
-# Install uv plus the local project so Databricks Apps resolves
-# all runtime dependencies from pyproject.toml at build time.
-# See: https://docs.databricks.com/aws/en/generative-ai/mcp/custom-mcp
+# Only install uv here. Runtime dependencies are installed by
+# `uv run --frozen --no-install-project` (app.yaml) straight from uv.lock,
+# whose wheels are pinned to files.pythonhosted.org.
+#
+# Do NOT add `-e .`: it forces a PEP 517 isolated build that downloads the
+# `hatchling` build backend. run.py already puts src/ on sys.path, so the
+# project itself never needs installing.
 uv
--e ".[lakebase,pitfalls]"

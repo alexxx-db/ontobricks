@@ -42,6 +42,9 @@ command:
   # instead of re-locking back to the flaky proxy. Do NOT remove without also
   # pinning the container index away from pypi-proxy.dev.databricks.com.
   - "--frozen"
+  # --no-install-project: run.py puts src/ on sys.path, so the project itself
+  # never needs building (avoids fetching the hatchling build backend).
+  - "--no-install-project"
   - "--no-dev"
   - "--extra"
   - "lakebase"
