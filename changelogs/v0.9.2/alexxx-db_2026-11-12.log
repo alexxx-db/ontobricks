@@ -1,0 +1,38 @@
+## Fix stale references in Claude skills
+
+Context: Review of the project skills (.claude/skills/) surfaced three files
+that had drifted from the canonical rules and the real toolchain: the
+changelog skill documented a flat changelogs/YYYY-MM-DD.log path while
+.cursorrules requires changelogs/v<version>/<user>_<date>.log; the deploy
+skill pointed at non-existent paths and a non-existent deploy-prod target;
+the ai-feature skill referenced renamed plugin skills and a hardcoded
+user-local path.
+
+Changes:
+
+1. .claude/skills/changelog/SKILL.md
+   Path convention corrected to changelogs/vX.Y.Z/<github-user>_YYYY-MM-DD.log
+   with the version taken from pyproject.toml (matches .cursorrules).
+2. .claude/skills/deploy/SKILL.md
+   Fixed docs/deployment.md and scripts/deploy.config.sh paths, replaced the
+   non-existent databricks-authentication skill reference with
+   databricks-core/databricks-setup-local, and removed the contradictory
+   make deploy-prod suggestion from the release flow.
+3. .claude/skills/ai-feature/SKILL.md
+   Corrected plugin skill names (databricks-synthetic-data-gen,
+   databricks-mlflow-evaluation), dropped a hardcoded /Users/... path and a
+   non-existent agent-evaluation skill, and updated the stale "5 agents,
+   zero eval coverage" premise to the current 10-agent, partial-coverage
+   reality.
+
+Modified files:
+- .claude/skills/changelog/SKILL.md
+- .claude/skills/deploy/SKILL.md
+- .claude/skills/ai-feature/SKILL.md
+- changelogs/v0.9.2/alexxx-db_2026-11-12.log
+
+Tests: uv run --frozen pytest -q -m "not scenario" → 2 failed, 9650 passed,
+338 skipped in 935.6s. The 2 failures are pre-existing and unrelated:
+tests/units/settings/test_deploy_instance_id.py expects INSTANCE_ID "09x"
+while committed scripts/deploy.config.sh defaults to "abacus" (commit
+1fe10093).
