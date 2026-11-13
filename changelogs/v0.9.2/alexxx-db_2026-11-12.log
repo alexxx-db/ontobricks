@@ -182,3 +182,42 @@ Modified files:
 Tests: uv run --frozen pytest on touched areas →
 13 passed (pool + SEA suites, incl. new backoff/ping cases),
 100 passed (architecture + registry store regression).
+
+---
+
+## deploy.sh least-privilege UC wiring + instance-id test fix
+
+Context: finishing the least-privilege rollout — deploy.sh still invoked
+lakebase-perms.sh with -c only (catalog-wide ALL_PRIVILEGES), and two
+pre-existing test_deploy_instance_id failures pinned a stale demo id.
+
+Changes:
+
+1. deploy.sh
+   The Lakebase bootstrap call now passes -S "${UC_SCHEMA:-$LAKEBASE_SCHEMA}"
+   alongside -c, so deploys apply the schema-scoped grant set by default.
+   UC_SCHEMA env overrides; the re-run hint echoes the same flags.
+
+2. lakebase-perms.sh + grants.py
+   The narrow grant's catalog privileges are now USE_CATALOG + CREATE_SCHEMA
+   (not just USE_CATALOG): CREATE_SCHEMA covers the first-deploy gap where
+   the UC sync schema does not exist yet — the SP can create it via the
+   synced-tables flow and owns it. This is the actual capability
+   ALL_PRIVILEGES was standing in for.
+
+3. test_deploy_instance_id.py
+   The two failing tests hardcoded the "09x" demo id while the committed
+   deploy.config.sh defaults to "abacus". They now read DEFAULT_INSTANCE_ID
+   from the config file and assert the derivation (suffixed app names +
+   DAB target), so they verify behaviour not a particular workspace.
+
+Modified files:
+- scripts/deploy.sh
+- scripts/bootstrap/lakebase-perms.sh
+- src/back/core/databricks/lakebase/grants.py
+- docs/deployment.md
+- tests/units/settings/test_deploy_instance_id.py
+- tests/units/settings/test_lakebase_provision.py (assertion strengthened)
+
+Tests: uv run --frozen pytest on touched areas → 74 passed, 0 failed.
+The two test_deploy_instance_id failures are resolved.

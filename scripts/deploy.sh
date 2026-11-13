@@ -893,11 +893,14 @@ fi
 if $IS_LAKEBASE; then
     begin_step "Lakebase schema permissions"
     chmod +x scripts/bootstrap/lakebase-perms.sh
-    # Pass the registry catalog so bootstrap also grants UC ALL_PRIVILEGES —
-    # required for the SP to read back synced tables via the Lakebase API.
+    # Pass the registry catalog + UC schema so bootstrap grants the
+    # least-privilege UC set (USE_CATALOG + CREATE_SCHEMA on the catalog,
+    # USE_SCHEMA + SELECT on the sync schema) — required for the SP to read
+    # back synced tables via the Lakebase API. Synced tables register under
+    # <catalog>.<pg schema name> by convention. UC_SCHEMA env overrides.
     _UC_CATALOG_ARG=()
     if [[ -n "${REGISTRY_CATALOG:-}" ]]; then
-        _UC_CATALOG_ARG=(-c "$REGISTRY_CATALOG")
+        _UC_CATALOG_ARG=(-c "$REGISTRY_CATALOG" -S "${UC_SCHEMA:-$LAKEBASE_SCHEMA}")
     fi
 
     if ! scripts/bootstrap/lakebase-perms.sh \
@@ -920,7 +923,7 @@ if $IS_LAKEBASE; then
         echo "        -b $LAKEBASE_BRANCH \\"
         echo "        -d $LAKEBASE_DATABASE \\"
         echo "        -s $LAKEBASE_SCHEMA \\"
-        echo "        ${_UC_CATALOG_ARG[*]:+-c $REGISTRY_CATALOG \\}"
+        echo "        ${_UC_CATALOG_ARG[*]:+-c $REGISTRY_CATALOG -S ${UC_SCHEMA:-$LAKEBASE_SCHEMA} \\}"
         echo "        -a $APP_NAME -a $MCP_APP_NAME"
     fi
 fi

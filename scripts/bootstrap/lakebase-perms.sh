@@ -293,9 +293,13 @@ print(d.get("service_principal_client_id") or "")' 2>/dev/null || true)"
     # catalog-wide ALL_PRIVILEGES as a development shortcut.
     if [[ -n "${UC_CATALOG:-}" ]]; then
         if [[ -n "${UC_SCHEMA:-}" ]]; then
-            echo "  [$app] granting USE_CATALOG on '${UC_CATALOG}' + USE_SCHEMA,SELECT on '${UC_CATALOG}.${UC_SCHEMA}'..."
+            # USE_CATALOG+CREATE_SCHEMA covers the first-deploy case where the
+            # UC sync schema does not exist yet (the SP can then create it via
+            # the synced-tables flow and owns it); the schema-level grant
+            # covers the pre-existing schema case.
+            echo "  [$app] granting USE_CATALOG,CREATE_SCHEMA on '${UC_CATALOG}' + USE_SCHEMA,SELECT on '${UC_CATALOG}.${UC_SCHEMA}'..."
             if databricks grants update CATALOG "${UC_CATALOG}" \
-                --json "{\"changes\": [{\"principal\": \"${sp_id}\", \"add\": [\"USE_CATALOG\"]}]}" \
+                --json "{\"changes\": [{\"principal\": \"${sp_id}\", \"add\": [\"USE_CATALOG\", \"CREATE_SCHEMA\"]}]}" \
                 >/dev/null 2>&1 \
             && databricks grants update SCHEMA "${UC_CATALOG}.${UC_SCHEMA}" \
                 --json "{\"changes\": [{\"principal\": \"${sp_id}\", \"add\": [\"USE_SCHEMA\", \"SELECT\"]}]}" \

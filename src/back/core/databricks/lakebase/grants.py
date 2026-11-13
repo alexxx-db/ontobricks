@@ -213,11 +213,13 @@ def grant_uc_catalog(
 
     Two grant shapes, least-privilege first:
 
-    - ``uc_schema`` set — grant ``USE_CATALOG`` on the catalog plus
-      ``USE_SCHEMA, SELECT`` on ``<catalog>.<schema>``. ``SELECT`` on a
-      schema covers every current and future table in it, which is all the
-      app needs to read back managed synced tables. This is the right shape
-      for regulated installs.
+    - ``uc_schema`` set — grant ``USE_CATALOG, CREATE_SCHEMA`` on the
+      catalog plus ``USE_SCHEMA, SELECT`` on ``<catalog>.<schema>``.
+      ``SELECT`` on a schema covers every current and future table in it,
+      which is all the app needs to read back managed synced tables;
+      ``CREATE_SCHEMA`` lets the SP create the UC sync schema itself when
+      it does not exist yet. This is the right shape for regulated
+      installs.
     - ``uc_schema`` empty — fall back to ``ALL_PRIVILEGES`` on the catalog.
       Catalog-wide, so only acceptable as a development/onboarding
       shortcut; the schema exists by then in practice since callers pass
@@ -239,7 +241,7 @@ def grant_uc_catalog(
                     "changes": [
                         {
                             "principal": sp_id,
-                            "add": ["USE_CATALOG"]
+                            "add": ["USE_CATALOG", "CREATE_SCHEMA"]
                             if narrow
                             else ["ALL_PRIVILEGES"],
                         }

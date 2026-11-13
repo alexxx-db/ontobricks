@@ -446,6 +446,16 @@ class TestProvisioner:
         # least-privilege shape: USE_CATALOG on the catalog plus
         # USE_SCHEMA,SELECT on <catalog>.<graph schema> — two calls per app.
         assert len(api.uc_calls) == 4
+        catalog_calls = [
+            (p, b)
+            for p, b in api.uc_calls
+            if p.endswith("/catalog/my_catalog")
+        ]
+        assert len(catalog_calls) == 2
+        assert all(
+            set(b["changes"][0]["add"]) == {"USE_CATALOG", "CREATE_SCHEMA"}
+            for _, b in catalog_calls
+        )
         schema_calls = [
             (p, b)
             for p, b in api.uc_calls

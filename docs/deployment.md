@@ -695,12 +695,12 @@ The script grants:
    control-plane — applied **before** the schema exists so a first
    deploy still grants it; `deploy.sh` passes `-c $REGISTRY_CATALOG`).
    Two grant shapes: `-S/--uc-schema <schema>` grants the
-   least-privilege set — `USE_CATALOG` on the catalog plus
+   least-privilege set — `USE_CATALOG + CREATE_SCHEMA` on the catalog
+   (lets the SP create the UC sync schema on first deploy) plus
    `USE_SCHEMA, SELECT` on `<catalog>.<schema>` (covers all current and
    future synced tables); without `-S` the script falls back to
-   catalog-wide `ALL PRIVILEGES`, a development shortcut useful when
-   the UC schema does not exist yet. Re-run with `-S` once the schema
-   is known to narrow the grant.
+   catalog-wide `ALL PRIVILEGES`, a development shortcut. `deploy.sh`
+   passes `-S $LAKEBASE_SCHEMA` by default.
 3. `USAGE + CREATE` on the Postgres schema.
 4. `SELECT / INSERT / UPDATE / DELETE` on every existing table.
 5. `USAGE / SELECT / UPDATE` on every existing sequence (bigserial PKs).
@@ -1000,8 +1000,8 @@ Prefer the explicit list above for a production workspace because `ALL PRIVILEGE
 >
 > ```sql
 > -- least-privilege (production): schema-scoped readback
-> GRANT USE CATALOG           ON CATALOG `<registry_catalog>`                    TO `<app-sp>`;
-> GRANT USE SCHEMA, SELECT    ON SCHEMA  `<registry_catalog>`.`<sync_schema>`    TO `<app-sp>`;
+> GRANT USE CATALOG, CREATE SCHEMA ON CATALOG `<registry_catalog>`                TO `<app-sp>`;
+> GRANT USE SCHEMA, SELECT       ON SCHEMA  `<registry_catalog>`.`<sync_schema>`  TO `<app-sp>`;
 > -- repeat both for the MCP app SP
 >
 > -- development shortcut (pre-schema first deploys):
