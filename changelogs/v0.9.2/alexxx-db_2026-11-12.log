@@ -146,3 +146,39 @@ Full suite: uv run --frozen pytest -q -m "not scenario" -> 9649 passed,
 targeted re-run of tests/units/architecture + test_bundle_job_resource);
 the remaining two are the pre-existing test_deploy_instance_id failures
 (INSTANCE_ID "09x" vs committed "abacus" config — unrelated).
+
+---
+
+## Connection health hardening: SEA poll backoff + idle-conn ping
+
+Context: two scale/reliability items from the Databricks review —
+fixed-interval SEA polling generated needless API chatter on long-running
+statements, and the Lakebase pool lent silently-dead sockets because
+``conn.closed`` only sees locally-observed shutdowns.
+
+Changes:
+
+1. StatementExecutionWarehouse (src/back/core/databricks/)
+   Poll interval now doubles from 0.2 s and clamps at 1 s
+   (_POLL_INTERVAL_MAX_SECONDS) inside _wait_for_terminal. Short
+   statements still finish inside the first fast checks; long-running
+   ones settle into a 1 s cadence.
+
+2. LakebaseConnectionPool (src/back/core/databricks/lakebase/)
+   Idle entries now carry idle_since; on checkout a connection parked
+   longer than POOL_PING_IDLE_S (30 s, in constants.py) is verified with
+   SELECT 1 before being lent out. The ping runs outside the pool lock
+   (acquire was restructured: pick/reserve under the lock, slow work
+   outside it). A failed ping discards the connection and re-enters
+   acquire. Both pool consumers (registry + graph) share the fix.
+
+Modified files:
+- src/back/core/databricks/StatementExecutionWarehouse.py
+- src/back/core/databricks/lakebase/LakebaseConnectionPool.py
+- src/back/core/databricks/lakebase/constants.py
+- tests/back/core/databricks/test_lakebase_connection_pool.py (new)
+- tests/units/core/test_statement_execution_warehouse.py
+
+Tests: uv run --frozen pytest on touched areas →
+13 passed (pool + SEA suites, incl. new backoff/ping cases),
+100 passed (architecture + registry store regression).

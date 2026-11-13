@@ -39,6 +39,7 @@ from back.core.databricks.lakebase.constants import (
     POOL_ACQUIRE_TIMEOUT_S,
     POOL_MAX_LIFETIME_S,
     POOL_MAX_SIZE,
+    POOL_PING_IDLE_S,
 )
 from back.core.databricks.lakebase.psycopg_gate import require_psycopg
 from back.core.logging import get_logger
@@ -80,7 +81,9 @@ class LakebaseConnectionPool:
         self._max_size = max_size
         self._max_lifetime = max_lifetime
         self._cv = threading.Condition()
-        self._idle: List[Tuple[Any, float]] = []  # (conn, opened_at)
+        # (conn, opened_at, idle_since) — idle_since drives the checkout
+        # liveness ping for connections parked longer than POOL_PING_IDLE_S.
+        self._idle: List[Tuple[Any, float, float]] = []
         self._size = 0  # checked-out + idle
         self._closed = False
 
@@ -106,7 +109,7 @@ class LakebaseConnectionPool:
             self._idle.clear()
             self._size = 0
             self._cv.notify_all()
-        for conn, _ in idle:
+        for conn, *_ in idle:
             try:
                 conn.close()
             except Exception:  # noqa: BLE001
@@ -132,45 +135,66 @@ class LakebaseConnectionPool:
 
     def _acquire(self, timeout: float = POOL_ACQUIRE_TIMEOUT_S) -> Tuple[Any, float]:
         deadline = time.monotonic() + timeout
-        with self._cv:
-            while True:
-                if self._closed:
-                    raise self._error("Lakebase pool is closed")
-                # Re-use an idle connection (LIFO keeps the hottest connection
-                # on top — friendliest to TCP keep-alive).
-                while self._idle:
-                    conn, opened_at = self._idle.pop()
-                    if self._is_alive(conn, opened_at):
-                        return conn, opened_at
-                    # Stale or closed: drop and keep looking.
-                    self._size -= 1
-                    try:
-                        conn.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                # No idle: open a fresh one if we are under cap. We reserve the
-                # slot here, then release the lock to do the (potentially slow)
-                # open.
-                if self._size < self._max_size:
-                    self._size += 1
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise self._error(
-                        f"Lakebase pool exhausted after waiting "
-                        f"{timeout:.1f}s for a connection"
-                    )
-                self._cv.wait(remaining)
-        # Open outside the lock. On failure, give the slot back so other
-        # waiters are not starved by a transient outage.
-        try:
-            conn = self._open_one()
-        except Exception:
+        while True:
+            # Pick a candidate or reserve a fresh-open slot under the lock;
+            # slow work (liveness ping, connect) happens outside it.
+            candidate: Optional[Tuple[Any, float, float]] = None
+            fresh_slot = False
             with self._cv:
-                self._size -= 1
-                self._cv.notify()
-            raise
-        return conn, time.monotonic()
+                while True:
+                    if self._closed:
+                        raise self._error("Lakebase pool is closed")
+                    # Re-use an idle connection (LIFO keeps the hottest
+                    # connection on top — friendliest to TCP keep-alive).
+                    while self._idle:
+                        conn, opened_at, idle_since = self._idle.pop()
+                        if self._is_alive(conn, opened_at):
+                            candidate = (conn, opened_at, idle_since)
+                            break
+                        # Stale or closed: drop and keep looking.
+                        self._size -= 1
+                        try:
+                            conn.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if candidate is not None:
+                        break
+                    if self._size < self._max_size:
+                        self._size += 1
+                        fresh_slot = True
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise self._error(
+                            f"Lakebase pool exhausted after waiting "
+                            f"{timeout:.1f}s for a connection"
+                        )
+                    self._cv.wait(remaining)
+
+            if fresh_slot:
+                # Open outside the lock. On failure, give the slot back so
+                # other waiters are not starved by a transient outage.
+                try:
+                    return self._open_one(), time.monotonic()
+                except Exception:
+                    with self._cv:
+                        self._size -= 1
+                        self._cv.notify()
+                    raise
+
+            conn, opened_at, idle_since = candidate  # type: ignore[misc]
+            # A recently-used connection is lent without a round-trip; a
+            # parked one may be a silently dead socket (conn.closed only sees
+            # locally-observed shutdowns), so ping before lending it out.
+            if time.monotonic() - idle_since < POOL_PING_IDLE_S:
+                return conn, opened_at
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                return conn, opened_at
+            except Exception as exc:  # noqa: BLE001
+                logger.info("Idle Lakebase connection failed ping: %s", exc)
+                self._discard(conn)
 
     def _release(self, conn: Any, opened_at: float) -> None:
         with self._cv:
@@ -182,7 +206,7 @@ class LakebaseConnectionPool:
                 except Exception:  # noqa: BLE001
                     pass
                 return
-            self._idle.append((conn, opened_at))
+            self._idle.append((conn, opened_at, time.monotonic()))
             self._cv.notify()
 
     def _discard(self, conn: Any) -> None:
