@@ -200,7 +200,13 @@ class TestAppPermissionsInBundle:
             levels = {p.get("level") for p in perms}
             assert "CAN_MANAGE" in levels, f"{key} missing CAN_MANAGE"
             assert "CAN_USE" in levels, f"{key} missing CAN_USE"
-            assert any(p.get("group_name") == "users" for p in perms)
+            assert any(
+                p.get("group_name") == "${var.app_access_group}" for p in perms
+            )
+        # the variable defaults to the built-in "users" group
+        assert (
+            data["variables"]["app_access_group"]["default"] == "users"
+        )
 
     def test_each_app_declares_user_api_scopes_for_obo(self):
         data = yaml.safe_load((REPO_ROOT / "databricks.yml").read_text())

@@ -120,6 +120,9 @@ class _FakeApi:
         if method == "GET" and path.endswith("/roles"):
             return {"roles": self.roles}
 
+        if method == "POST" and path.endswith("/roles"):
+            return {"name": path + "/r-new/operations/op-1"}
+
         if path.endswith("/endpoints"):
             return {
                 "endpoints": [
@@ -173,7 +176,10 @@ def _make_provisioner(api, sql_log, *, grant_uc=False, **overrides):
     task = tm.create_task(
         name="test-provision",
         task_type="lakebase_provision",
-        steps=provision_steps(grant_uc=grant_uc),
+        steps=provision_steps(
+            grant_uc=grant_uc,
+            grant_superusers=bool(overrides.get("grant_superusers")),
+        ),
     )
     kwargs = dict(
         tm=tm,
@@ -437,10 +443,69 @@ class TestProvisioner:
             prov.run()
 
         assert task.status.value == "completed"
-        assert len(api.uc_calls) == 2  # one per app
+        # least-privilege shape: USE_CATALOG on the catalog plus
+        # USE_SCHEMA,SELECT on <catalog>.<graph schema> — two calls per app.
+        assert len(api.uc_calls) == 4
+        schema_calls = [
+            (p, b)
+            for p, b in api.uc_calls
+            if p.endswith("/schema/my_catalog.ontobricks_graph")
+        ]
+        assert len(schema_calls) == 2
+        assert all(
+            set(b["changes"][0]["add"]) == {"USE_SCHEMA", "SELECT"}
+            for _, b in schema_calls
+        )
         assert any(
-            "ALL_PRIVILEGES on catalog my_catalog" in g
+            "USE_SCHEMA+SELECT on my_catalog.ontobricks_graph" in g
             for g in task.result["granted"]
+        )
+
+    def test_superuser_step_skipped_by_default(self):
+        api = _FakeApi()
+        sql_log = []
+        prov, task, patcher = _make_provisioner(api, sql_log)
+
+        with patcher:
+            prov.run()
+
+        assert task.status.value == "completed"
+        assert "superusers" not in [s.name for s in task.steps]
+        # no Lakebase role writes and no SCIM admin lookups at all
+        assert not any(
+            "/roles" in path and method in ("POST", "PATCH")
+            for method, path, _ in api.calls
+        )
+        assert not any(
+            "/preview/scim/v2/" in path for _, path, _ in api.calls
+        )
+
+    def test_superuser_step_runs_when_opted_in(self):
+        api = _FakeApi()
+        sql_log = []
+        prov, task, patcher = _make_provisioner(
+            api,
+            sql_log,
+            grant_superusers=True,
+            operator_email="ops@example.com",
+        )
+
+        with patcher:
+            prov.run()
+
+        assert task.status.value == "completed"
+        assert "superusers" in [s.name for s in task.steps]
+        # the operator role is created and patched into DATABRICKS_SUPERUSER
+        membership = [
+            body
+            for method, path, body in api.calls
+            if method == "PATCH" and "/roles/" in path
+        ]
+        assert membership
+        assert any(
+            "DATABRICKS_SUPERUSER"
+            in ((b or {}).get("spec") or {}).get("membership_roles", [])
+            for b in membership
         )
 
 

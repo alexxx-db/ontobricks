@@ -537,7 +537,7 @@ def _check_lakebase_permissions(settings: Settings) -> Tuple[str, str]:
             _ERROR,
             "Missing Lakebase grants for role "
             f"'{cur_user}' on {cur_db}.{store.schema}: {', '.join(missing)}. "
-            "Run scripts/bootstrap-lakebase-perms.sh.",
+            "Run scripts/bootstrap/lakebase-perms.sh.",
         )
 
     return (
@@ -1146,7 +1146,7 @@ def _check_graphdb_permissions(settings: Settings) -> Tuple[str, str]:
                 f"Missing Postgres permissions on graph schema '{schema}' for role '{cur_user}': "
                 f"{', '.join(missing)}. "
                 "Run Settings → Lakebase → Permissions to grant superuser, or use "
-                "scripts/bootstrap-lakebase-perms.sh.",
+                "scripts/bootstrap/lakebase-perms.sh.",
             )
         return (
             _OK,
@@ -1436,7 +1436,7 @@ def run_diagnostics_checks(settings: Optional[Settings] = None) -> Dict[str, Any
                 "lazy table: domain_change_events (created on first domain save); "
                 "(6) The role has USAGE/CREATE on the schema + SELECT/INSERT/UPDATE/DELETE "
                 "on all tables + USAGE/SELECT/UPDATE on all sequences. "
-                "Run Settings → Registry → Initialize or scripts/bootstrap-lakebase-perms.sh "
+                "Run Settings → Registry → Initialize or scripts/bootstrap/lakebase-perms.sh "
                 "to fix permission and initialization issues."
             ),
             "checks": lb_checks,

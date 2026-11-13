@@ -13,9 +13,11 @@ set -euo pipefail
 # principal client id, and grants it the privileges OntoBricks needs:
 #
 #   - CAN_USE on the Lakebase project (control-plane, both API endpoints)
-#   - (when -c/--catalog) ALL PRIVILEGES on the UC catalog (control-plane;
-#     applied before the schema exists so a first deploy still grants it —
-#     Initialize cannot self-serve this because the app SP lacks MANAGE)
+#   - (when -c/--catalog) UC privileges on the catalog: least-privilege
+#     USE_CATALOG + USE_SCHEMA/SELECT on -S/--uc-schema, or catalog-wide
+#     ALL PRIVILEGES without -S (control-plane; applied before the schema
+#     exists so a first deploy still grants it — Initialize cannot
+#     self-serve this because the app SP lacks MANAGE)
 #   - USAGE + CREATE on the Postgres schema (data-plane)
 #   - SELECT/INSERT/UPDATE/DELETE on every existing table
 #   - USAGE/SELECT/UPDATE on every existing sequence (bigserial PKs)
@@ -78,10 +80,16 @@ INSTANCE="${INSTANCE:-ontobricks-app}"
 BRANCH="${BRANCH:-${LAKEBASE_BRANCH:-production}}"
 DATABASE="${DATABASE:-ontobricks_registry}"
 SCHEMA="${SCHEMA:-ontobricks_registry}"
-# Unity Catalog catalog name — when set the SP receives ALL PRIVILEGES on
-# the catalog so it can read back synced tables regardless of who created them.
-# Required for managed_synced mode.  Pass -c/--catalog or set the env var.
+# Unity Catalog catalog name — when set the SP receives UC privileges so it
+# can read back synced tables regardless of who created them. Required for
+# managed_synced mode.  Pass -c/--catalog or set the env var.
+# With -S/--uc-schema the grant is least-privilege: USE_CATALOG on the
+# catalog plus USE_SCHEMA + SELECT on <catalog>.<uc-schema> (covers all
+# current and future synced tables in that schema). Without it the script
+# grants catalog-wide ALL PRIVILEGES — a development shortcut that needs
+# the UC schema to not exist yet; prefer -S once the schema is known.
 UC_CATALOG="${UC_CATALOG:-}"
+UC_SCHEMA="${UC_SCHEMA:-}"
 APPS=()
 
 while [[ $# -gt 0 ]]; do
@@ -91,6 +99,7 @@ while [[ $# -gt 0 ]]; do
         -d|--database) DATABASE="$2"; shift 2 ;;
         -s|--schema)   SCHEMA="$2"; shift 2 ;;
         -c|--catalog)  UC_CATALOG="$2"; shift 2 ;;
+        -S|--uc-schema) UC_SCHEMA="$2"; shift 2 ;;
         -a|--app)      APPS+=("$2"); shift 2 ;;
         -h|--help)
             sed -n '2,32p' "$0"
@@ -274,21 +283,40 @@ print(d.get("service_principal_client_id") or "")' 2>/dev/null || true)"
         FAILED=$((FAILED+1))
     fi
 
-    # ── UC catalog ALL_PRIVILEGES (control-plane — no schema required) ──
+    # ── UC grants (control-plane — no Postgres schema required) ─────────
     # Must run BEFORE the schema guard. On a first deploy the registry
     # schema does not exist yet, so the script used to exit early and
     # never grant UC privileges; Initialize then tried (and failed) as
     # the app SP which lacks MANAGE on the catalog (#137).
+    # -S/--uc-schema selects the least-privilege shape (USE_CATALOG +
+    # USE_SCHEMA,SELECT on that UC schema); without it we fall back to
+    # catalog-wide ALL_PRIVILEGES as a development shortcut.
     if [[ -n "${UC_CATALOG:-}" ]]; then
-        echo "  [$app] granting ALL PRIVILEGES on UC catalog '${UC_CATALOG}'..."
-        if databricks grants update CATALOG "${UC_CATALOG}" \
-            --json "{\"changes\": [{\"principal\": \"${sp_id}\", \"add\": [\"ALL_PRIVILEGES\"]}]}" \
-            >/dev/null 2>&1; then
-            echo "  [$app] ✓ UC ALL_PRIVILEGES granted on catalog '${UC_CATALOG}'"
+        if [[ -n "${UC_SCHEMA:-}" ]]; then
+            echo "  [$app] granting USE_CATALOG on '${UC_CATALOG}' + USE_SCHEMA,SELECT on '${UC_CATALOG}.${UC_SCHEMA}'..."
+            if databricks grants update CATALOG "${UC_CATALOG}" \
+                --json "{\"changes\": [{\"principal\": \"${sp_id}\", \"add\": [\"USE_CATALOG\"]}]}" \
+                >/dev/null 2>&1 \
+            && databricks grants update SCHEMA "${UC_CATALOG}.${UC_SCHEMA}" \
+                --json "{\"changes\": [{\"principal\": \"${sp_id}\", \"add\": [\"USE_SCHEMA\", \"SELECT\"]}]}" \
+                >/dev/null 2>&1; then
+                echo "  [$app] ✓ UC USE_CATALOG + schema USE_SCHEMA/SELECT granted"
+            else
+                echo "  [$app] ⚠ UC grant failed (you may lack MANAGE on '${UC_CATALOG}.${UC_SCHEMA}')"
+                echo "          Run manually: databricks grants update SCHEMA ${UC_CATALOG}.${UC_SCHEMA} \\"
+                echo "            --json '{\"changes\":[{\"principal\":\"${sp_id}\",\"add\":[\"USE_SCHEMA\",\"SELECT\"]}]}'"
+            fi
         else
-            echo "  [$app] ⚠ UC catalog grant failed (you may lack MANAGE on catalog '${UC_CATALOG}')"
-            echo "          Run manually: databricks grants update CATALOG ${UC_CATALOG} \\"
-            echo "            --json '{\"changes\":[{\"principal\":\"${sp_id}\",\"add\":[\"ALL_PRIVILEGES\"]}]}'"
+            echo "  [$app] granting ALL PRIVILEGES on UC catalog '${UC_CATALOG}' (dev shortcut — use -S for least-privilege)..."
+            if databricks grants update CATALOG "${UC_CATALOG}" \
+                --json "{\"changes\": [{\"principal\": \"${sp_id}\", \"add\": [\"ALL_PRIVILEGES\"]}]}" \
+                >/dev/null 2>&1; then
+                echo "  [$app] ✓ UC ALL_PRIVILEGES granted on catalog '${UC_CATALOG}'"
+            else
+                echo "  [$app] ⚠ UC catalog grant failed (you may lack MANAGE on catalog '${UC_CATALOG}')"
+                echo "          Run manually: databricks grants update CATALOG ${UC_CATALOG} \\"
+                echo "            --json '{\"changes\":[{\"principal\":\"${sp_id}\",\"add\":[\"ALL_PRIVILEGES\"]}]}'"
+            fi
         fi
     fi
 done

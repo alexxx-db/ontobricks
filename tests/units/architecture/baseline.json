@@ -63,9 +63,9 @@
     "back/core/graphdb/lakebase/SyncedTableManager.py::SyncedTableManager": 814,
     "back/core/sqlwizard/SQLWizardService.py::SQLWizardService": 882,
     "back/core/w3c/owl/OntologyGenerator.py::OntologyGenerator": 1098,
-    "back/core/w3c/owl/OntologyParser.py::OntologyParser": 1113,
+    "back/core/w3c/owl/OntologyParser.py::OntologyParser": 1112,
     "back/core/w3c/shacl/SHACLService.py::SHACLService": 1663,
-    "back/core/w3c/sparql/SparqlTranslator.py::SparqlTranslator": 2417,
+    "back/core/w3c/sparql/SparqlTranslator.py::SparqlTranslator": 2389,
     "back/objects/digitaltwin/build/_build_pipeline.py::_BuildPipeline": 1452,
     "back/objects/domain/Domain.py::Domain": 2305,
     "back/objects/domain/settings/SettingsService.py::SettingsService": 1388,
@@ -139,7 +139,7 @@
     "back/core/w3c/owl/OntologyGenerator.py::OntologyGenerator._add_axiom": 135,
     "back/core/w3c/owl/OntologyGenerator.py::OntologyGenerator._add_class": 132,
     "back/core/w3c/owl/OntologyParser.py::OntologyParser._get_all_axiom_items": 186,
-    "back/core/w3c/owl/OntologyParser.py::OntologyParser.get_classes": 180,
+    "back/core/w3c/owl/OntologyParser.py::OntologyParser.get_classes": 179,
     "back/core/w3c/owl/OntologyParser.py::OntologyParser.get_constraints": 171,
     "back/core/w3c/r2rml/R2RMLGenerator.py::R2RMLGenerator._add_entity_mapping": 139,
     "back/core/w3c/r2rml/R2RMLGenerator.py::R2RMLGenerator._add_relationship_mapping": 213,
@@ -161,7 +161,7 @@
     "back/objects/digitaltwin/explorer/GraphFilter.py::GraphFilter.expand": 127,
     "back/objects/digitaltwin/node/NodeBusinessRuleService.py::NodeBusinessRuleService.execute": 112,
     "back/objects/digitaltwin/node/NodeContextService.py::NodeContextService._resolve_bridges": 108,
-    "back/objects/digitaltwin/node/NodeContextService.py::NodeContextService.resolve_context": 138,
+    "back/objects/digitaltwin/node/NodeContextService.py::NodeContextService.resolve_context": 134,
     "back/objects/digitaltwin/query/TwinMapping.py::TwinMapping.augment_mappings_from_config": 146,
     "back/objects/digitaltwin/query/TwinMapping.py::TwinMapping.augment_relationships_from_config": 242,
     "back/objects/digitaltwin/query/TwinMapping.py::TwinMapping.diagnose_view_error": 132,
@@ -204,11 +204,11 @@
     "back/objects/session/DomainSession.py::DomainSession.export_for_save": 121,
     "back/objects/session/DomainSession.py::DomainSession.import_from_file": 206,
     "jobs/graph_analytics_job.py::_run_analysis_stages": 112,
-    "mcp-server/server/tools.py::register_tools": 866,
+    "mcp-server/server/tools.py::register_tools": 862,
     "shared/fastapi/health.py::_check_lakebase_permissions": 113,
     "shared/fastapi/health.py::_check_lakebase_registry_tables": 110,
     "shared/fastapi/health.py::run_diagnostics_checks": 226,
     "shared/fastapi/health.py::run_readiness_checks": 107,
-    "shared/fastapi/main.py::PermissionMiddleware.dispatch": 186
+    "shared/fastapi/main.py::PermissionMiddleware.dispatch": 185
   }
 }

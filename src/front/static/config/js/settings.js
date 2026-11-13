@@ -4137,6 +4137,7 @@ document.addEventListener('DOMContentLoaded', function () {
             schema: normalizeProvName(document.getElementById('provSchema')?.value) || 'ontobricks_graph',
             mcp_app_name: (document.getElementById('provMcpAppName')?.value || '').trim(),
             grant_uc_catalog: !!document.getElementById('provGrantUcCatalog')?.checked,
+            grant_superusers: !!document.getElementById('provGrantSuperusers')?.checked,
         };
         if (btn) btn.disabled = true;
         const list = document.getElementById('provStepLog');

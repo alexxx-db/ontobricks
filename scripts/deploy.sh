@@ -159,6 +159,7 @@ IS_LAKEBASE=false
 _dab_var_overrides=(
     "--var=app_name=${APP_NAME}"
     "--var=mcp_app_name=${MCP_APP_NAME}"
+    "--var=app_access_group=${APP_ACCESS_GROUP:-users}"
     "--var=warehouse_id=${WAREHOUSE_ID}"
     "--var=registry_catalog=${REGISTRY_CATALOG}"
     "--var=registry_schema=${REGISTRY_SCHEMA}"
@@ -450,7 +451,7 @@ if $IS_LAKEBASE && $DO_BOOTSTRAP; then
         if [[ $_PREFLIGHT_WARNINGS -gt 0 ]]; then
             info "preflight passed with ${_PREFLIGHT_WARNINGS} warning(s) — review messages above."
         else
-            ok "bootstrap-lakebase-perms.sh and registry migrations ready"
+            ok "scripts/bootstrap/lakebase-perms.sh and registry migrations ready"
         fi
     fi
 fi
@@ -884,7 +885,7 @@ fi
 # This script is registry-scoped: it only grants on the REGISTRY schema.
 # The graph DB is configured in-app (Settings → Graph DB) and may live in
 # a different Lakebase project, so its grants are handled by the in-app
-# "Create graph DB" flow (or a manual bootstrap-lakebase-perms.sh run
+# "Create graph DB" flow (or a manual scripts/bootstrap/lakebase-perms.sh run
 # with the explicit graph project/database/schema).
 #
 # Re-running the bootstrap is idempotent, so we do it on every
@@ -910,7 +911,7 @@ if $IS_LAKEBASE; then
         echo ""
         echo "  ⚠ Lakebase permission bootstrap did not complete cleanly."
         _lakebase_print_diag_hints \
-            "bootstrap-lakebase-perms.sh failed (connection, endpoint, or schema grants)" \
+            "scripts/bootstrap/lakebase-perms.sh failed (connection, endpoint, or schema grants)" \
             "${LAKEBASE_PROJECT}" "${LAKEBASE_BRANCH}" \
             "${LAKEBASE_DATABASE}" "${LAKEBASE_DATABASE_RESOURCE_SEGMENT:-}" "${CONFIG_FILE}"
         echo "    Re-run after fixing grants:"

@@ -7,7 +7,7 @@ the only way to stand up the graph store:
   instance/project + Postgres database (via the *old*
   ``/api/2.0/database/instances`` API so the project stays compatible with
   the Synced Tables API used by ``managed_synced`` builds).
-- ``scripts/bootstrap-lakebase-perms.sh`` -- grant ``CAN_USE`` on the
+- ``scripts/bootstrap/lakebase-perms.sh`` -- grant ``CAN_USE`` on the
   project and ``USAGE``/``CREATE``/DML on the graph schema to the app +
   MCP service principals.
 
@@ -73,7 +73,10 @@ _AVAILABLE_POLL_S = 5.0
 
 
 def provision_steps(
-    *, grant_uc: bool, grant_app_permissions: bool = True
+    *,
+    grant_uc: bool,
+    grant_app_permissions: bool = True,
+    grant_superusers: bool = False,
 ) -> List[Dict[str, str]]:
     """Return the seeded TaskManager step list for the provision flow."""
     steps = [
@@ -90,12 +93,13 @@ def provision_steps(
                 {"name": "grants", "description": "Granting schema privileges"},
             ]
         )
-    steps.append(
-        {
-            "name": "superusers",
-            "description": "Granting Postgres superuser to CAN_MANAGE users",
-        }
-    )
+    if grant_superusers:
+        steps.append(
+            {
+                "name": "superusers",
+                "description": "Granting Postgres superuser to CAN_MANAGE users",
+            }
+        )
     if grant_uc:
         steps.append(
             {"name": "uc", "description": "Granting Unity Catalog privileges"}
@@ -130,6 +134,14 @@ class LakebaseGraphProvisioner:
         (``managed_synced`` only).
     pg_user:
         Postgres role to authenticate as (the app SP -- normally ``PGUSER``).
+    operator_email:
+        Operator address -- promoted to ``DATABRICKS_SUPERUSER`` only when
+        ``grant_superusers`` is set.
+    grant_superusers:
+        Opt-in Postgres superuser promotion (default off). Superuser
+        bypasses all schema-level ACLs, so regulated installs should leave
+        this off and use the explicit ``lakebase-grant-superuser`` settings
+        action for individual operators instead.
     on_success:
         Optional callback invoked with the result dict just before the
         task is marked complete (used to persist the new coordinates into
@@ -152,6 +164,7 @@ class LakebaseGraphProvisioner:
         uc_catalog: str = "",
         pg_user: str = "",
         operator_email: str = "",
+        grant_superusers: bool = False,
         on_success: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self._tm = tm
@@ -176,6 +189,7 @@ class LakebaseGraphProvisioner:
         self._uc_catalog = (uc_catalog or "").strip()
         self._pg_user = (pg_user or "").strip()
         self._operator_email = (operator_email or "").strip()
+        self._grant_superusers = bool(grant_superusers)
         self._on_success = on_success
 
         # Resolved canonical resource paths (filled in during the endpoint
@@ -235,8 +249,9 @@ class LakebaseGraphProvisioner:
                 tm.advance_step(self._task_id)
                 self._step_grant_schema(api, sp_ids)
 
-            tm.advance_step(self._task_id)
-            self._step_grant_superuser_to_managers(api)
+            if self._grant_superusers:
+                tm.advance_step(self._task_id)
+                self._step_grant_superuser_to_managers(api)
 
             if self._uc_catalog and self._sync_mode == "managed_synced":
                 tm.advance_step(self._task_id)
@@ -562,7 +577,9 @@ class LakebaseGraphProvisioner:
         self._tm.update_progress(self._task_id, 90, "Schema grants applied")
 
     def _step_grant_uc(self, api: Any, sp_ids: Dict[str, str]) -> None:
-        granted, warnings = grant_uc_catalog(api, self._uc_catalog, sp_ids)
+        granted, warnings = grant_uc_catalog(
+            api, self._uc_catalog, sp_ids, uc_schema=self._schema
+        )
         self._granted.extend(granted)
         self._warnings.extend(warnings)
         self._tm.update_progress(self._task_id, 98, "Unity Catalog grants applied")
@@ -570,21 +587,11 @@ class LakebaseGraphProvisioner:
     def _step_grant_superuser_to_managers(self, api: Any) -> None:
         """Provision Postgres roles + DATABRICKS_SUPERUSER for every workspace admin.
 
-        Workspace admins hold ``CAN_MANAGE`` on every Lakebase project via the
-        *admins* group, but that group membership is never expanded to individual
-        ``user_name`` rows in the project ACL — so reading the project ACL alone
-        is insufficient.  Instead we resolve admins via the SCIM ``/Groups``
-        endpoint (``displayName eq admins``) and act on ``Users/`` members only
-        (service-principal members already have DATABRICKS_SUPERUSER as the
-        project creator).
-
-        For each admin user we ensure:
-
-        1. A ``LAKEBASE_OAUTH_V1`` Postgres role (created if absent).
-        2. ``DATABRICKS_SUPERUSER`` group membership (patched if absent).
-
-        Idempotent and best-effort — users who already hold the membership are
-        skipped; individual failures produce warnings but do not abort the flow.
+        Admins hold ``CAN_MANAGE`` via the *admins* group, which never expands
+        to ``user_name`` rows in the project ACL, so members are resolved via
+        the SCIM ``/Groups`` endpoint (``Users/`` refs only). Each admin gets a
+        ``LAKEBASE_OAUTH_V1`` Postgres role plus ``DATABRICKS_SUPERUSER``
+        membership. Idempotent and best-effort — failures warn, not abort.
         """
         manager_users = self._resolve_admin_emails(api)
         if not manager_users:
@@ -625,16 +632,9 @@ class LakebaseGraphProvisioner:
     def _resolve_admin_emails(self, api: Any) -> List[str]:
         """Return emails that should receive DATABRICKS_SUPERUSER.
 
-        Priority order:
-
-        1. ``operator_email`` — the human who clicked the button.  Always
-           included when set.  This is the only reliable source when the
-           provisioner runs as a service principal that lacks SCIM read
-           access.
-
-        2. Workspace admins group via SCIM (best-effort).  May return an
-           empty supplemental list when called as a non-admin SP — that is
-           not treated as an error.
+        ``operator_email`` first (the only reliable source when running as a
+        SP without SCIM read), then workspace admins via SCIM (best-effort —
+        an empty supplemental list is not an error).
         """
         seen: set = set()
         emails: List[str] = []

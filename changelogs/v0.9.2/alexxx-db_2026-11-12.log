@@ -36,3 +36,113 @@ Tests: uv run --frozen pytest -q -m "not scenario" → 2 failed, 9650 passed,
 tests/units/settings/test_deploy_instance_id.py expects INSTANCE_ID "09x"
 while committed scripts/deploy.config.sh defaults to "abacus" (commit
 1fe10093).
+
+## Correct stale script path and health-route references
+
+Context: During the Databricks best-practices / least-privilege review, two
+classes of stale references were found: source comments and user-facing
+warning messages pointed operators at scripts/bootstrap-lakebase-perms.sh
+(moved to scripts/bootstrap/lakebase-perms.sh), and the deploy skill told
+agents to probe /healthz (the liveness route is /health).
+
+Changes:
+
+1. src/, scripts/, docs/
+   Replaced 20+ occurrences of bootstrap-lakebase-perms.sh with
+   scripts/bootstrap/lakebase-perms.sh in docstrings, operator-facing warning
+   strings, preflight messages, and deployment/backend docs.
+2. .claude/skills/deploy/SKILL.md
+   Post-deploy probe corrected from /healthz to /health (the real liveness
+   route; deep diagnostics stay admin-only at /settings/diagnostics/readiness).
+
+Modified files:
+- .claude/skills/deploy/SKILL.md
+- docs/backend.md, docs/deployment.md
+- scripts/_internal/_deploy-preflight.sh, _lakebase_preflight.py,
+  check-deploy-prerequisites.sh, scripts/deploy.sh
+- src/api/routers/internal/settings.py
+- src/back/core/databricks/lakebase/grants.py
+- src/back/core/graphdb/lakebase/LakebaseGraphProvisioner.py
+- src/back/core/graphdb/lakebase/SyncedTableManager.py
+- src/back/objects/domain/settings/RegistrySettings.py
+- src/back/objects/domain/settings/graphengine/GraphEngineLakebaseSettings.py
+- src/back/objects/registry/store/lakebase/Bootstrap.py, Catalog.py, Schedules.py
+- src/shared/fastapi/health.py
+
+Tests: uv run --frozen pytest -q tests/units/settings tests/units/scripts
+tests/units/registry tests/units/shared tests/units/graphdb → 2389 passed,
+2 failed in 12.6s (same pre-existing test_deploy_instance_id failures —
+INSTANCE_ID "09x" vs committed "abacus"; unrelated to this change).
+
+---
+
+## Least-privilege grants: superuser opt-in + schema-scoped UC readback
+
+Context: regulated-industry posture — provisioning previously granted
+DATABRICKS_SUPERUSER to every workspace admin (Postgres superuser bypasses
+all schema ACLs) and the UC readback grant was catalog-wide ALL_PRIVILEGES.
+Both are now narrow-by-default with deliberate opt-ins for the broad paths.
+
+Changes:
+
+1. LakebaseGraphProvisioner + provision_steps (src/back/core/graphdb/lakebase/)
+   New grant_superusers flag (default False). The "superusers" task step and
+   _step_grant_superuser_to_managers only run when the caller opts in via the
+   provision payload. Individual operators can still be promoted on demand
+   through the existing lakebase-grant-superuser settings action.
+
+2. grant_uc_catalog (src/back/core/databricks/lakebase/grants.py)
+   New uc_schema parameter. When set, grants USE_CATALOG on the catalog plus
+   USE_SCHEMA,SELECT on <catalog>.<schema> (covers all current+future synced
+   tables) instead of catalog-wide ALL_PRIVILEGES — now documented as the
+   development-only fallback. Both call sites (graph provisioner, registry
+   Bootstrap) pass their schema, so the in-app path is least-privilege by
+   default.
+
+3. scripts/bootstrap/lakebase-perms.sh
+   New -S/--uc-schema flag selecting the same least-privilege grant shape;
+   -c without -S keeps the catalog-wide ALL_PRIVILEGES shortcut with an
+   explicit "dev shortcut" message.
+
+4. databricks.yml
+   Hardcoded "group_name: users" on both app ACLs replaced with
+   ${var.app_access_group} (default "users") so regulated installs can scope
+   app access to a real group via --var or deploy.config.sh.
+
+5. Settings UI (settings.html + settings.js)
+   Provision dialog: UC checkbox label updated to "schema-scoped readback";
+   new opt-in checkbox "Promote workspace admins to DATABRICKS_SUPERUSER".
+
+6. search_path hardening
+   Schema name now escapes embedded double quotes before interpolation into
+   SET search_path in LakebaseConnectionPool, LakebaseFlatStore and
+   LakebaseBase (5 sites).
+
+7. docs/deployment.md
+   Grant matrix and lakebase-perms.sh section updated: schema-scoped
+   USE_CATALOG+USE_SCHEMA,SELECT documented as the production path;
+   ALL_PRIVILEGES demoted to a development shortcut for pre-schema deploys.
+
+Modified files:
+- databricks.yml
+- docs/deployment.md
+- scripts/bootstrap/lakebase-perms.sh
+- src/back/core/databricks/lakebase/grants.py
+- src/back/core/databricks/lakebase/LakebaseConnectionPool.py
+- src/back/core/graphdb/lakebase/LakebaseGraphProvisioner.py
+- src/back/core/graphdb/lakebase/LakebaseBase.py, LakebaseFlatStore.py
+- src/back/objects/domain/settings/graphengine/GraphEngineLakebaseSettings.py
+- src/back/objects/registry/store/lakebase/Bootstrap.py
+- src/front/static/config/js/settings.js, src/front/templates/settings.html
+- tests/units/settings/test_lakebase_provision.py
+- tests/units/registry/test_v090_lakebase_bootstrap.py
+
+Tests: uv run --frozen pytest -q tests/units/settings/test_lakebase_provision.py
+tests/units/registry/test_v090_lakebase_bootstrap.py
+tests/units/settings/test_v090_graph_engine_lakebase.py → 110 passed.
+Full suite: uv run --frozen pytest -q -m "not scenario" -> 9649 passed,
+338 skipped, 5 failed. Three were introduced and fixed in this change
+(size-budget growth + literal "users" group assertion — verified green in
+targeted re-run of tests/units/architecture + test_bundle_job_resource);
+the remaining two are the pre-existing test_deploy_instance_id failures
+(INSTANCE_ID "09x" vs committed "abacus" config — unrelated).

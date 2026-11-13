@@ -533,7 +533,7 @@ class Catalog:
                     self._status_column_ready = True
                     return True
                 # Column absent — attempt DDL (requires schema owner to
-                # have not yet run bootstrap-lakebase-perms.sh).
+                # have not yet run scripts/bootstrap/lakebase-perms.sh).
                 cur.execute(
                     f"""
                     ALTER TABLE {sch}.domain_versions
@@ -552,7 +552,7 @@ class Catalog:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "could not add domain_versions.status column — "
-                "run `make bootstrap-lakebase` (or scripts/bootstrap-lakebase-perms.sh) "
+                "run `make bootstrap-lakebase` (or scripts/bootstrap/lakebase-perms.sh) "
                 "as the schema owner to apply the migration: %s",
                 exc,
             )
@@ -593,7 +593,7 @@ class Catalog:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "could not add domains.review_quorum column — "
-                "run `make bootstrap-lakebase` (or scripts/bootstrap-lakebase-perms.sh) "
+                "run `make bootstrap-lakebase` (or scripts/bootstrap/lakebase-perms.sh) "
                 "as the schema owner to apply the migration: %s",
                 exc,
             )
@@ -634,7 +634,7 @@ class Catalog:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "could not add domains.mcp_policy column — "
-                "run `make bootstrap-lakebase` (or scripts/bootstrap-lakebase-perms.sh) "
+                "run `make bootstrap-lakebase` (or scripts/bootstrap/lakebase-perms.sh) "
                 "as the schema owner to apply the migration: %s",
                 exc,
             )

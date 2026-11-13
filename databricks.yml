@@ -144,6 +144,14 @@ variables:
     description: "Databricks Apps name for the MCP companion server"
     default: "mcp-ontobricks-abacus"
 
+  # Workspace group granted CAN_USE on both apps. Defaults to the built-in
+  # ``users`` group (every workspace user — fine for a dev sandbox);
+  # override via ``--var=app_access_group=<group>`` or deploy.config.sh
+  # for regulated installs that must scope app access to a real group.
+  app_access_group:
+    description: "Workspace group granted CAN_USE on the apps"
+    default: "users"
+
   warehouse_id:
     description: "SQL Warehouse ID for query execution"
     default: "337986b7fa599984"  # demo-genesis-warehouse
@@ -248,7 +256,7 @@ resources:
         - level: CAN_MANAGE
           user_name: ${workspace.current_user.userName}
         - level: CAN_USE
-          group_name: users
+          group_name: ${var.app_access_group}
       resources:
         - name: sql-warehouse
           description: "SQL Warehouse for executing queries and metadata operations"
@@ -279,7 +287,7 @@ resources:
         - level: CAN_MANAGE
           user_name: ${workspace.current_user.userName}
         - level: CAN_USE
-          group_name: users
+          group_name: ${var.app_access_group}
       resources:
         - name: sql-warehouse
           description: "SQL Warehouse for executing queries and metadata operations"

@@ -453,7 +453,7 @@ class Schedules:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "could not migrate the schedules tables to generic tasks — "
-                "run `make bootstrap-lakebase` (or scripts/bootstrap-lakebase-perms.sh) "
+                "run `make bootstrap-lakebase` (or scripts/bootstrap/lakebase-perms.sh) "
                 "as the schema owner to apply the migration: %s",
                 exc,
             )

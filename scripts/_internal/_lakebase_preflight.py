@@ -2,7 +2,7 @@
 """Read-only Lakebase preflight checks for deploy / bootstrap.
 
 Used by ``scripts/check-deploy-prerequisites.sh`` and ``scripts/deploy.sh``
-before mutating Databricks resources or running bootstrap-lakebase-perms.sh.
+before mutating Databricks resources or running scripts/bootstrap/lakebase-perms.sh.
 
 Exit codes:
   0 — all blocking checks passed (warnings may be present on stderr)
@@ -20,7 +20,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-# Registry objects provisioned by bootstrap-lakebase-perms.sh Step 2b and the
+# Registry objects provisioned by scripts/bootstrap/lakebase-perms.sh Step 2b and the
 # upgrade_0.4_to_0.5.sql / upgrade_0.5_to_0.6.sql / upgrade_0.6_to_0.7.sql /
 # upgrade_0.7_to_0.8.sql scripts.
 EXPECTED_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -447,7 +447,7 @@ def run_preflight(
                     CheckResult(
                         "migrations",
                         "warn",
-                        "Pending registry migrations will be applied by bootstrap-lakebase-perms.sh: "
+                        "Pending registry migrations will be applied by scripts/bootstrap/lakebase-perms.sh: "
                         + ", ".join(pending),
                     )
                 )

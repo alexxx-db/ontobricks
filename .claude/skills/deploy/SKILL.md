@@ -72,10 +72,10 @@ README.md). If the user runs `databricks bundle deploy` directly, run
 1. **Compute > Apps > ontobricks > Resources** — confirm `sql-warehouse` and `volume` are bound. If missing, the user must bind them manually (binding cannot be done via DAB).
 2. **Logs** — confirm startup completed cleanly.
 3. If the registry volume is empty, tell the user to open **Settings > Registry > Initialize** in the app UI.
-4. Hit `/healthz` to confirm the FastAPI app is responsive.
+4. Hit `/health` to confirm the FastAPI app is responsive.
 5. **Re-check `app_status.state` about a minute after the deploy reports success.**
    A dependency-download failure surfaces as a crash ~45s *after* "App started
-   successfully", so a single immediate `/healthz` 200 does not prove the deploy
+   successfully", so a single immediate `/health` 200 does not prove the deploy
    is healthy: `databricks apps get <app> --output json`.
 
 ## Release flow

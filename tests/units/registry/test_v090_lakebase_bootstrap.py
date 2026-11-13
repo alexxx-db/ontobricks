@@ -295,9 +295,9 @@ def grants(monkeypatch):
         calls["schema"] = sch
         return ["USAGE"], ["schema-warning"]
 
-    def uc(api, catalog, sp_ids):
-        calls["uc"] = catalog
-        return ["ALL_PRIVILEGES"], []
+    def uc(api, catalog, sp_ids, uc_schema=""):
+        calls["uc"] = (catalog, uc_schema)
+        return ["UC_GRANT"], []
 
     monkeypatch.setattr(grants_mod, "resolve_app_service_principals", resolve)
     monkeypatch.setattr(grants_mod, "grant_can_use_on_project", can_use)
@@ -313,13 +313,18 @@ def test_grant_app_permissions_runs_all_grant_phases(grants):
 
     assert result == {
         "success": True,
-        "granted": ["CAN_USE", "USAGE", "ALL_PRIVILEGES"],
+        "granted": ["CAN_USE", "USAGE", "UC_GRANT"],
         "warnings": ["resolve-warning", "schema-warning"],
         "error": None,
         "schema": SCHEMA,
         "apps": ["mcp-app"],
     }
-    assert calls == {"resolve": ["mcp-app"], "can_use": "proj-1", "schema": SCHEMA, "uc": "main"}
+    assert calls == {
+        "resolve": ["mcp-app"],
+        "can_use": "proj-1",
+        "schema": SCHEMA,
+        "uc": ("main", SCHEMA),
+    }
 
 
 def test_grant_app_permissions_without_catalog_skips_uc(grants):

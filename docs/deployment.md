@@ -149,7 +149,7 @@ OntoBricks uses Lakebase Postgres (Autoscaling) as **both** its registry store (
 ║  Schema: ontobricks   (optional — managed_synced sync mode only)                       ║
 ║  Lakeflow synced tables — Lakebase mirror of the UC Delta triplestore VIEW              ║
 ║  Created by: first Lakeflow snapshot on a managed_synced domain                        ║
-║  Granted by: manual bootstrap-lakebase-perms.sh -s <sync_schema> (managed_synced)      ║
+║  Granted by: manual scripts/bootstrap/lakebase-perms.sh -s <sync_schema> (managed_synced)      ║
 ╚══════════════════════════════════════════════════════════════════════════════════════════╝
 ```
 
@@ -668,7 +668,7 @@ The deploy script is **registry-scoped**: it bootstraps only the
 **registry** schema. The graph DB is configured in-app
 (`Settings → Graph DB`) and may live in a **different** Lakebase
 project, so its grant is handled by the in-app "Create graph DB" flow
-or a manual `bootstrap-lakebase-perms.sh` run.
+or a manual `scripts/bootstrap/lakebase-perms.sh` run.
 
 > **In-app alternative (no `psql` needed).** The registry schema grants
 > are now also applied **from inside the app**: **Settings → Registry →
@@ -676,10 +676,10 @@ or a manual `bootstrap-lakebase-perms.sh` run.
 > owns the schema, so it can `GRANT` to the MCP SP), and the **Repair
 > permissions** button on the same panel re-applies them on demand
 > (idempotent — useful after a rebind/redeploy drops the schema GRANTs).
-> The control-plane grants (project `CAN_USE`, UC catalog
-> `ALL_PRIVILEGES`) are best-effort in-app and degrade to a warning when
+> The control-plane grants (project `CAN_USE`, UC catalog/schema
+> privileges) are best-effort in-app and degrade to a warning when
 > the SP lacks manage rights — those still rely on the script/CLI. So
-> `bootstrap-lakebase-perms.sh` (and its `psql` dependency) remains the
+> `scripts/bootstrap/lakebase-perms.sh` (and its `psql` dependency) remains the
 > documented path for the full set, but the everyday schema GRANTs no
 > longer require it.
 
@@ -691,9 +691,16 @@ or a manual `bootstrap-lakebase-perms.sh` run.
 The script grants:
 
 1. `CAN_USE` on the Lakebase database project (control-plane).
-2. `ALL PRIVILEGES` on the UC catalog when `-c/--catalog` is passed
-   (also control-plane — applied **before** the schema exists so a
-   first deploy still grants it; `deploy.sh` passes `-c $REGISTRY_CATALOG`).
+2. UC privileges on the catalog when `-c/--catalog` is passed (also
+   control-plane — applied **before** the schema exists so a first
+   deploy still grants it; `deploy.sh` passes `-c $REGISTRY_CATALOG`).
+   Two grant shapes: `-S/--uc-schema <schema>` grants the
+   least-privilege set — `USE_CATALOG` on the catalog plus
+   `USE_SCHEMA, SELECT` on `<catalog>.<schema>` (covers all current and
+   future synced tables); without `-S` the script falls back to
+   catalog-wide `ALL PRIVILEGES`, a development shortcut useful when
+   the UC schema does not exist yet. Re-run with `-S` once the schema
+   is known to narrow the grant.
 3. `USAGE + CREATE` on the Postgres schema.
 4. `SELECT / INSERT / UPDATE / DELETE` on every existing table.
 5. `USAGE / SELECT / UPDATE` on every existing sequence (bigserial PKs).
@@ -790,7 +797,7 @@ databricks bundle summary -t dev-lakebase
 
 ### `scripts/deploy.sh` Reference
 
-The convenience script wraps **`databricks bundle validate`**, **`databricks bundle deploy`**, optional **`bundle deployment bind`**, **`bundle run`** (main app only), **`bootstrap-app-permissions.sh`**, and **`bootstrap-lakebase-perms.sh`** (when target is `dev-lakebase`):
+The convenience script wraps **`databricks bundle validate`**, **`databricks bundle deploy`**, optional **`bundle deployment bind`**, **`bundle run`** (main app only), **`bootstrap-app-permissions.sh`**, and **`scripts/bootstrap/lakebase-perms.sh`** (when target is `dev-lakebase`):
 
 ```bash
 scripts/deploy.sh                    # default: -t dev-lakebase — validate + deploy + run ontobricks-XXX
@@ -980,17 +987,25 @@ GRANT ALL PRIVILEGES ON SCHEMA  `<registry_catalog>`.`<registry_schema>` TO `<ap
 Prefer the explicit list above for a production workspace because `ALL PRIVILEGES` also implies `MANAGE`, which is broader than what the app needs day to day.
 
 > **Lakebase / Initialize note (issue #137):** the in-app *Initialize* /
-> *Repair permissions* flow also tries to grant catalog-level
-> `ALL_PRIVILEGES` to the app SP so synced tables are readable. That call
-> runs **as the app SP**, which cannot succeed unless the SP already has
-> catalog `MANAGE`. Prefer granting `ALL PRIVILEGES` **to** the SP from a
+> *Repair permissions* flow also tries to grant UC readback privileges
+> to the app SP so synced tables are readable — schema-scoped
+> (`USE_CATALOG` + `USE_SCHEMA, SELECT`) when the schema is known,
+> catalog-wide `ALL_PRIVILEGES` only as a fallback. That call runs
+> **as the app SP**, which cannot succeed unless the SP already has
+> `MANAGE` on the securable. Prefer granting **to** the SP from a
 > human/admin principal via `scripts/bootstrap/lakebase-perms.sh -c
-> <catalog>` (or the SQL below) — do **not** elevate the app SP to
-> `CAN_MANAGE` / catalog `MANAGE` just to silence the Initialize warning.
+> <catalog> -S <uc-schema>` (or the SQL below) — do **not** elevate the
+> app SP to `CAN_MANAGE` / catalog `MANAGE` just to silence the
+> Initialize warning.
 >
 > ```sql
+> -- least-privilege (production): schema-scoped readback
+> GRANT USE CATALOG           ON CATALOG `<registry_catalog>`                    TO `<app-sp>`;
+> GRANT USE SCHEMA, SELECT    ON SCHEMA  `<registry_catalog>`.`<sync_schema>`    TO `<app-sp>`;
+> -- repeat both for the MCP app SP
+>
+> -- development shortcut (pre-schema first deploys):
 > GRANT ALL PRIVILEGES ON CATALOG `<registry_catalog>` TO `<app-sp>`;
-> -- repeat for the MCP app SP
 > GRANT ALL PRIVILEGES ON CATALOG `<registry_catalog>` TO `<mcp-sp>`;
 > ```
 
@@ -1833,7 +1848,7 @@ scripts/deploy.sh --dry-run
 | **uv** | Dependency install (`make install`, `make setup`) | `uv --version` (setup.sh installs it if missing) |
 | **Databricks CLI ≥ 0.250.0** | Bundle deploy, bootstrap scripts | `databricks version` |
 | **python3** | JSON parsing, app.yaml render | `python3 --version` |
-| **psql** (libpq client) | `bootstrap-lakebase-perms.sh`, SQL upgrade scripts | `psql --version` — macOS: `brew install libpq && brew link --force libpq` |
+| **psql** (libpq client) | `scripts/bootstrap/lakebase-perms.sh`, SQL upgrade scripts | `psql --version` — macOS: `brew install libpq && brew link --force libpq` |
 | **curl** | `setup-lakebase.sh` provisioning API calls | `curl --version` |
 | **Git clone + venv** | Project source | `make setup` or `make install` |
 
@@ -1884,7 +1899,7 @@ databricks postgres list-databases "projects/<project>/branches/<branch>" -o jso
 
 ---
 
-### 4. Lakebase bootstrap (`bootstrap-lakebase-perms.sh`)
+### 4. Lakebase bootstrap (`scripts/bootstrap/lakebase-perms.sh`)
 
 Run automatically on every `dev-lakebase` deploy (`make deploy`), or manually:
 

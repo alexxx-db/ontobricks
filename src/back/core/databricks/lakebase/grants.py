@@ -1,7 +1,7 @@
 """Reusable Lakebase grant primitives.
 
 In-app equivalents of the ``GRANT`` statements in
-``scripts/bootstrap-lakebase-perms.sh``. Two call sites share them so the
+``scripts/bootstrap/lakebase-perms.sh``. Two call sites share them so the
 grant logic lives in exactly one place:
 
 - :class:`~back.core.graphdb.lakebase.LakebaseGraphProvisioner.LakebaseGraphProvisioner`
@@ -14,10 +14,13 @@ Permission model (identical to the bash script):
 - The connecting principal must **own** the schema to run the Postgres
   ``GRANT`` statements. The app's service principal owns it because it
   ran ``CREATE SCHEMA`` during *Initialize* / *Create graph DB*.
-- ``CAN_USE`` on the Lakebase project and ``ALL_PRIVILEGES`` on the Unity
-  Catalog catalog are control-plane grants that need *manage* rights the
-  SP may not hold — they are therefore best-effort and downgrade to a
-  warning instead of aborting (same tolerance as the bash script).
+- ``CAN_USE`` on the Lakebase project and the Unity Catalog grants are
+  control-plane grants that need *manage* rights the SP may not hold —
+  they are therefore best-effort and downgrade to a warning instead of
+  aborting (same tolerance as the bash script). The UC grant is
+  schema-scoped (``USE_CATALOG`` + ``USE_SCHEMA, SELECT``) whenever the
+  caller knows the schema; catalog-wide ``ALL_PRIVILEGES`` is the
+  dev-only fallback.
 
 Every function returns ``(granted, warnings)`` — two lists of
 human-readable strings the caller aggregates into its task/route result.
@@ -198,37 +201,84 @@ def grant_schema_privileges(
             warnings.append(
                 f"{app_name}: schema grant failed ({exc}). The Postgres "
                 f"role may not exist yet — re-run after the app has "
-                f"connected once, or use scripts/bootstrap-lakebase-perms.sh."
+                f"connected once, or use scripts/bootstrap/lakebase-perms.sh."
             )
     return granted, warnings
 
 
 def grant_uc_catalog(
-    api: Any, uc_catalog: str, sp_ids: Dict[str, str]
+    api: Any, uc_catalog: str, sp_ids: Dict[str, str], uc_schema: str = ""
 ) -> Tuple[List[str], List[str]]:
-    """Grant ``ALL_PRIVILEGES`` on the Unity Catalog catalog to each SP.
+    """Grant the Unity Catalog privileges needed for synced-table readback.
 
-    Required so the SP can read back synced tables regardless of who
-    created them. Best-effort — needs ``MANAGE`` on the catalog.
+    Two grant shapes, least-privilege first:
+
+    - ``uc_schema`` set — grant ``USE_CATALOG`` on the catalog plus
+      ``USE_SCHEMA, SELECT`` on ``<catalog>.<schema>``. ``SELECT`` on a
+      schema covers every current and future table in it, which is all the
+      app needs to read back managed synced tables. This is the right shape
+      for regulated installs.
+    - ``uc_schema`` empty — fall back to ``ALL_PRIVILEGES`` on the catalog.
+      Catalog-wide, so only acceptable as a development/onboarding
+      shortcut; the schema exists by then in practice since callers pass
+      the schema they just created.
+
+    Best-effort either way — the SP needs ``MANAGE`` on the securable to
+    grant to itself, so failures downgrade to a warning pointing at
+    ``scripts/bootstrap/lakebase-perms.sh``.
     """
     granted: List[str] = []
     warnings: List[str] = []
+    narrow = bool((uc_schema or "").strip())
     for app_name, sp_id in sp_ids.items():
         try:
             api.do(
                 "PATCH",
                 f"/api/2.1/unity-catalog/permissions/catalog/{uc_catalog}",
-                body={"changes": [{"principal": sp_id, "add": ["ALL_PRIVILEGES"]}]},
+                body={
+                    "changes": [
+                        {
+                            "principal": sp_id,
+                            "add": ["USE_CATALOG"]
+                            if narrow
+                            else ["ALL_PRIVILEGES"],
+                        }
+                    ]
+                },
             )
-            granted.append(f"{app_name}: ALL_PRIVILEGES on catalog {uc_catalog}")
+            if narrow:
+                api.do(
+                    "PATCH",
+                    "/api/2.1/unity-catalog/permissions/schema/"
+                    f"{uc_catalog}.{uc_schema.strip()}",
+                    body={
+                        "changes": [
+                            {
+                                "principal": sp_id,
+                                "add": ["USE_SCHEMA", "SELECT"],
+                            }
+                        ]
+                    },
+                )
+                granted.append(
+                    f"{app_name}: USE_CATALOG on catalog {uc_catalog}, "
+                    f"USE_SCHEMA+SELECT on {uc_catalog}.{uc_schema.strip()}"
+                )
+            else:
+                granted.append(
+                    f"{app_name}: ALL_PRIVILEGES on catalog {uc_catalog} "
+                    f"(development shortcut — pass uc_schema for the "
+                    f"least-privilege grant)"
+                )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("UC catalog grant for %s failed: %s", app_name, exc)
+            logger.warning("UC grant for %s failed: %s", app_name, exc)
+            extra = f" -S {uc_schema.strip()}" if narrow else ""
             warnings.append(
-                f"{app_name}: UC catalog grant on {uc_catalog} failed "
-                f"({exc}). The app SP needs MANAGE on the catalog to "
-                f"grant ALL_PRIVILEGES to itself — prefer re-running "
-                f"scripts/bootstrap/lakebase-perms.sh -c {uc_catalog} "
-                f"as a workspace admin (deploy applies this before the "
-                f"registry schema exists)."
+                f"{app_name}: UC grant on {uc_catalog} failed "
+                f"({exc}). The app SP needs MANAGE on the securable to "
+                f"grant privileges to itself — prefer re-running "
+                f"scripts/bootstrap/lakebase-perms.sh -c {uc_catalog}"
+                f"{extra} as a workspace admin (deploy applies this "
+                f"before the registry schema exists)."
             )
     return granted, warnings
