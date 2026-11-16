@@ -35,3 +35,8 @@ Changes:
 7. Makefile / scripts/deploy.sh
    `make artifact`, `make artifact-check`; deploy.sh builds (or, on --dry-run,
    checks) the artifact before validate and verifies the vendor files synced.
+8. .github/workflows/build-artifact.yml (new)
+   Builds and checks both vendor dirs on GitHub-hosted runners (manual run,
+   or a push/PR touching either uv.lock or the build scripts) and uploads
+   them as the ontobricks-vendor-<sha> artifact (30-day retention). Unzip at
+   the root of the same commit, then `make artifact-check && make deploy`.

@@ -1,0 +1,97 @@
+name: Build offline wheel artifact
+
+# Builds vendor/ and src/mcp-server/vendor/ with scripts/build_artifact.sh:
+# every locked runtime dependency as a wheel for the Databricks Apps runtime
+# (CPython 3.11, Linux x86_64). The abacus workspace has no PyPI egress, so
+# it cannot build these itself; this job does it and uploads the result.
+#
+# To deploy with it: download the artifact from the run, unzip it at the
+# root of a checkout of the SAME commit (it holds vendor/ and
+# src/mcp-server/vendor/), then run `make artifact-check && make deploy`.
+# lock.sha256 ties each vendor dir to its uv.lock, so a mismatched commit
+# fails the check instead of deploying stale wheels.
+
+on:
+  workflow_dispatch:
+  # Keep both path lists identical: a lock or build-script change rebuilds.
+  push:
+    paths:
+      - uv.lock
+      - src/mcp-server/uv.lock
+      - scripts/build_artifact.sh
+      - scripts/_internal/_vendor_artifact.py
+      - vendor_bootstrap.py
+      - .github/workflows/build-artifact.yml
+  pull_request:
+    paths:
+      - uv.lock
+      - src/mcp-server/uv.lock
+      - scripts/build_artifact.sh
+      - scripts/_internal/_vendor_artifact.py
+      - vendor_bootstrap.py
+      - .github/workflows/build-artifact.yml
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: build-artifact-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build vendored wheels
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      # --force: always build from the lock in this commit.
+      - name: Build artifact
+        run: bash scripts/build_artifact.sh --force
+
+      # Re-run the offline check exactly as deploy.sh --dry-run does.
+      - name: Check artifact
+        run: bash scripts/build_artifact.sh --check
+
+      - name: Summarize
+        run: |
+          {
+            echo "### Offline wheel artifact for \`${GITHUB_SHA::12}\`"
+            echo ""
+            echo "| Directory | Pins | Whole wheels | Chunks | Size |"
+            echo "| --- | --- | --- | --- | --- |"
+            for d in vendor src/mcp-server/vendor; do
+              pins=$(grep -cE '^[A-Za-z0-9]' "$d/requirements.txt")
+              whole=$(find "$d/wheels" -name '*.whl' | wc -l | tr -d ' ')
+              parts=$(find "$d/wheels" -name '*.whl.part*' | wc -l | tr -d ' ')
+              echo "| \`$d\` | $pins | $whole | $parts | $(du -sh "$d" | cut -f1) |"
+            done
+            echo ""
+            echo "Unzip at the root of a checkout of this commit, then \`make artifact-check && make deploy\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Paths are stored relative to the repo root, so the zip unpacks as
+      # vendor/ and src/mcp-server/vendor/.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ontobricks-vendor-${{ github.sha }}
+          path: |
+            vendor/
+            src/mcp-server/vendor/
+          if-no-files-found: error
+          retention-days: 30
+          # Wheels are already compressed.
+          compression-level: 0
