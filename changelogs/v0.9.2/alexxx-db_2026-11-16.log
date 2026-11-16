@@ -40,3 +40,16 @@ Changes:
    or a push/PR touching either uv.lock or the build scripts) and uploads
    them as the ontobricks-vendor-<sha> artifact (30-day retention). Unzip at
    the root of the same commit, then `make artifact-check && make deploy`.
+9. tests/units/settings/test_app_yaml_template.py
+   TestStartCommandExtras reads the requested extras from the main-app
+   `build_one` line of scripts/build_artifact.sh (the app command no longer
+   carries `--extra`), and asserts the command is `python vendor_bootstrap.py`.
+
+Tests (cluster without network, Python 3.12, pydantic-settings unavailable):
+- tests/units/settings/test_{bundle_job_resource,deploy_app_rename_guard,
+  deploy_instance_id}.py + tests/units/config/test_no_registry_volume.py
+  (--noconftest): 57 passed, 2 failed on the missing pydantic_settings import
+  (test_settings_dropped_volume_fields, test_health_dropped_volume_probes).
+- tests/units/settings/test_app_yaml_template.py (Settings import stubbed,
+  round-trip tests deselected): 14 passed, 6 deselected.
+- Not run: test_help_api.py, MCP tests, full suite (need app dependencies).
