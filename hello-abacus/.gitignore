@@ -1,0 +1,13 @@
+node_modules/
+backend/dist/
+# Built by scripts/build_artifact.sh. The directory stays, so the app's source path exists
+# before the bundle builds into it.
+app_artifact/*
+!app_artifact/.gitkeep
+bin/
+# The Databricks CLI the Seiji hooks run, fetched by scripts/fetch_databricks_cli.sh or
+# from the published tag. Not uploaded with the bundle.
+cli/
+.venv/
+__pycache__/
+*.py[cod]

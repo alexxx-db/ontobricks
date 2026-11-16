@@ -1,0 +1,40 @@
+resources:
+  postgres_projects:
+    lakebase:
+      project_id: hello-abacus${var.name_suffix}
+      display_name: hello-abacus ${var.name_suffix}
+      pg_version: 17
+      history_retention_duration: 604800s
+      purge_on_delete: ${var.lakebase_purge_on_delete}
+
+  postgres_branches:
+    production:
+      parent: ${resources.postgres_projects.lakebase.id}
+      branch_id: production
+      no_expiry: true
+      purge_on_delete: ${var.lakebase_purge_on_delete}
+      replace_existing: true
+
+  postgres_roles:
+    app_owner:
+      parent: ${resources.postgres_branches.production.id}
+      role_id: app-owner
+      postgres_role: app_owner
+      attributes:
+        createdb: true
+
+  postgres_databases:
+    app:
+      parent: ${resources.postgres_branches.production.id}
+      database_id: app
+      postgres_database: app
+      role: ${resources.postgres_roles.app_owner.id}
+
+  postgres_endpoints:
+    primary:
+      parent: ${resources.postgres_branches.production.id}
+      endpoint_id: primary
+      endpoint_type: ENDPOINT_TYPE_READ_WRITE
+      autoscaling_limit_min_cu: ${var.lakebase_autoscaling_limit_min_cu}
+      autoscaling_limit_max_cu: ${var.lakebase_autoscaling_limit_max_cu}
+      replace_existing: true

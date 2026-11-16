@@ -221,3 +221,17 @@ Modified files:
 
 Tests: uv run --frozen pytest on touched areas → 74 passed, 0 failed.
 The two test_deploy_instance_id failures are resolved.
+
+hello-abacus: scaffold app from Hello Abacus spec (develop)
+  - Rendered copier template/ from specs/hello-abacus-develop.zip into
+    hello-abacus/ with project_name=hello-abacus, matching the spec's
+    generator defaults (.tmpl suffix stripped, {{ project_name }} and its
+    underscore form substituted, .copier-answers.yml written for develop).
+  - Carries the spec structure verbatim: slices+ports backend (health, me,
+    items; ports/kernel/adapters), React+Vite frontend, databricks.yml +
+    resources/, Atlas migrations, jobs, Seiji deploy hooks, scripts/check.sh.
+  - Atlas {{ .app_users_role }} vars and bundle ${var.*} left literal per spec;
+    no environment values invented.
+Tests: hello-abacus/scripts/check.sh backend+deploy — pytest, lint-imports,
+  manifest check, Seiji hook tests, fetch tests all pass; frontend/artifact/
+  migrations skipped (no pnpm or atlas reachable on this host).

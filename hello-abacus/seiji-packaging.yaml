@@ -1,0 +1,25 @@
+# One Seiji package. Its hooks deploy the bundle's prd target with the artifact CI
+# published for app_tag; see deploy/create.sh.
+shared-executor-config: &shared-executor-config
+  executor:
+    image: "473376902650.dkr.ecr.us-east-1.amazonaws.com/seiji-orchestrator"
+    tag: "latest-terraform1.1.7-py3.10"
+
+deployable_packages:
+  nextgen.datasolutions.hello_abacus:
+    <<: *shared-executor-config
+    descriptors:
+      config: "deploy/luna-config-spec.yaml"
+      dependencies: "deploy/luna-dependencies.yaml"
+    hooks:
+      create: "deploy/create.sh"
+      destroy: "deploy/destroy.sh"
+    files:
+      include:
+        - "databricks.yml"
+        - "atlas.hcl"
+        - "resources/*.yml"
+        - "jobs/*.py"
+        - "migrations/*"
+        - "deploy/*"
+        - "app_artifact/.gitkeep"

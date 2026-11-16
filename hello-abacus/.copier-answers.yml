@@ -1,0 +1,5 @@
+# Changes here will be overwritten by Copier; do NOT edit manually
+
+_src_path: git@gitlab.com:abacusinsights/abacusai/hello-abacus.git
+_commit: develop
+project_name: hello-abacus

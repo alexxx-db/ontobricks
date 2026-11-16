@@ -1,0 +1,7 @@
+name: me
+version: 1
+summary: Who is signed in, from the headers Databricks Apps forwards.
+ports: [identity]
+resources: []
+scopes: []
+source: null

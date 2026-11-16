@@ -1,0 +1,5 @@
+# The workspace, its URL in SSM, and the groups the app grants to must exist first.
+dependencies:
+  nextgen.base.init: ">=22.12.0"
+  nextgen.databricks.provision: ">=22.12.0"
+  nextgen.databricks.configurations: ">=23.10.10"

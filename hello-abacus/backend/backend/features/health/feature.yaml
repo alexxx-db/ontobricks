@@ -1,0 +1,7 @@
+name: health
+version: 1
+summary: Liveness for the platform and the deploy smoke.
+ports: []
+resources: []
+scopes: []
+source: null

@@ -1,0 +1,95 @@
+bundle:
+  name: hello-abacus
+
+include:
+  - resources/*.yml
+
+sync:
+  include:
+    - app_artifact/**
+    - bin/**
+  # The Seiji package has no .gitignore, so these are excluded here too.
+  exclude:
+    - "**/.terraform/**"
+    - cli/**
+    - "*.auto.tfvars.json"
+
+variables:
+  # Inputs to the deploy, with no defaults, so every deploy names its workspace. The Seiji
+  # hooks set all three for each workspace (deploy/lib.sh); a dev deploy sets them itself.
+  customer:
+    description: The label's customer, which ng-infrastructure's group names use, such as abacus. Not always the label.
+  workspace:
+    description: The workspace's name in the label, such as dev or nv-prd.
+  catalog:
+    description: The workspace's default catalog, <label>_<workspace without dashes>_catalog, which the app's schema is created in.
+
+  # The app's groups, named from customer and workspace, so who may use the app changes only
+  # by an MR. A dev deploy may override one with --var; the Luna config never does.
+  app_viewers_group:
+    description: The client's viewers, an account group. Opens the app, uses its SQL warehouse and reads its schema.
+    default: ${var.customer}-${var.workspace}-${bundle.name}-viewer
+  implementers_group:
+    description: The tenant's implementation group in the workspace. Gets the viewers' grants.
+    default: ${var.customer}-${var.workspace}-implementation
+  workspace_admins_group:
+    description: The tenant's admin group in the workspace. Opens the app and uses its warehouse; it already reads the catalog.
+    default: ${var.customer}-${var.workspace}-admin
+  tenant_admins_group:
+    description: The tenant's account admin group. Opens the app and uses its warehouse; it already reads the catalog.
+    default: ${var.customer}-admin
+
+  # Variables below here are not intended to be overridden except within target configurations.
+  name_suffix:
+    description: Suffix used to isolate developer resources; empty for production.
+    default: ""
+  app_source_code_path:
+    description: The app's source, built by scripts/build_artifact.sh in every target.
+    default: ../app_artifact
+  lakebase_autoscaling_limit_min_cu:
+    description: Minimum Lakebase compute units.
+  lakebase_autoscaling_limit_max_cu:
+    description: Maximum Lakebase compute units.
+  lakebase_purge_on_delete:
+    description: Permanently delete Lakebase data when the project or branch is destroyed.
+    default: false
+  app_users_role:
+    description: Postgres group role that migrations grant to. Every app user's role is a member.
+    default: app_users
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      name_suffix: -${workspace.current_user.domain_friendly_name}
+      lakebase_autoscaling_limit_min_cu: 0.5
+      lakebase_autoscaling_limit_max_cu: 0.5
+      lakebase_purge_on_delete: true
+    # Each target defines its own artifacts: dev builds them here, and prd checks
+    # that Seiji copied them in.
+    artifacts:
+      # One build, so the frontend is in backend/dist/ before the artifact copies it.
+      app_artifact:
+        build: pnpm --dir frontend install --frozen-lockfile && pnpm --dir frontend run build && bash scripts/build_artifact.sh
+      atlas:
+        build: bash scripts/fetch_atlas.sh
+
+  prd:
+    mode: production
+    workspace:
+      root_path: /Workspace/bundles/${bundle.name}/${bundle.target}
+    variables:
+      name_suffix: ""
+      lakebase_autoscaling_limit_min_cu: 0.5
+      lakebase_autoscaling_limit_max_cu: 1.0
+      lakebase_purge_on_delete: false
+    # Seiji copies in what CI published for the tag, so prd builds and downloads
+    # nothing: these steps only check it is there.
+    artifacts:
+      app_artifact:
+        build: test -f app_artifact/requirements.txt || { echo "app_artifact/ is missing; Seiji copies it from S3 before deploying." >&2; exit 1; }
+      atlas:
+        build: test -f bin/atlas-linux-amd64 -a -f bin/atlas-linux-arm64 || { echo "bin/ is missing the Atlas binaries; Seiji copies them from S3 before deploying." >&2; exit 1; }
