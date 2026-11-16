@@ -71,6 +71,11 @@ sync:
     # uploads the rendered file on every `databricks bundle deploy` run.
     - app.yaml
     - src/mcp-server/app.yaml
+    # Offline dependency artifacts (gitignored, built by
+    # scripts/build_artifact.sh). The workspace has no PyPI egress, so the
+    # apps install only these vendored wheels — see vendor_bootstrap.py.
+    - vendor/**
+    - src/mcp-server/vendor/**
     # Help Center serves markdown from docs/ at runtime (/api/help/docs/*).
     # Force-include tracked Help Center files even if a broader ignore matches.
     - docs/**
@@ -97,6 +102,9 @@ sync:
     - licenses/
     - releases/
     - scripts/
+    # hello-abacus is a separate template project kept for reference; it is
+    # not part of either app.
+    - hello-abacus/
     # DAB still *parses* resources/*.yml locally via `include:`; this only
     # keeps the YAML out of the Apps workspace files tree.
     - resources/

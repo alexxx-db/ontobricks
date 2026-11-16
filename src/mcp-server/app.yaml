@@ -12,15 +12,14 @@
 # ║                                                                 ║
 # ║  app.yaml is .gitignored — only this template is tracked.      ║
 # ╚════════════════════════════════════════════════════════════════╝
+# The workspace has no PyPI egress. The Apps build installs requirements.txt
+# from the vendored wheels in vendor/ (scripts/build_artifact.sh) with
+# --no-index, as hello-abacus does, so this only starts the server. The
+# `server` package is imported from the app root (the working directory).
 command:
-  - "uv"
-  - "run"
-  # --frozen: use uv.lock verbatim — never re-resolve against the Apps base
-  # image's internal pypi-proxy (which cold-caches and times out on fresh
-  # wheels). The committed lock pins files.pythonhosted.org URLs (public CDN).
-  - "--frozen"
-  - "--no-dev"
-  - "mcp-ontobricks"
+  - "python"
+  - "-c"
+  - "from server.main import main; main()"
 
 env:
   # ── Main app URL ──────────────────────────────────────────────────

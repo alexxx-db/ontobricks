@@ -95,6 +95,10 @@ mlartifacts/
 /src/mcp-server/app.yaml
 # Per-INSTANCE_ID DAB target written by _ensure-instance-target.sh
 /resources/_generated_instance_target.yml
+# Offline dependency artifacts built by scripts/build_artifact.sh
+# (force-synced to the workspace by databricks.yml sync.include).
+/vendor/
+/src/mcp-server/vendor/
 
 # Cookie jars / curl session dumps (may contain live session + CSRF tokens)
 cookies*.txt

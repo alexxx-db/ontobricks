@@ -15,7 +15,7 @@ CONFIG := scripts/deploy.config.sh
         deploy deploy-dry-run deploy-volume deploy-no-run \
         bootstrap-perms bootstrap-lakebase \
         bundle-validate bundle-summary deploy-check \
-        render-app-yaml docs-toc
+        render-app-yaml docs-toc artifact artifact-check
 
 # Output dir for the live scenario campaign reports (JUnit + HTML).
 SCENARIO_ARTIFACTS := artifacts/scenarios
@@ -51,6 +51,8 @@ help:
 	@echo "    make deploy-volume       - Deploy + start the dev sandbox app (Volume-only backend)"
 	@echo "    make deploy-no-run       - Deploy without starting the app (Lakebase target)"
 	@echo "    make render-app-yaml     - Re-render app.yaml from template + config"
+	@echo "    make artifact            - Vendor every runtime dependency as wheels (needs PyPI; run before deploy)"
+	@echo "    make artifact-check      - Verify vendor/ matches uv.lock, offline"
 	@echo "    make bootstrap-perms     - Grant app SP CAN_MANAGE on itself + CAN_MANAGE_RUN on the analytics job"
 	@echo "    make bootstrap-lakebase  - Grant the app SP USAGE/DML on the Lakebase registry schema"
 	@echo "    make bundle-validate     - Validate the bundle config (target from deploy.config.sh)"
@@ -161,6 +163,15 @@ prod:
 # config, then bootstraps app SP perms (and Lakebase schema GRANTs on
 # *-lakebase targets). The DAB target defaults to `dev-lakebase` from
 # `$(CONFIG)`; the `deploy-volume` target overrides on the CLI.
+
+# Offline dependency artifact (hello-abacus pattern): the workspace has no
+# PyPI egress, so both apps install only the wheels vendored here. Needs uv
+# and internet access; rebuilds only when a uv.lock changed.
+artifact:
+	bash scripts/build_artifact.sh
+
+artifact-check:
+	bash scripts/build_artifact.sh --check
 
 deploy:
 	chmod +x scripts/deploy.sh

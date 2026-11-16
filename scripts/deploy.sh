@@ -507,6 +507,20 @@ else
     info "skipped (--skip-app-yaml) — using the existing app.yaml as-is"
 fi
 
+# ── 3b. Offline dependency artifact ────────────────────────────────────
+# The workspace has no PyPI egress: both apps install only the wheels
+# vendored under vendor/ and src/mcp-server/vendor/ (hello-abacus pattern).
+# Build them when a uv.lock changed (needs internet); --dry-run only checks.
+begin_step "Offline dependency artifact"
+if $DRY_RUN; then
+    bash scripts/build_artifact.sh --check \
+        || die "vendored wheels are missing or stale — run 'make artifact' on a machine that can reach PyPI."
+else
+    bash scripts/build_artifact.sh \
+        || die "building the vendored wheels failed — 'make artifact' needs uv and PyPI access."
+fi
+ok "vendor/ and src/mcp-server/vendor/ match their uv.lock"
+
 # ── 4. Validate bundle ──────────────────────────────────────────────
 begin_step "Validate bundle"
 # Re-materialise immediately before validate: unit tests may unlink the
@@ -657,8 +671,11 @@ begin_step "Verify synced source"
 # already burned us that way.
 _CRITICAL_SYNCED_FILES=(
     "run.py"
+    "vendor_bootstrap.py"
+    "vendor/requirements.txt"
     "pyproject.toml"
     "src/mcp-server/pyproject.toml"
+    "src/mcp-server/vendor/requirements.txt"
     "src/mcp-server/app.yaml"
     "src/mcp-server/app.yaml.template"
     "src/back/objects/registry/collab/__init__.py"

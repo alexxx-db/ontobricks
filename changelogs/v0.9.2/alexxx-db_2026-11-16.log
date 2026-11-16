@@ -1,0 +1,37 @@
+================================================================================
+## Vendor all runtime dependencies as wheels (offline Apps install)
+================================================================================
+
+Context: The abacus workspace has no PyPI egress (Apps builds, serverless and
+classic compute all fail to reach pypi.org / files.pythonhosted.org), so every
+deploy since November failed at "Package installation" — even with
+requirements.txt reduced to `uv`. Following hello-abacus's
+scripts/build_artifact.sh, both apps now ship every locked dependency as a
+wheel for the Apps runtime (CPython 3.11, Linux x86_64) and install with no
+package index.
+
+Changes:
+
+1. scripts/build_artifact.sh (new) + scripts/_internal/_vendor_artifact.py (new)
+   Export uv.lock (main: --extra lakebase), resolve for the Apps platform,
+   download wheels (sdist-only pins such as promise are built and must be pure
+   Python), split wheels over 9 MiB into .partNN chunks for the main app, and
+   check every wheel against uv.lock's sha256. Skips when lock.sha256 matches;
+   --force rebuilds, --check verifies offline.
+2. vendor_bootstrap.py (new) — main app command
+   Reassemble chunks, install vendor/requirements.txt with --no-index
+   --no-deps into a writable target (uv, falling back to pip), once per lock,
+   then exec run.py with the target first on PYTHONPATH.
+3. requirements.txt
+   Installs nothing at build time (the chunked wheels cannot go through pip).
+4. src/mcp-server/requirements.txt
+   --no-index --find-links ./vendor/wheels -r vendor/requirements.txt
+   (all MCP wheels are under the limit, so the Apps build installs them).
+5. app.yaml.template / src/mcp-server/app.yaml(.template)
+   Commands no longer use `uv run`: `python vendor_bootstrap.py` and
+   `python -c "from server.main import main; main()"`.
+6. databricks.yml / .databricksignore / .gitignore
+   Force-sync the gitignored vendor/ dirs; exclude hello-abacus/ from the app.
+7. Makefile / scripts/deploy.sh
+   `make artifact`, `make artifact-check`; deploy.sh builds (or, on --dry-run,
+   checks) the artifact before validate and verifies the vendor files synced.

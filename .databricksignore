@@ -11,6 +11,8 @@
 #   docs/images/  — Help Center diagrams
 #   docs/screenshots/
 #   app.yaml / run.py / pyproject.toml / uv.lock / requirements.txt
+#   vendor_bootstrap.py, vendor/ and src/mcp-server/vendor/ (offline wheels,
+#   gitignored but force-included by databricks.yml sync.include)
 #   LICENSE.txt / NOTICE.txt
 
 # ── Virtual environments ──────────────────────────────────────
@@ -92,6 +94,7 @@ src/.coding_rules.md
 /Makefile
 pytest.ini
 scripts/
+hello-abacus/
 .cursorrules
 .gitignore
 .pre-commit-config.yaml
