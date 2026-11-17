@@ -33,25 +33,26 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from back.core.errors import InfrastructureError
 from back.core.logging import get_logger
+from back.core.mcp_tools import coerce_mcp_policy
 from back.core.databricks import VolumeFileService
 from back.objects.registry.registry_cache import (
-    registry_cache_key,
     get_cached_registry_details,
     set_cached_registry_details,
     get_cached_registry_names,
     set_cached_registry_names,
+    get_cached_published_domain,
+    set_cached_published_domain,
     invalidate_registry_cache,
 )
+from back.objects.registry.RegistryCfg import RegistryCfg
 
 logger = get_logger(__name__)
 
 _SCHEME_RE = re.compile(r"^https?:/[^/]")
-_DEFAULT_VOLUME = "OntoBricksRegistry"
-_REGISTRY_MARKER = ".registry"
 _DOMAINS_FOLDER = "domains"
 _LEGACY_DOMAINS_FOLDER = "projects"
 
@@ -59,215 +60,6 @@ _LEGACY_DOMAINS_FOLDER = "projects"
 # ------------------------------------------------------------------
 # RegistryCfg — lightweight value object
 # ------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class RegistryCfg:
-    """Immutable registry location triplet (catalog, schema, volume).
-
-    Lakebase is the sole registry backend. ``lakebase_schema`` is the
-    Postgres schema for registry tables.
-
-    ``lakebase_database`` (optional) overrides the bound Postgres
-    database name. When empty (the default), the runtime uses the
-    ``PGDATABASE`` env var auto-injected by the Databricks Apps
-    runtime from the ``database`` resource binding. Setting this lets
-    an admin point the registry at any other database that lives on
-    the same Lakebase instance — provided the app's service principal
-    has ``CONNECT`` on it. The Lakebase JWT scope is per-instance, so
-    no token re-mint is required.
-
-    The ``catalog``/``schema``/``volume`` triplet locates the Unity
-    Catalog Volume where domain-scoped binary artefacts (the
-    ``documents/`` uploads imported by the ontology designer) live; it
-    is not used for registry rows.
-    """
-
-    catalog: str
-    schema: str
-    volume: str
-    lakebase_schema: str = "ontobricks_registry"
-    lakebase_database: str = ""
-
-    # -- constructors ------------------------------------------------
-
-    @classmethod
-    def from_volume_path(
-        cls,
-        path: str,
-        *,
-        lakebase_schema: str = "ontobricks_registry",
-        lakebase_database: str = "",
-    ) -> RegistryCfg:
-        """Parse ``/Volumes/<catalog>/<schema>/<volume>`` into a RegistryCfg."""
-        parts = path.strip("/").split("/")
-        if len(parts) >= 4 and parts[0].lower() == "volumes":
-            return cls(
-                catalog=parts[1],
-                schema=parts[2],
-                volume=parts[3],
-                lakebase_schema=lakebase_schema,
-                lakebase_database=lakebase_database,
-            )
-        logger.warning(
-            "Cannot parse volume path '%s'; expected /Volumes/<c>/<s>/<v>", path
-        )
-        return cls(
-            catalog="",
-            schema="",
-            volume="",
-            lakebase_schema=lakebase_schema,
-            lakebase_database=lakebase_database,
-        )
-
-    @classmethod
-    def from_domain(
-        cls,
-        domain,
-        settings,
-        *,
-        prefer_volume_binding: bool = False,
-    ) -> RegistryCfg:
-        """Build from a *DomainSession* and *Settings* with env-var fallbacks.
-
-        Resolution order (highest priority first):
-
-        1. ``domain.settings["registry"]`` — admin choices made from the
-           Settings UI for the Lakebase-side knobs (``lakebase_schema`` /
-           ``lakebase_database``). These win even on a Databricks Apps
-           deployment where the Volume is bound by the platform.
-        2. **Lakebase ``registries`` row** — when reachable, the
-           catalog/schema/volume triplet is read from the row so binary
-           archive paths and Delta view names follow where artefacts
-           were archived. **However**, when step 3's bound Volume path
-           is present and parses successfully, its catalog/schema/volume
-           **replace** the row values for the UC triplet. Otherwise a
-           Databricks Apps deployment whose bundle Volume name changed
-           (or whose ``registries`` row still holds the env default
-           ``OntoBricksRegistry``) would keep resolving binary paths
-           against the wrong Volume while the platform had mounted the
-           resource named in ``REGISTRY_VOLUME_PATH``.
-        3. ``settings.registry_volume_path`` — when present (Databricks
-           Apps with a bound Volume resource) and parses as
-           ``/Volumes/<c>/<s>/<v>``, that triplet is the authoritative UC
-           location for this process (merged into step 2 when the
-           registries row is found; used alone when step 2 does not
-           return a row).
-        4. ``settings.*`` env vars — last-resort fallback for catalog,
-           schema, volume, ``lakebase_schema`` and ``lakebase_database``.
-
-        ``prefer_volume_binding`` (Initialize path only): when ``True``
-        the Lakebase row read in step 2 is skipped. Lets the Initialize
-        flow re-pin the registry triplet to the *current* Volume
-        binding so a re-bind + re-init cycle propagates the new
-        catalog/schema/volume into the ``registries`` row. Without this
-        flag, re-initialising on a re-bound app silently re-upserts the
-        stale triplet that was already in the row, leaving downstream
-        artefact paths pointing at the previous Volume.
-        """
-        env_lb_schema = (
-            getattr(settings, "lakebase_schema", "ontobricks_registry")
-            or "ontobricks_registry"
-        )
-        env_lb_database = getattr(settings, "lakebase_database", "") or ""
-
-        reg = domain.settings.get("registry", {}) if domain is not None else {}
-        lb_schema = reg.get("lakebase_schema") or env_lb_schema
-        lb_database = reg.get("lakebase_database") or env_lb_database
-
-        vol_path = getattr(settings, "registry_volume_path", "")
-        bound_cfg: Optional[RegistryCfg] = None
-        if vol_path:
-            parsed = cls.from_volume_path(
-                vol_path,
-                lakebase_schema=lb_schema,
-                lakebase_database=lb_database,
-            )
-            if parsed.catalog and parsed.schema and parsed.volume:
-                bound_cfg = parsed
-
-        # Read catalog/schema/volume from the Lakebase ``registries`` row
-        # so binary-archive paths and Delta view names point where
-        # artefacts actually live. When ``bound_cfg`` is set (Databricks
-        # Apps Volume resource binding), its triplet replaces the row's
-        # so UC paths match the mounted Volume. Fail-soft — if Lakebase
-        # is unreachable we fall through to the bound-Volume / env-var
-        # chain. Skipped when ``prefer_volume_binding`` is True
-        # (Initialize path) so re-binding the Volume + re-running
-        # Initialize propagates the new triplet into the row.
-        if not prefer_volume_binding:
-            try:
-                from back.objects.registry.store.lakebase.store import (
-                    fetch_lakebase_registry_triplet,
-                )
-
-                triplet = fetch_lakebase_registry_triplet(lb_schema, lb_database)
-            except Exception:  # noqa: BLE001 -- best-effort, Lakebase may be unreachable
-                triplet = None
-            if triplet:
-                cat, sch, vol = triplet
-                if bound_cfg is not None:
-                    cat, sch, vol = (
-                        bound_cfg.catalog,
-                        bound_cfg.schema,
-                        bound_cfg.volume,
-                    )
-                return cls(
-                    catalog=cat,
-                    schema=sch,
-                    volume=vol or _DEFAULT_VOLUME,
-                    lakebase_schema=lb_schema,
-                    lakebase_database=lb_database,
-                )
-
-        if vol_path:
-            return cls.from_volume_path(
-                vol_path,
-                lakebase_schema=lb_schema,
-                lakebase_database=lb_database,
-            )
-
-        return cls(
-            catalog=reg.get("catalog") or settings.registry_catalog,
-            schema=reg.get("schema") or settings.registry_schema,
-            volume=reg.get("volume") or settings.registry_volume or _DEFAULT_VOLUME,
-            lakebase_schema=lb_schema,
-            lakebase_database=lb_database,
-        )
-
-    @classmethod
-    def from_session(cls, session_mgr, settings) -> RegistryCfg:
-        """Build from *SessionManager* and *Settings*."""
-        from back.objects.session.DomainSession import get_domain
-
-        return cls.from_domain(get_domain(session_mgr), settings)
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, str]) -> RegistryCfg:
-        """Build from a plain dict (e.g. an existing ``registry_cfg``)."""
-        return cls(
-            catalog=d.get("catalog", ""),
-            schema=d.get("schema", ""),
-            volume=d.get("volume", "") or _DEFAULT_VOLUME,
-            lakebase_schema=d.get("lakebase_schema") or "ontobricks_registry",
-            lakebase_database=d.get("lakebase_database") or "",
-        )
-
-    # -- helpers -----------------------------------------------------
-
-    @property
-    def is_configured(self) -> bool:
-        return bool(self.catalog and self.schema and self.volume)
-
-    def as_dict(self) -> Dict[str, str]:
-        """Dict representation for backward compatibility with legacy callers."""
-        return {
-            "catalog": self.catalog,
-            "schema": self.schema,
-            "volume": self.volume,
-            "lakebase_schema": self.lakebase_schema,
-            "lakebase_database": self.lakebase_database,
-        }
 
 
 # ------------------------------------------------------------------
@@ -413,18 +205,6 @@ class RegistryService:
     def version_path(self, folder: str, version: str) -> str:
         """Return the version directory: ``.../domains/{folder}/V{version}``."""
         return f"{self.domain_path(folder)}/V{version}"
-
-    def version_file_path(self, folder: str, version: str) -> str:
-        return f"{self.version_path(folder, version)}/V{version}.json"
-
-    def marker_path(self) -> str:
-        return f"{self.volume_root()}/{_REGISTRY_MARKER}"
-
-    def config_file_path(self) -> str:
-        return f"{self.volume_root()}/.global_config.json"
-
-    def history_file_path(self, folder: str) -> str:
-        return f"{self.domain_path(folder)}/.schedule_history.json"
 
     # -- registry lifecycle ------------------------------------------
 
@@ -625,35 +405,70 @@ class RegistryService:
 
     def list_mcp_domains(
         self, require_ontology: bool = False
-    ) -> Tuple[bool, List[Dict[str, str]], str]:
+    ) -> Tuple[bool, List[Dict[str, Any]], str]:
         """List domains that have an MCP-enabled version.
 
-        Returns ``(ok, domains, message)`` where each domain is
-        ``{"name": ..., "description": ...}``.  When *require_ontology* is
-        ``True`` only domains whose MCP version has a non-empty ``classes``
-        list are included.
+        Returns ``(ok, domains, message)`` where each domain includes its name,
+        description, MCP policy, configured graph backend, and graph
+        availability. When *require_ontology* is ``True`` only domains whose
+        MCP version has a non-empty ``classes`` list are included.
         """
-        ok, names, msg = self._store.list_domain_folders()
+        # Fast path: the cached two-query metadata listing already carries
+        # per-version ``status`` + description, so a domain's PUBLISHED
+        # membership can be decided without the O(domains × versions)
+        # full-document scan the previous implementation performed.
+        ok, details, msg = self.list_domain_details_cached()
         if not ok:
             return False, [], msg
 
-        result: List[Dict[str, str]] = []
-        for name in names:
-            try:
-                mcp_ver, mcp_data = self.find_mcp_version(name)
-                if not mcp_ver:
-                    continue
-                info = mcp_data.get("info", {})
-                if require_ontology:
+        result: List[Dict[str, Any]] = []
+        for d in details:
+            name = d.get("name", "")
+            published = [
+                v
+                for v in d.get("versions", [])
+                if (v.get("status") or "").upper() == "PUBLISHED"
+            ]
+            if not published:
+                continue
+            # ``has_graph`` reflects the numeric-latest PUBLISHED version (the
+            # one the external API/MCP serves): True once it has been built at
+            # least once. An ontology-only domain publishes with no build, so
+            # this stays False and the MCP surface falls back to the ontology
+            # tool alone.
+            latest_published = max(
+                published, key=RegistryService._version_sort_key
+            )
+            from back.core.graphdb.GraphDBFactory import normalize_graph_backend
+
+            graph_backend = normalize_graph_backend(
+                latest_published.get("graph_backend")
+            )
+            has_graph = bool(latest_published.get("last_build"))
+            if require_ontology:
+                # Metadata only carries the latest version's ontology, so
+                # confirm the PUBLISHED version has classes with one targeted
+                # read (still far cheaper than scanning every version).
+                try:
+                    mcp_ver, mcp_data = self.find_published_version(name)
+                    if not mcp_ver:
+                        continue
                     ver_data = mcp_data.get("versions", {}).get(mcp_ver, {})
                     ont = ver_data.get("ontology", mcp_data.get("ontology", {}))
                     if not ont.get("classes"):
                         continue
-                result.append(
-                    {"name": name, "description": info.get("description", "")}
-                )
-            except Exception:
-                logger.debug("Could not inspect domain %s", name)
+                except Exception:
+                    logger.debug("Could not inspect ontology for domain %s", name)
+                    continue
+            result.append(
+                {
+                    "name": name,
+                    "description": d.get("description", ""),
+                    "mcp_policy": coerce_mcp_policy(d.get("mcp_policy")),
+                    "graph_backend": graph_backend,
+                    "has_graph": has_graph,
+                }
+            )
         return True, result, ""
 
     def delete_domain(self, folder: str) -> List[str]:
@@ -676,6 +491,10 @@ class RegistryService:
         logger.info("recursive_delete: listing %s", dir_path)
         ok, items, msg = self._uc.list_directory(dir_path)
         if not ok:
+            # Directory doesn't exist — nothing to delete, not an error.
+            if "not found" in msg.lower() or "404" in msg:
+                logger.info("recursive_delete: %s does not exist, skipping", dir_path)
+                return errors
             logger.warning("recursive_delete: cannot list %s: %s", dir_path, msg)
             errors.append(f"Cannot list {dir_path}: {msg}")
             return errors
@@ -712,6 +531,19 @@ class RegistryService:
         """Return version strings (e.g. ``['2', '1']``) for a domain folder."""
         return self._store.list_versions(folder)
 
+    @staticmethod
+    def _version_sort_key(v: Any) -> List[int]:
+        """Numeric sort key for a version string or a version dict.
+
+        Tolerates malformed versions (returns ``[0]``) so a hand-edited row
+        can never break the listing.
+        """
+        raw = v.get("version", "0") if isinstance(v, dict) else v
+        try:
+            return [int(x) for x in str(raw).split(".")]
+        except (ValueError, AttributeError):
+            return [0]
+
     def list_versions_sorted(self, folder: str, *, reverse: bool = True) -> List[str]:
         """Convenience: sorted version list (empty on failure)."""
         ok, versions, _ = self.list_versions(folder)
@@ -728,6 +560,32 @@ class RegistryService:
     def read_version(self, folder: str, version: str) -> Tuple[bool, dict, str]:
         """Read and parse a version document from Lakebase."""
         return self._store.read_version(folder, version)
+
+    @staticmethod
+    def version_document_has_ontology(
+        data: Dict[str, Any], version: str = ""
+    ) -> bool:
+        """True when a version document declares at least one ontology class.
+
+        Tolerates both document shapes seen across stores: a top-level
+        ``ontology`` block and the ``versions[<v>].ontology`` nesting used by
+        :meth:`find_published_version`. Any non-dict node (from a hand-edited
+        or corrupt row) reads as "no ontology" rather than raising.
+        """
+
+        def _classes(node: Any) -> list:
+            ont = node.get("ontology") if isinstance(node, dict) else None
+            cls = ont.get("classes") if isinstance(ont, dict) else None
+            return cls if isinstance(cls, list) else []
+
+        if not isinstance(data, dict):
+            return False
+        classes = _classes(data)
+        if not classes and version:
+            versions = data.get("versions")
+            vdata = versions.get(version) if isinstance(versions, dict) else None
+            classes = _classes(vdata)
+        return bool(classes)
 
     def write_version(self, folder: str, version: str, data: str) -> Tuple[bool, str]:
         """Persist a version document.
@@ -748,13 +606,38 @@ class RegistryService:
         return ok, msg
 
     def delete_version(self, folder: str, version: str) -> Tuple[bool, str]:
-        """Delete a version (rows + binary directory)."""
+        """Delete a version (rows + Knowledge Store documents + binary dir)."""
         ok, msg = self._store.delete_version(folder, version)
         if not ok:
             return False, msg
-        # Also remove the binary version dir on the Volume (documents/
-        # uploads). Errors are non-fatal — the JSON side is the source
-        # of truth.
+        # Purge the version's Knowledge Store documents (Lakebase). Rows are
+        # keyed by (domain_id, version) with no version FK, so an explicit
+        # purge is needed — the domain-level FK cascade only fires on a full
+        # domain delete.
+        try:
+            doc_rows = self._store.list_documents(folder, version, strict=True)
+            filenames = [r.get("filename") for r in doc_rows if r.get("filename")]
+            if filenames:
+                errors = self._store.delete_documents(folder, version, filenames)
+                if errors:
+                    raise InfrastructureError(
+                        "Registry version metadata was deleted, but Knowledge "
+                        "Store cleanup failed",
+                        detail="; ".join(errors),
+                    )
+        except InfrastructureError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Knowledge Store cleanup raised for %s/V%s", folder, version
+            )
+            raise InfrastructureError(
+                "Registry version metadata was deleted, but Knowledge Store "
+                "cleanup failed",
+                detail=str(exc),
+            ) from exc
+        # Also remove any legacy binary version dir on the Volume. Errors are
+        # non-fatal — Lakebase is the source of truth.
         try:
             errors = self.recursive_delete(self.version_path(folder, version))
             if errors:
@@ -771,6 +654,127 @@ class RegistryService:
         invalidate_registry_cache(self.cache_key)
         return True, ""
 
+    # -- build-run trace (analytics) ---------------------------------
+
+    def record_build_run(self, folder: str, entry: dict) -> None:
+        """Persist a build-run trace row for *folder* (best-effort).
+
+        Never raises — a failed trace must not break a build. See
+        :meth:`RegistryStore.record_build_run`.
+        """
+        try:
+            self._store.record_build_run(folder, entry)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("record_build_run(%s) raised: %s", folder, exc)
+
+    def load_build_runs(
+        self, folder: str, *, version: Optional[str] = None, limit: int = 100
+    ) -> list:
+        """Newest-first build runs for *folder* (optionally one version)."""
+        return self._store.load_build_runs(folder, version=version, limit=limit)
+
+    def build_analytics(
+        self, folder: str, *, version: Optional[str] = None
+    ) -> dict:
+        """Aggregate build statistics for *folder* (optionally one version)."""
+        return self._store.build_analytics(folder, version=version)
+
+    def load_all_build_runs(
+        self,
+        *,
+        folder: Optional[str] = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> Tuple[list, int]:
+        """One newest-first page of build runs across the whole registry.
+
+        Returns ``(page_rows, total)``. ``folder=None`` spans every domain.
+        See :meth:`RegistryStore.load_all_build_runs`.
+        """
+        try:
+            return self._store.load_all_build_runs(
+                folder=folder, limit=limit, offset=offset
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("load_all_build_runs(folder=%s) raised: %s", folder, exc)
+            return [], 0
+
+    # -- graph analytics cache (last result per folder/version) ------
+
+    def save_graph_analytics(
+        self, folder: str, version: str, entry: dict
+    ) -> None:
+        """UPSERT the latest KG analytics result for *folder*/*version*.
+
+        Never raises — a failed cache write must not break the background
+        analytics task. See :meth:`RegistryStore.save_graph_analytics`.
+        """
+        try:
+            self._store.save_graph_analytics(folder, version, entry)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("save_graph_analytics(%s) raised: %s", folder, exc)
+
+    def load_graph_analytics(self, folder: str, version: str) -> Optional[dict]:
+        """Return the stored KG analytics result for *folder*/*version*
+        (or ``None`` when none exists). Never raises.
+        """
+        try:
+            return self._store.load_graph_analytics(folder, version)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("load_graph_analytics(%s) raised: %s", folder, exc)
+            return None
+
+    def record_graph_analytics_run(
+        self, folder: str, version: str, entry: dict
+    ) -> None:
+        """Append an analytics run-history row for *folder*/*version*.
+
+        Never raises — history is best-effort. See
+        :meth:`RegistryStore.record_graph_analytics_run`.
+        """
+        try:
+            self._store.record_graph_analytics_run(folder, version, entry)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("record_graph_analytics_run(%s) raised: %s", folder, exc)
+
+    def load_graph_analytics_runs(
+        self, folder: str, version: Optional[str] = None, *, limit: int = 100
+    ) -> list:
+        """Newest-first analytics run history for *folder*.
+
+        Spans every version unless *version* is given, in which case
+        the history is scoped to that version only.
+        """
+        try:
+            return self._store.load_graph_analytics_runs(
+                folder, version, limit=limit
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("load_graph_analytics_runs(%s) raised: %s", folder, exc)
+            return []
+
+    def load_all_graph_analytics_runs(
+        self,
+        *,
+        folder: Optional[str] = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> Tuple[list, int]:
+        """One newest-first page of analytics runs across the registry.
+
+        Returns ``(page_rows, total)``. ``folder=None`` spans every domain.
+        See :meth:`RegistryStore.load_all_graph_analytics_runs`.
+        """
+        try:
+            return self._store.load_all_graph_analytics_runs(
+                folder=folder, limit=limit, offset=offset
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "load_all_graph_analytics_runs(folder=%s) raised: %s", folder, exc
+            )
+            return [], 0
+
     # -- load domain from registry (stateless) -----------------------
 
     def load_latest_domain_data(self, folder: str) -> Tuple[bool, dict, str, str]:
@@ -786,32 +790,216 @@ class RegistryService:
             return False, {}, latest, msg
         return True, data, latest, ""
 
-    def find_mcp_version(self, folder: str) -> Tuple[Optional[str], dict]:
-        """Find the version with ``mcp_enabled=True`` for *folder*.
+    def find_published_version(self, folder: str) -> Tuple[Optional[str], dict]:
+        """Find the numeric-latest ``PUBLISHED`` version for *folder*.
+
+        The API/MCP surface serves the highest-numbered version whose
+        lifecycle ``status`` is ``PUBLISHED``. Multiple PUBLISHED versions
+        may coexist; this returns the most recent one.
 
         Returns ``(version_str, data_dict)`` or ``(None, {})`` when no
-        version has the flag set.
+        version is PUBLISHED.
         """
         for ver in self.list_versions_sorted(folder):
             ok, data, _ = self.read_version(folder, ver)
             if not ok:
                 continue
-            if data.get("info", {}).get("mcp_enabled"):
+            if data.get("info", {}).get("status") == "PUBLISHED":
                 return ver, data
         return None, {}
 
-    def load_mcp_domain_data(self, folder: str) -> Tuple[bool, dict, str, str]:
-        """Load the MCP-enabled version for *folder*.
+    # Backwards-compatible alias. The old "MCP-enabled" flag has been
+    # replaced by the lifecycle ``status``; "the MCP version" now means
+    # "the latest PUBLISHED version".
+    def find_mcp_version(self, folder: str) -> Tuple[Optional[str], dict]:
+        return self.find_published_version(folder)
 
-        Falls back to the latest version when no version has
-        ``mcp_enabled`` set.
+    def load_published_domain_data(
+        self, folder: str
+    ) -> Tuple[bool, dict, str, str]:
+        """Load the numeric-latest PUBLISHED version for *folder*.
+
+        Unlike :meth:`load_latest_domain_data` there is **no fallback** to
+        a non-PUBLISHED version — the API/MCP surface only serves data for
+        PUBLISHED versions.
 
         Returns ``(ok, data_dict, version_str, error_msg)``.
         """
-        ver, data = self.find_mcp_version(folder)
+        ver, data = self.find_published_version(folder)
         if ver:
             return True, data, ver, ""
-        return self.load_latest_domain_data(folder)
+        return (
+            False,
+            {},
+            "",
+            f'No PUBLISHED version available for domain "{folder}"',
+        )
+
+    def load_published_domain_data_cached(
+        self, folder: str
+    ) -> Tuple[bool, dict, str, str]:
+        """Like :meth:`load_published_domain_data` but memoised (TTL).
+
+        Read-only API/MCP surfaces resolve the same PUBLISHED document on
+        every call. Caching it removes the newest→oldest ``read_version``
+        scan from the hot path. The cache is invalidated on any version
+        write / status change via :func:`invalidate_registry_cache`.
+        """
+        cached = get_cached_published_domain(self.cache_key, folder)
+        if cached is not None:
+            ver, data = cached
+            return True, data, ver, ""
+        ok, data, ver, err = self.load_published_domain_data(folder)
+        if ok:
+            set_cached_published_domain(self.cache_key, folder, ver, data)
+        return ok, data, ver, err
+
+    def set_version_status(
+        self, folder: str, version: str, status: str
+    ) -> Tuple[bool, str]:
+        """Set the lifecycle ``status`` of a single (domain, version)."""
+        ok, msg = self._store.update_version_status(folder, version, status)
+        if ok:
+            invalidate_registry_cache(self.cache_key)
+        return ok, msg
+
+    def get_version_status(
+        self, folder: str, version: str
+    ) -> Optional[str]:
+        """Live lifecycle status of one version (``None`` when absent)."""
+        return self._store.get_version_status(folder, version)
+
+    # -- review / validation audit log -------------------------------
+
+    def record_review_event(
+        self,
+        folder: str,
+        version: str,
+        actor: str,
+        action: str,
+        *,
+        from_status: str = "",
+        to_status: str = "",
+        comment: str = "",
+        meta: Optional[dict] = None,
+    ) -> Tuple[bool, str]:
+        """Append a review-audit row for ``(folder, version)`` (best-effort)."""
+        return self._store.record_review_event(
+            folder,
+            version,
+            actor,
+            action,
+            from_status=from_status,
+            to_status=to_status,
+            comment=comment,
+            meta=meta,
+        )
+
+    def list_review_events(
+        self, folder: str, version: Optional[str] = None
+    ) -> list:
+        """Oldest-first review events for *folder* (optionally one version)."""
+        return self._store.list_review_events(folder, version)
+
+    def list_all_review_events(self) -> list:
+        """All review events across the registry (oldest-first)."""
+        return self._store.list_all_review_events()
+
+    # -- ontology / mapping change audit log -------------------------
+
+    def record_change_events(
+        self,
+        folder: str,
+        version: str,
+        actor: str,
+        events: list,
+    ) -> Tuple[bool, str]:
+        """Append a batch of ontology/mapping change rows (best-effort)."""
+        return self._store.record_change_events(folder, version, actor, events)
+
+    def list_change_events(
+        self, folder: str, version: Optional[str] = None, limit: int = 500
+    ) -> list:
+        """Oldest-first change events for *folder* (optionally one version)."""
+        return self._store.list_change_events(folder, version, limit)
+
+    # -- collaborative comments + tasks ------------------------------
+
+    def insert_comment(
+        self,
+        folder: str,
+        version: str,
+        *,
+        author: str,
+        body: str,
+        parent_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Append a discussion comment; return the created row or None."""
+        return self._store.insert_comment(
+            folder,
+            version,
+            author=author,
+            body=body,
+            parent_id=parent_id,
+        )
+
+    def list_comments(
+        self,
+        folder: str,
+        version: Optional[str] = None,
+        *,
+        include_resolved: bool = True,
+    ) -> list:
+        """Oldest-first comments for *folder* (optionally scoped to version)."""
+        return self._store.list_comments(
+            folder,
+            version,
+            include_resolved=include_resolved,
+        )
+
+    def resolve_comment(
+        self, folder: str, comment_id: str, *, resolved: bool = True
+    ) -> Tuple[bool, str]:
+        """Flip a comment's ``resolved`` flag."""
+        return self._store.resolve_comment(folder, comment_id, resolved=resolved)
+
+    def insert_task(
+        self,
+        folder: str,
+        version: str,
+        *,
+        assignee: str,
+        created_by: str,
+        title: str,
+        description: str = "",
+        due_date: Optional[str] = None,
+        comment_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Create a task; return the created row or None."""
+        return self._store.insert_task(
+            folder,
+            version,
+            assignee=assignee,
+            created_by=created_by,
+            title=title,
+            description=description,
+            due_date=due_date,
+            comment_id=comment_id,
+        )
+
+    def list_tasks(self, folder: str, version: Optional[str] = None) -> list:
+        """Newest-first tasks for *folder* (optionally one *version*)."""
+        return self._store.list_tasks(folder, version)
+
+    def list_tasks_for_assignee(self, assignee: str) -> list:
+        """All tasks across the registry assigned to *assignee*."""
+        return self._store.list_tasks_for_assignee(assignee)
+
+    def update_task_status(
+        self, folder: str, task_id: str, status: str
+    ) -> Tuple[bool, str]:
+        """Set a task's ``status``."""
+        return self._store.update_task_status(folder, task_id, status)
 
     # -- document operations -------------------------------------------
 
@@ -821,35 +1009,20 @@ class RegistryService:
         src_version: str,
         dst_version: str,
     ) -> Tuple[int, List[str]]:
-        """Copy all documents from one version directory to another.
+        """Carry the Knowledge Store corpus forward to a new version.
 
+        Copies the parsed document rows (text, not the transient bytes) from
+        ``src_version`` to ``dst_version`` in Lakebase — no UC Volume I/O.
         Returns ``(copied_count, error_messages)``.
         """
-        src_docs = f"{self.version_path(folder, src_version)}/documents"
-        dst_docs = f"{self.version_path(folder, dst_version)}/documents"
-        ok, items, msg = self._uc.list_directory(src_docs)
+        before = self._store.count_documents(folder, dst_version)
+        ok, msg = self._store.copy_documents_to_version(
+            folder, src_version, dst_version
+        )
         if not ok:
-            if "not found" in msg.lower():
-                return 0, []
-            return 0, [msg]
-        errors: List[str] = []
-        copied = 0
-        for item in items:
-            if item.get("is_directory"):
-                continue
-            name = item["name"]
-            src_file = f"{src_docs}/{name}"
-            dst_file = f"{dst_docs}/{name}"
-            r_ok, content, r_msg = self._uc.read_binary_file(src_file)
-            if not r_ok:
-                errors.append(f"Read {name}: {r_msg}")
-                continue
-            w_ok, w_msg = self._uc.write_binary_file(dst_file, content)
-            if not w_ok:
-                errors.append(f"Write {name}: {w_msg}")
-                continue
-            copied += 1
-        return copied, errors
+            return 0, [msg or "Document copy failed"]
+        after = self._store.count_documents(folder, dst_version)
+        return max(after - before, 0), []
 
     # -- bridge aggregation ---------------------------------------------
 
@@ -916,91 +1089,3 @@ class RegistryService:
 
         return True, result, ""
 
-    # -- one-time layout migration -------------------------------------
-
-    def migrate_domain_layout(self, folder: str) -> Tuple[bool, str]:
-        """Migrate a single domain from the flat layout to the versioned layout.
-
-        Flat layout (old)::
-
-            domains/{folder}/v1.json
-            domains/{folder}/v2.json
-            domains/{folder}/documents/
-
-        Versioned layout (new)::
-
-            domains/{folder}/V1/V1.json
-            domains/{folder}/V1/documents/
-            domains/{folder}/V2/V2.json
-            domains/{folder}/V2/documents/
-
-        Returns ``(ok, message)``.
-        """
-        base = self.domain_path(folder)
-
-        ok, items, msg = self._uc.list_directory(base)
-        if not ok:
-            return False, f"Cannot list {base}: {msg}"
-
-        flat_versions: List[str] = []
-        has_documents = False
-
-        for item in items:
-            name = item["name"]
-            if name.startswith("v") and name.endswith(".json"):
-                flat_versions.append(name[1:-5])  # "v1.json" -> "1"
-            elif name == "documents" and item.get("is_directory"):
-                has_documents = True
-
-        if not flat_versions:
-            return True, "No flat version files found — nothing to migrate"
-
-        flat_versions.sort(
-            key=lambda v: [int(x) for x in v.split(".")],
-            reverse=True,
-        )
-        latest_version = flat_versions[0]
-        errors: List[str] = []
-
-        for ver in flat_versions:
-            old_file = f"{base}/v{ver}.json"
-            new_file = self.version_file_path(folder, ver)
-            r_ok, content, r_msg = self._uc.read_file(old_file)
-            if not r_ok:
-                errors.append(f"Read v{ver}.json: {r_msg}")
-                continue
-            w_ok, w_msg = self._uc.write_file(new_file, content)
-            if not w_ok:
-                errors.append(f"Write V{ver}/V{ver}.json: {w_msg}")
-                continue
-            d_ok, d_msg = self._uc.delete_file(old_file)
-            if not d_ok:
-                errors.append(f"Delete old v{ver}.json: {d_msg}")
-
-        if has_documents:
-            src_docs = f"{base}/documents"
-            dst_docs = f"{self.version_path(folder, latest_version)}/documents"
-            doc_ok, doc_items, doc_msg = self._uc.list_directory(src_docs)
-            if doc_ok:
-                for item in doc_items:
-                    if item.get("is_directory"):
-                        continue
-                    name = item["name"]
-                    r_ok, content, r_msg = self._uc.read_binary_file(
-                        f"{src_docs}/{name}"
-                    )
-                    if not r_ok:
-                        errors.append(f"Read doc {name}: {r_msg}")
-                        continue
-                    w_ok, w_msg = self._uc.write_binary_file(
-                        f"{dst_docs}/{name}", content
-                    )
-                    if not w_ok:
-                        errors.append(f"Write doc {name}: {w_msg}")
-                        continue
-                    self._uc.delete_file(f"{src_docs}/{name}")
-                self._uc.delete_directory(src_docs)
-
-        if errors:
-            return False, f"Migration completed with errors: {'; '.join(errors)}"
-        return True, f"Migrated {len(flat_versions)} version(s) to versioned layout"

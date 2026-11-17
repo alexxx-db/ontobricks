@@ -60,6 +60,12 @@ REST and GraphQL under `/api/v1/...` (GraphQL at `/api/v1/graphql/...`; same han
 
 Pass Databricks credentials in the JSON body or headers as documented per REST operation. GraphQL uses the browser session when called from the UI; external tools should use the same host and session cookie or call from an authenticated context.
 
+## Domain backends
+
+Published domain summaries expose `graph_backend` (`none`, `lakebase`,
+`databricks`, or `neo4j`) and `has_graph`. `none` is ontology-only;
+`has_graph` becomes true after a successful graph build.
+
 ---
 *OpenAPI for programmatic access only — UI HTML routes are not listed here.*
 """
@@ -77,11 +83,12 @@ EXTERNAL_OPENAPI_TAGS: List[Dict[str, str]] = [
     {
         "name": "Domain",
         "description": "**Domain API** — Registry domain list and domain design artifacts "
-        "(OWL ontology, R2RML, generated Spark SQL).",
+        "(OWL ontology, R2RML, generated Spark SQL), including `graph_backend` "
+        "configuration and `has_graph` availability metadata.",
     },
     {
-        "name": "Digital Twin",
-        "description": "**Digital Twin API** — Registry discovery, triple store "
+        "name": "Knowledge Graph",
+        "description": "**Knowledge Graph API** — Registry discovery, triple store "
         "status, build trigger, and triple retrieval.",
     },
     {
@@ -92,8 +99,9 @@ EXTERNAL_OPENAPI_TAGS: List[Dict[str, str]] = [
     },
     {
         "name": "GraphQL",
-        "description": "**GraphQL API** — List domains, GraphiQL playground, execute queries, and SDL "
-        "for the auto-generated ontology-backed schema.",
+        "description": "**GraphQL API** — List domains with a materialized graph, "
+        "open GraphiQL, execute queries, and retrieve SDL for the "
+        "auto-generated ontology-backed schema.",
     },
 ]
 
@@ -103,8 +111,8 @@ EXTERNAL_API_CONTACT: Dict[str, str] = {
 }
 
 EXTERNAL_API_LICENSE_INFO: Dict[str, str] = {
-    "name": "Apache 2.0",
-    "url": "https://www.apache.org/licenses/LICENSE-2.0.html",
+    "name": "Databricks License",
+    "url": "https://github.com/databrickslabs/ontobricks/blob/master/LICENSE.txt",
 }
 
 __all__ = [

@@ -4,10 +4,13 @@ import json
 import re
 from rdflib import BNode, Graph, Namespace, URIRef, Literal
 from rdflib.collection import Collection
-from rdflib.namespace import RDF, RDFS, OWL, XSD
+from rdflib.namespace import RDF, RDFS, OWL, SKOS, XSD
 from typing import List, Dict
 
 from back.core.logging import get_logger
+from back.core.w3c.owl.OntologyRdfExtras import OntologyRdfExtras
+from back.core.w3c.owl.iri import serialize_turtle
+from back.objects.ontology.ClassModel import ClassModel
 from shared.config.constants import ONTOBRICKS_NS
 
 logger = get_logger(__name__)
@@ -27,6 +30,8 @@ class OntologyGenerator:
         axioms: List[Dict] = None,
         expressions: List[Dict] = None,
         groups: List[Dict] = None,
+        label_lang: str = None,
+        rdf_extras: dict = None,
     ):
         """Initialize the OWL generator.
 
@@ -40,9 +45,16 @@ class OntologyGenerator:
             axioms: List of OWL axioms (logical assertions)
             expressions: List of OWL class expressions (unionOf, intersectionOf, etc.)
             groups: List of entity group definitions (name, label, color, icon, members)
+            label_lang: Optional language tag for the ontology label
+            rdf_extras: Unmodeled RDF namespace bindings and triples
         """
-        self.base_uri = base_uri.rstrip("#") + "#"
+        self.base_uri = (
+            base_uri
+            if base_uri.endswith(("#", "/"))
+            else base_uri + "#"
+        )
         self.ontology_name = ontology_name
+        self.label_lang = label_lang
         self.classes = classes or []
         self.properties = properties or []
         self.constraints = constraints or []
@@ -50,9 +62,20 @@ class OntologyGenerator:
         self.axioms = axioms or []
         self.expressions = expressions or []
         self.groups = groups or []
+        self.rdf_extras = rdf_extras or {}
 
         self.graph = Graph()
         self.ns = Namespace(self.base_uri)
+        self._entity_uri_index = self._build_entity_uri_index()
+
+        # Index of class attributes (local name -> set of attribute local names)
+        # used to drop stale domain-scoped DatatypeProperty shadows on export.
+        self._class_attr_index = self._build_class_attr_index()
+
+        # Derive a clean lowercase prefix from the ontology name (e.g. "MyDomain" -> "mydomain").
+        # Fall back to the empty prefix only when no name is available.
+        _raw = re.sub(r"[^a-zA-Z0-9]", "", self.ontology_name or "").lower()
+        self._domain_prefix = _raw or ""
 
         # Bind namespaces
         self.graph.bind("owl", OWL)
@@ -60,7 +83,7 @@ class OntologyGenerator:
         self.graph.bind("rdfs", RDFS)
         self.graph.bind("xsd", XSD)
         self.graph.bind("ontobricks", ONTOBRICKS_NS)
-        self.graph.bind("", self.ns)
+        self.graph.bind(self._domain_prefix, self.ns)
 
     def generate(self) -> str:
         """Generate OWL content.
@@ -73,7 +96,13 @@ class OntologyGenerator:
         self.graph.add((ontology_uri, RDF.type, OWL.Ontology))
 
         if self.ontology_name:
-            self.graph.add((ontology_uri, RDFS.label, Literal(self.ontology_name)))
+            self.graph.add(
+                (
+                    ontology_uri,
+                    RDFS.label,
+                    Literal(self.ontology_name, lang=self.label_lang or None),
+                )
+            )
 
         # Add classes and their data properties (attributes)
         for cls in self.classes:
@@ -100,8 +129,99 @@ class OntologyGenerator:
         # Add entity groups (defined classes with owl:unionOf)
         self._add_groups()
 
+        live_subjects = {str(subject) for subject in self.graph.subjects()}
+        OntologyRdfExtras().apply(
+            self.graph, self.rdf_extras, live_subjects=live_subjects
+        )
+
         # Serialize to Turtle format
-        return self.graph.serialize(format="turtle")
+        return serialize_turtle(self.graph)
+
+    @staticmethod
+    def _local_name(ref: str) -> str:
+        """Return the local name of a URI/CURIE/plain name (after ``#`` or ``/``)."""
+        if not ref:
+            return ""
+        return ref.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+
+    def _build_class_attr_index(self) -> Dict[str, set]:
+        """Map each class (by name and URI local name) to its attribute names.
+
+        ``classes[].dataProperties`` is the authoritative store for class
+        attributes; this index lets :meth:`_add_property` recognise — and skip —
+        domain-scoped ``DatatypeProperty`` shadows whose attribute was deleted
+        from its owning class (issue #50).
+        """
+        index: Dict[str, set] = {}
+        for cls in self.classes:
+            attrs = set()
+            for dp in cls.get("dataProperties", []) or []:
+                dp_name = dp if isinstance(dp, str) else (
+                    dp.get("name") or dp.get("localName") or ""
+                )
+                local = self._local_name(dp_name).lower()
+                if local:
+                    attrs.add(local)
+
+            keys = set()
+            name = (cls.get("name") or "").strip()
+            if name:
+                keys.add(name.lower())
+                keys.add(self._local_name(name).lower())
+            uri = cls.get("uri") or ""
+            if uri:
+                keys.add(self._local_name(uri).lower())
+            for key in keys:
+                if key:
+                    index.setdefault(key, set()).update(attrs)
+        return index
+
+    def _effective_uri(self, name: str, stored_uri: str = "") -> URIRef:
+        """Resolve an entity URI without reusing an IRI made stale by a rename."""
+        clean_name = (name or "").strip()
+        clean_stored_uri = (stored_uri or "").strip()
+        if (
+            clean_stored_uri.startswith(("http://", "https://"))
+            and self._local_name(clean_stored_uri) == clean_name
+        ):
+            return URIRef(clean_stored_uri)
+        return URIRef(self.base_uri + clean_name)
+
+    def _build_entity_uri_index(self) -> Dict[str, URIRef]:
+        """Index current class/property names to their effective subject IRIs."""
+        index: Dict[str, URIRef] = {}
+        for entity in [*self.classes, *self.properties]:
+            name = (entity.get("name") or "").strip()
+            if name:
+                index[name] = self._effective_uri(name, str(entity.get("uri") or ""))
+        for cls in self.classes:
+            for data_prop in cls.get("dataProperties", []) or []:
+                if not isinstance(data_prop, dict):
+                    continue
+                name = (
+                    data_prop.get("name") or data_prop.get("localName") or ""
+                ).strip()
+                if name:
+                    index[name] = self._effective_uri(
+                        self._sanitize_name(name), str(data_prop.get("uri") or "")
+                    )
+        return index
+
+    def _is_stale_datatype_shadow(self, prop_name: str, domain: str) -> bool:
+        """True when *prop_name* is a domain-scoped datatype attribute the
+        owning class no longer declares.
+
+        Conservative: returns False when the domain is empty or the domain class
+        is unknown to this generator, so only attributes explicitly removed from
+        a known class are dropped.
+        """
+        domain_local = self._local_name(domain).lower()
+        if not domain_local:
+            return False
+        class_attrs = self._class_attr_index.get(domain_local)
+        if class_attrs is None:
+            return False
+        return self._local_name(prop_name).lower() not in class_attrs
 
     def _resolve_uri(self, ref: str):
         """Convert a name or full URI string to a URIRef, or None if empty."""
@@ -109,7 +229,7 @@ class OntologyGenerator:
             return None
         if ref.startswith("http://") or ref.startswith("https://"):
             return URIRef(ref)
-        return URIRef(self.base_uri + ref)
+        return self._entity_uri_index.get(ref, URIRef(self.base_uri + ref))
 
     def _collect_uris(self, refs: list) -> list:
         """Resolve a list of name/URI strings to URIRefs, skipping empty values."""
@@ -433,7 +553,7 @@ class OntologyGenerator:
         """Add a class to the ontology.
 
         Args:
-            cls: Class definition with 'name', 'label', 'comment', 'parent', 'emoji', 'dashboard', 'dataProperties'
+            cls: Class definition with 'name', 'label', 'comment', 'parent', 'emoji', 'dashboard', 'dataset', 'dataProperties'
         """
         class_name = cls.get("name", "").strip()
         if not class_name:
@@ -443,7 +563,7 @@ class OntologyGenerator:
             "Processing class: %s, parent: %s", class_name, cls.get("parent", "NONE")
         )
 
-        class_uri = URIRef(self.base_uri + class_name)
+        class_uri = self._effective_uri(class_name, str(cls.get("uri") or ""))
 
         # Define as OWL Class
         self.graph.add((class_uri, RDF.type, OWL.Class))
@@ -451,12 +571,23 @@ class OntologyGenerator:
         # Add label
         label = cls.get("label", class_name)
         if label:
-            self.graph.add((class_uri, RDFS.label, Literal(label)))
+            lang = cls.get("label_lang") or None
+            self.graph.add((class_uri, RDFS.label, Literal(label, lang=lang)))
+
+        # Add synonyms (alternate labels) as first-class ontology data,
+        # using the standard SKOS altLabel vocabulary (design:
+        # docs/superpowers/specs/2026-09-20-three-stage-ontology-generate-design.md
+        # §Synonyms as first-class alternate labels; task 4 review finding #4).
+        for alt_label in cls.get("alternate_labels", []) or []:
+            alt_label = str(alt_label or "").strip()
+            if alt_label:
+                self.graph.add((class_uri, SKOS.altLabel, Literal(alt_label)))
 
         # Add comment/description
         comment = cls.get("comment", "") or cls.get("description", "")
         if comment:
-            self.graph.add((class_uri, RDFS.comment, Literal(comment)))
+            lang = cls.get("comment_lang") or None
+            self.graph.add((class_uri, RDFS.comment, Literal(comment, lang=lang)))
 
         # Add emoji/icon using custom OntoBricks property
         emoji = cls.get("emoji", "")
@@ -492,20 +623,64 @@ class OntologyGenerator:
                 (class_uri, ONTOBRICKS_NS.bridges, Literal(json.dumps(bridges)))
             )
 
+        # Linked Unity Catalog datasets (tables/views/metric views) as JSON array
+        datasets = ClassModel.normalize_datasets(cls)
+        if datasets:
+            self.graph.add(
+                (class_uri, ONTOBRICKS_NS.dataset, Literal(json.dumps(datasets)))
+            )
+
+        # Add linked Unity Catalog function actions as JSON string
+        actions = cls.get("actions", [])
+        if actions:
+            self.graph.add(
+                (class_uri, ONTOBRICKS_NS.actions, Literal(json.dumps(actions)))
+            )
+
+        # Add referenced SWRL business rules (by rule name) as JSON string
+        business_rules = cls.get("business_rules", [])
+        if business_rules:
+            self.graph.add(
+                (
+                    class_uri,
+                    ONTOBRICKS_NS.businessRules,
+                    Literal(json.dumps(business_rules)),
+                )
+            )
+
+        # Add virtual attribute declarations as JSON string. These are computed
+        # on demand by a UC function, never materialized, so they are kept out
+        # of the owl:DatatypeProperty block below on purpose.
+        virtual_attributes = cls.get("virtualAttributes", [])
+        if virtual_attributes:
+            self.graph.add(
+                (
+                    class_uri,
+                    ONTOBRICKS_NS.virtualAttributes,
+                    Literal(json.dumps(virtual_attributes)),
+                )
+            )
+
         # Add parent class (subClassOf)
         parent = cls.get("parent", "").strip() if cls.get("parent") else ""
-        if parent:
-            logger.debug("Adding subClassOf: %s -> %s", class_name, parent)
-            if parent.startswith("http://") or parent.startswith("https://"):
-                parent_uri = URIRef(parent)
-            else:
-                parent_uri = URIRef(self.base_uri + parent)
+        stored_parent_uri = str(cls.get("parent_uri") or "").strip()
+        parent_ref = (
+            stored_parent_uri
+            if (
+                stored_parent_uri.startswith(("http://", "https://"))
+                and self._local_name(stored_parent_uri) == self._local_name(parent)
+            )
+            else parent
+        )
+        if parent_ref:
+            logger.debug("Adding subClassOf: %s -> %s", class_name, parent_ref)
+            parent_uri = self._resolve_uri(parent_ref)
             self.graph.add((class_uri, RDFS.subClassOf, parent_uri))
 
         # Add data properties (attributes) for this class
         data_props = cls.get("dataProperties", [])
         for data_prop in data_props:
-            self._add_data_property_for_class(data_prop, class_name)
+            self._add_data_property_for_class(data_prop, class_uri)
 
     def _sanitize_name(self, name: str) -> str:
         """Sanitize a name to be URI-safe.
@@ -529,12 +704,12 @@ class OntologyGenerator:
         sanitized = sanitized.strip("_")
         return sanitized
 
-    def _add_data_property_for_class(self, data_prop: Dict, class_name: str):
+    def _add_data_property_for_class(self, data_prop: Dict, class_uri: URIRef):
         """Add a data property (attribute) for a specific class.
 
         Args:
             data_prop: Data property definition with 'name', 'type', etc.
-            class_name: Name of the class this property belongs to
+            class_uri: URI of the class this property belongs to
         """
         # Handle different formats - can be string or dict
         if isinstance(data_prop, str):
@@ -557,7 +732,10 @@ class OntologyGenerator:
 
         # Create a unique property name to avoid conflicts
         # Use format: className_propertyName or just propertyName
-        prop_uri = URIRef(self.base_uri + prop_name)
+        stored_prop_uri = (
+            str(data_prop.get("uri", "")) if isinstance(data_prop, dict) else ""
+        )
+        prop_uri = self._effective_uri(prop_name, stored_prop_uri)
 
         if (prop_uri, RDF.type, OWL.DatatypeProperty) in self.graph:
             return
@@ -569,8 +747,7 @@ class OntologyGenerator:
         self.graph.add((prop_uri, RDFS.label, Literal(original_name)))
 
         # Add domain (the class this property belongs to)
-        domain_uri = URIRef(self.base_uri + class_name)
-        self.graph.add((prop_uri, RDFS.domain, domain_uri))
+        self.graph.add((prop_uri, RDFS.domain, class_uri))
 
         # Add range (default to xsd:string)
         prop_type = (
@@ -617,10 +794,25 @@ class OntologyGenerator:
         if not prop_name:
             return
 
-        prop_uri = URIRef(self.base_uri + prop_name)
-
         # Determine property type
         prop_type = prop.get("type", "ObjectProperty")
+
+        # Skip stale class-attribute shadows: a domain-scoped DatatypeProperty
+        # whose owning class no longer declares it (deleted in the designer).
+        # The class's dataProperties list is the single source of truth for
+        # attributes (issue #50).
+        if prop_type == "DatatypeProperty" and self._is_stale_datatype_shadow(
+            prop_name, prop.get("domain", "")
+        ):
+            logger.debug(
+                "Skipping stale datatype attribute shadow: %s (domain %s)",
+                prop_name,
+                prop.get("domain", ""),
+            )
+            return
+
+        prop_uri = self._effective_uri(prop_name, str(prop.get("uri") or ""))
+
         if prop_type == "DatatypeProperty":
             self.graph.add((prop_uri, RDF.type, OWL.DatatypeProperty))
         else:
@@ -629,12 +821,14 @@ class OntologyGenerator:
         # Add label
         label = prop.get("label", prop_name)
         if label:
-            self.graph.add((prop_uri, RDFS.label, Literal(label)))
+            lang = prop.get("label_lang") or None
+            self.graph.add((prop_uri, RDFS.label, Literal(label, lang=lang)))
 
         # Add comment
         comment = prop.get("comment", "")
         if comment:
-            self.graph.add((prop_uri, RDFS.comment, Literal(comment)))
+            lang = prop.get("comment_lang") or None
+            self.graph.add((prop_uri, RDFS.comment, Literal(comment, lang=lang)))
 
         # Add direction as custom property
         direction = prop.get("direction", "forward")
@@ -643,26 +837,37 @@ class OntologyGenerator:
 
         # Add domain
         domain = prop.get("domain", "")
-        if domain:
-            domain = domain.strip()
-            if domain.startswith("http://") or domain.startswith("https://"):
-                domain_uri = URIRef(domain)
-            else:
-                domain_uri = URIRef(self.base_uri + domain)
+        stored_domain_uri = str(prop.get("domain_uri") or "").strip()
+        domain_ref = (
+            stored_domain_uri
+            if (
+                stored_domain_uri.startswith(("http://", "https://"))
+                and self._local_name(stored_domain_uri) == self._local_name(domain)
+            )
+            else domain
+        )
+        if domain_ref:
+            domain_uri = self._resolve_uri(domain_ref)
             self.graph.add((prop_uri, RDFS.domain, domain_uri))
 
         # Add range
         range_val = prop.get("range", "")
-        if range_val:
-            range_val = range_val.strip()
-            if range_val.startswith("http://") or range_val.startswith("https://"):
-                range_uri = URIRef(range_val)
-            elif range_val.startswith("xsd:"):
+        stored_range_uri = str(prop.get("range_uri") or "").strip()
+        range_ref = (
+            stored_range_uri
+            if (
+                stored_range_uri.startswith(("http://", "https://"))
+                and self._local_name(stored_range_uri) == self._local_name(range_val)
+            )
+            else range_val
+        )
+        if range_ref:
+            if range_ref.startswith("xsd:"):
                 # Handle XSD datatypes
-                datatype = range_val.replace("xsd:", "")
+                datatype = range_ref.replace("xsd:", "")
                 range_uri = self._get_xsd_type(datatype)
             else:
-                range_uri = URIRef(self.base_uri + range_val)
+                range_uri = self._resolve_uri(range_ref)
             self.graph.add((prop_uri, RDFS.range, range_uri))
 
         # Note: Relationship attributes are not supported - relationships are simple ObjectProperties
@@ -894,10 +1099,7 @@ class OntologyGenerator:
 
             member_uris = []
             for m in member_names:
-                if m.startswith("http://") or m.startswith("https://"):
-                    member_uris.append(URIRef(m))
-                else:
-                    member_uris.append(URIRef(self.base_uri + m))
+                member_uris.append(self._resolve_uri(m))
 
             members_list = BNode()
             Collection(self.graph, members_list, member_uris)

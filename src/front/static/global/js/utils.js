@@ -298,36 +298,47 @@ async function loadSchemas(catalog) {
 }
 
 
-/**
- * Load volumes for a catalog and schema
- * @param {string} catalog - Catalog name
- * @param {string} schema - Schema name
- * @returns {Promise<Array>} List of volume names
- */
-async function loadVolumes(catalog, schema) {
-    try {
-        const data = await apiRequest(`/settings/volumes/${catalog}/${schema}`);
-        return data.volumes || [];
-    } catch (error) {
-        console.error('Error loading volumes:', error);
-        return [];
-    }
-}
-
-
 // ========== HTML UTILITIES ==========
+
+const _HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
 /**
  * Escape HTML special characters to prevent XSS.
  * Canonical implementation — all modules should use this instead of local copies.
+ * Safe for both text content and quoted attribute values.
  * @param {*} text - Text to escape
  * @returns {string} Escaped HTML string
  */
 function escapeHtml(text) {
     if (text === null || text === undefined) return '';
-    const div = document.createElement('div');
-    div.textContent = String(text);
-    return div.innerHTML;
+    return String(text).replace(/[&<>"']/g, ch => _HTML_ESCAPES[ch]);
+}
+
+/**
+ * Escape a value for a quoted HTML attribute (alias of escapeHtml).
+ * @param {*} text - Text to escape
+ * @returns {string} Escaped attribute string
+ */
+function escapeAttr(text) {
+    return escapeHtml(text);
+}
+
+/**
+ * Render untrusted Markdown to sanitised HTML.
+ * Uses the global `marked` + `DOMPurify` (loaded in base.html); without
+ * either of them it falls back to escaped plain text with <br> line breaks.
+ * @param {*} text - Markdown source
+ * @returns {string} HTML safe to assign to innerHTML
+ */
+function renderMarkdown(text) {
+    const src = text === null || text === undefined ? '' : String(text);
+    if (window.marked && typeof window.marked.parse === 'function'
+            && window.DOMPurify && typeof window.DOMPurify.sanitize === 'function') {
+        try {
+            return window.DOMPurify.sanitize(window.marked.parse(src, { breaks: true, gfm: true }));
+        } catch (e) { /* fall through to plain text */ }
+    }
+    return escapeHtml(src).replace(/\n/g, '<br>');
 }
 
 
@@ -363,6 +374,49 @@ function extractLocalName(uri) {
 // ========== CONFIRMATION DIALOG ==========
 
 /**
+ * Show a Bootstrap modal above the currently visible modal, if any.
+ * @param {HTMLElement} modalEl - Child modal element to display
+ * @returns {bootstrap.Modal} Bootstrap modal instance
+ */
+function showStackedModal(modalEl) {
+    const openModals = Array.from(document.querySelectorAll('.modal.show'))
+        .filter((el) => el !== modalEl);
+    const parentModal = openModals.length
+        ? openModals[openModals.length - 1]
+        : null;
+    let stackApplied = false;
+
+    const applyStack = () => {
+        if (!parentModal || stackApplied) return;
+        parentModal.classList.add('ob-modal-underlying');
+        modalEl.classList.add('ob-modal-stacked');
+        const backdrops = document.querySelectorAll('.modal-backdrop');
+        const topBackdrop = backdrops.length
+            ? backdrops[backdrops.length - 1]
+            : null;
+        topBackdrop?.classList.add('ob-modal-stacked-backdrop');
+        stackApplied = true;
+    };
+
+    const clearStack = () => {
+        if (!stackApplied) return;
+        parentModal?.classList.remove('ob-modal-underlying');
+        modalEl.classList.remove('ob-modal-stacked');
+        document.querySelectorAll('.modal-backdrop.ob-modal-stacked-backdrop')
+            .forEach((el) => el.classList.remove('ob-modal-stacked-backdrop'));
+        stackApplied = false;
+    };
+
+    modalEl.addEventListener('shown.bs.modal', applyStack, { once: true });
+    modalEl.addEventListener('hidden.bs.modal', clearStack, { once: true });
+
+    const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+    modal.show();
+    applyStack();
+    return modal;
+}
+
+/**
  * Show a confirmation dialog (replaces native confirm())
  * @param {Object} options - Dialog options
  * @param {string} options.title - Dialog title (default: 'Confirm')
@@ -371,6 +425,12 @@ function extractLocalName(uri) {
  * @param {string} options.cancelText - Cancel button text (default: 'Cancel')
  * @param {string} options.confirmClass - Bootstrap button class for confirm (default: 'btn-primary')
  * @param {string} options.icon - Bootstrap icon name (default: 'question-circle')
+ * @param {string} options.detailHtml - Optional HTML rendered below the message in a
+ *   scrollable bordered panel (for listing affected items, diffs, etc.)
+ * @param {string} options.size - Optional Bootstrap modal size class, e.g. 'modal-lg'
+ * @param {string} options.headerClass - Optional Bootstrap class for the header, e.g. 'bg-danger text-white'
+ * @param {string} options.checkboxLabel - Optional checkbox shown under the message
+ * @param {boolean} options.checkboxChecked - Initial checkbox state; updated on confirm
  * @returns {Promise<boolean>} Resolves to true if confirmed, false if cancelled
  */
 function showConfirmDialog(options = {}) {
@@ -381,23 +441,40 @@ function showConfirmDialog(options = {}) {
             confirmText = 'Yes',
             cancelText = 'Cancel',
             confirmClass = 'btn-primary',
-            icon = 'question-circle'
+            icon = 'question-circle',
+            detailHtml = '',
+            size = '',
+            headerClass = '',
+            checkboxLabel = '',
+            checkboxChecked = false
         } = options;
-        
+
         const modalId = 'confirmDialog_' + Date.now();
-        
+        const closeClass = headerClass.includes('text-white') ? 'btn-close-white' : '';
+        const detailBlock = detailHtml
+            ? `<div class="border rounded p-3 bg-light mt-3" style="max-height: 320px; overflow-y: auto;">${detailHtml}</div>`
+            : '';
+        const checkboxBlock = checkboxLabel
+            ? `<div class="form-check mt-3">
+                    <input class="form-check-input ob-confirm-check" type="checkbox" id="${modalId}_check"${checkboxChecked ? ' checked' : ''}>
+                    <label class="form-check-label" for="${modalId}_check">${checkboxLabel}</label>
+               </div>`
+            : '';
+
         const modalHtml = `
             <div class="modal fade" id="${modalId}" tabindex="-1" data-bs-backdrop="static">
-                <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-dialog modal-dialog-centered ${size}">
                     <div class="modal-content">
-                        <div class="modal-header">
+                        <div class="modal-header ${headerClass}">
                             <h5 class="modal-title">
                                 <i class="bi bi-${icon} me-2"></i>${title}
                             </h5>
-                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                            <button type="button" class="btn-close ${closeClass}" data-bs-dismiss="modal"></button>
                         </div>
                         <div class="modal-body">
                             <p class="mb-0">${message}</p>
+                            ${checkboxBlock}
+                            ${detailBlock}
                         </div>
                         <div class="modal-footer">
                             <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" id="${modalId}_cancel">
@@ -411,35 +488,84 @@ function showConfirmDialog(options = {}) {
                 </div>
             </div>
         `;
-        
-        // Remove any existing dialog with same ID
+
         const existing = document.getElementById(modalId);
         if (existing) existing.remove();
-        
-        // Add modal to page
+
         document.body.insertAdjacentHTML('beforeend', modalHtml);
-        
+
         const modalEl = document.getElementById(modalId);
-        const modal = new bootstrap.Modal(modalEl);
-        
+
         let resolved = false;
-        
-        // Handle confirm
+
         document.getElementById(`${modalId}_confirm`).addEventListener('click', () => {
+            const box = document.getElementById(`${modalId}_check`);
+            if (box) options.checkboxChecked = box.checked;
             resolved = true;
             modal.hide();
             resolve(true);
         });
-        
-        // Handle cancel/close
+
         modalEl.addEventListener('hidden.bs.modal', () => {
             if (!resolved) {
                 resolve(false);
             }
-            // Clean up modal from DOM
             setTimeout(() => modalEl.remove(), 100);
         });
-        
+
+        const modal = showStackedModal(modalEl);
+    });
+}
+
+/**
+ * Show a simple informational modal with a single dismiss button.
+ * @param {object} options - { title, message, okText, okClass, icon }
+ * @returns {Promise<void>} resolves once the dialog is dismissed
+ */
+function showInfoDialog(options = {}) {
+    return new Promise((resolve) => {
+        const {
+            title = 'Information',
+            message = '',
+            okText = 'OK',
+            okClass = 'btn-primary',
+            icon = 'info-circle'
+        } = options;
+
+        const modalId = 'infoDialog_' + Date.now();
+        const modalHtml = `
+            <div class="modal fade" id="${modalId}" tabindex="-1">
+                <div class="modal-dialog modal-dialog-centered">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title">
+                                <i class="bi bi-${icon} me-2"></i>${title}
+                            </h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body">
+                            <p class="mb-0">${message}</p>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn ${okClass}" id="${modalId}_ok">
+                                ${okText}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.insertAdjacentHTML('beforeend', modalHtml);
+        const modalEl = document.getElementById(modalId);
+        const modal = new bootstrap.Modal(modalEl);
+
+        document.getElementById(`${modalId}_ok`).addEventListener('click', () => modal.hide());
+        modalEl.addEventListener('hidden.bs.modal', () => {
+            setTimeout(() => modalEl.remove(), 100);
+            resolve();
+        });
+
         modal.show();
     });
 }
@@ -491,23 +617,10 @@ const DocumentPreview = {
         return el;
     },
 
-    _extOf(filename) {
-        return (filename.includes('.') ? filename.split('.').pop() : '').toLowerCase();
-    },
-
-    _isBinary(ext) {
-        return ['pdf', 'png', 'jpg', 'jpeg', 'gif', 'svg'].includes(ext);
-    },
-
-    _isImage(ext) {
-        return ['png', 'jpg', 'jpeg', 'gif', 'svg'].includes(ext);
-    },
-
     open(filename) {
         const modalEl = this._ensureModal();
         const title = document.getElementById('docPreviewTitle');
         const body = document.getElementById('docPreviewBody');
-        const ext = this._extOf(filename);
 
         title.innerHTML = `<i class="bi bi-eye me-2"></i>${escapeHtml(filename)}`;
         body.innerHTML = `<div class="d-flex justify-content-center align-items-center" style="min-height:300px;">
@@ -517,31 +630,21 @@ const DocumentPreview = {
         const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
         modal.show();
 
+        // The original binary is never retained — preview always serves the
+        // parsed text extracted from the Knowledge Store.
         const url = `/domain/documents/preview/${encodeURIComponent(filename)}`;
-
-        if (ext === 'pdf') {
-            body.innerHTML = `<iframe class="doc-preview-iframe" src="${url}"></iframe>`;
-            return;
-        }
-
-        if (this._isImage(ext)) {
-            body.innerHTML = `<div class="text-center p-3">
-                <img src="${url}" class="doc-preview-image" alt="${escapeHtml(filename)}">
-            </div>`;
-            return;
-        }
-
         fetch(url, { credentials: 'same-origin' })
             .then(r => r.json())
             .then(data => {
                 if (!data.success) {
                     body.innerHTML = `<div class="p-4 text-center text-muted">
                         <i class="bi bi-file-earmark-x fs-1 d-block mb-2"></i>
-                        ${escapeHtml(data.message || 'Preview not available')}
+                        ${escapeHtml(data.error || data.message || 'Parsed content not available yet')}
                     </div>`;
                     return;
                 }
-                if (ext === 'md') {
+                const looksMarkdown = /^\s*#{1,6}\s|\*\*|^- /m.test(data.content || '');
+                if (looksMarkdown) {
                     body.innerHTML = `<div class="doc-preview-md p-4">${this._renderMarkdown(data.content)}</div>`;
                 } else {
                     body.innerHTML = `<pre class="doc-preview-text p-3 m-0">${escapeHtml(data.content)}</pre>`;
@@ -550,7 +653,7 @@ const DocumentPreview = {
             .catch(err => {
                 body.innerHTML = `<div class="p-4 text-center text-danger">
                     <i class="bi bi-exclamation-triangle fs-1 d-block mb-2"></i>
-                    Error loading preview: ${escapeHtml(err.message)}
+                    Error loading parsed content: ${escapeHtml(err.message)}
                 </div>`;
             });
     },
@@ -714,14 +817,180 @@ window.fetch = function(input, init) {
     return _origFetch.call(this, input, init);
 };
 
+/**
+ * Strip non-alphanumeric chars and force CamelCase on a domain name.
+ * Each "word" (sequence of letters/digits after a non-alnum char or at the
+ * start) gets its first letter uppercased.
+ */
+function enforceDomainNameCamelCase(value) {
+    const stripped = String(value || '').replace(/[^a-zA-Z0-9]/g, ' ');
+    return stripped
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+        .join('');
+}
+
+/**
+ * Domain names must be CamelCase alphanumeric (no spaces or special characters).
+ */
+function isValidDomainName(name) {
+    return /^[A-Z][a-zA-Z0-9]*$/.test(String(name || '').trim());
+}
+
+/**
+ * Show a modal that collects a new domain name, description, and LLM target.
+ * Resolves with endpoint name and kind, or null if cancelled.
+ */
+function showNewDomainDialog() {
+    return new Promise((resolve) => {
+        const modalId = 'newDomainDialog_' + Date.now();
+        const modalHtml = `
+            <div class="modal fade" id="${modalId}" tabindex="-1" data-bs-backdrop="static">
+                <div class="modal-dialog modal-dialog-centered">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title">
+                                <i class="bi bi-file-earmark-plus me-2"></i>New Domain
+                            </h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body">
+                            <p class="text-muted small mb-3">Enter a name for your new domain. You can add more details later.</p>
+                            <div class="mb-3">
+                                <label for="${modalId}_name" class="form-label fw-semibold">Domain name <span class="text-danger">*</span></label>
+                                <input type="text" class="form-control new-domain-field" id="${modalId}_name"
+                                       placeholder="e.g. PatientCare, SupplyChain…" autocomplete="off" maxlength="64"
+                                       pattern="[A-Z][A-Za-z0-9]*" inputmode="text" spellcheck="false">
+                                <div class="form-text">CamelCase alphanumeric only — no spaces or special characters.</div>
+                                <div class="invalid-feedback" id="${modalId}_name_err">Please enter a CamelCase alphanumeric name (e.g. MyOntologyDomain).</div>
+                            </div>
+                            <div class="mb-3">
+                                <label for="${modalId}_desc" class="form-label fw-semibold">Description <span class="text-muted fw-normal">(optional)</span></label>
+                                <textarea class="form-control new-domain-field" id="${modalId}_desc" rows="2"
+                                          placeholder="Short description of this domain…" maxlength="256"></textarea>
+                            </div>
+                            <div class="alert alert-light border small py-2 mb-3">
+                                <i class="bi bi-hdd-network me-1"></i>
+                                This domain uses the <strong>Lakehouse</strong> graph backend by default. You can
+                                change it anytime in <strong>Domain → General</strong>:
+                                <ul class="mb-0 mt-1 ps-3">
+                                    <li><strong>Lakehouse</strong> — graph stored as Delta tables in Unity Catalog (default).</li>
+                                    <li><strong>Lakebase</strong> — graph stored in a managed Postgres instance.</li>
+                                    <li><strong>Neo4j</strong> — external native graph database (requires a connection).</li>
+                                    <li><strong>No Backend</strong> — ontology only, no knowledge graph.</li>
+                                </ul>
+                            </div>
+                            <div class="mb-1">
+                                <label for="${modalId}_llm_display" class="form-label fw-semibold">
+                                    <i class="bi bi-robot me-1"></i>LLM Endpoint <span class="text-muted fw-normal">(optional — for OntoBricks Agents)</span>
+                                </label>
+                                <div class="input-group">
+                                    <input type="hidden" id="${modalId}_llm" value="">
+                                    <input type="hidden" id="${modalId}_llm_kind" value="">
+                                    <input type="text" class="form-control new-domain-field"
+                                           id="${modalId}_llm_display" readonly placeholder="No LLM selected">
+                                    <button type="button" class="btn btn-outline-secondary"
+                                            id="${modalId}_llm_browse">
+                                        <i class="bi bi-search me-1"></i>Browse
+                                    </button>
+                                </div>
+                                <small class="text-muted">AI Gateway model service or legacy Model Serving endpoint.</small>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" id="${modalId}_cancel">Cancel</button>
+                            <button type="button" class="btn btn-primary" id="${modalId}_confirm">
+                                <i class="bi bi-check2 me-1"></i>Create Domain
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+
+        document.body.insertAdjacentHTML('beforeend', modalHtml);
+        const modalEl   = document.getElementById(modalId);
+        const nameInput = document.getElementById(`${modalId}_name`);
+        const llmInput = document.getElementById(`${modalId}_llm`);
+        const llmKindInput = document.getElementById(`${modalId}_llm_kind`);
+        const llmDisplay = document.getElementById(`${modalId}_llm_display`);
+        const modal     = new bootstrap.Modal(modalEl);
+        let resolved    = false;
+
+        document.getElementById(`${modalId}_llm_browse`).addEventListener('click', async () => {
+            if (typeof openLlmEndpointPicker !== 'function') return;
+            const selected = await openLlmEndpointPicker({
+                name: llmInput.value,
+                kind: llmKindInput.value
+            });
+            if (!selected) return;
+            llmInput.value = selected.name;
+            llmKindInput.value = selected.kind;
+            llmDisplay.value = selected.name;
+        });
+
+        document.getElementById(`${modalId}_confirm`).addEventListener('click', () => {
+            const name = enforceDomainNameCamelCase(nameInput.value).trim();
+            nameInput.value = name;
+            if (!isValidDomainName(name)) {
+                nameInput.classList.add('is-invalid');
+                nameInput.focus();
+                return;
+            }
+            const desc = (document.getElementById(`${modalId}_desc`).value || '').trim();
+            const llm = llmInput.value || '';
+            const llmKind = llmKindInput.value || '';
+            resolved = true;
+            modal.hide();
+            resolve({
+                name,
+                description: desc,
+                llm_endpoint: llm,
+                llm_endpoint_kind: llmKind,
+                graph_backend: 'databricks'
+            });
+        });
+
+        nameInput.addEventListener('input', () => {
+            const pos = nameInput.selectionStart;
+            const cleaned = enforceDomainNameCamelCase(nameInput.value);
+            if (cleaned !== nameInput.value) {
+                nameInput.value = cleaned;
+                nameInput.setSelectionRange(
+                    Math.min(pos, cleaned.length),
+                    Math.min(pos, cleaned.length)
+                );
+            }
+            nameInput.classList.remove('is-invalid');
+        });
+        nameInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') document.getElementById(`${modalId}_confirm`).click();
+        });
+
+        modalEl.addEventListener('hidden.bs.modal', () => {
+            if (!resolved) resolve(null);
+            setTimeout(() => modalEl.remove(), 100);
+        });
+
+        modal.show();
+        setTimeout(() => nameInput.focus(), 300);
+    });
+}
+
 // Make all utility functions globally available
 window.showNotification = showNotification;
 window.NotificationCenter = NotificationCenter;
 window.DocumentPreview = DocumentPreview;
 window.showConfirmDialog = showConfirmDialog;
+window.showInfoDialog = showInfoDialog;
 window.showDeleteConfirm = showDeleteConfirm;
 window.apiRequest = apiRequest;
 window.escapeHtml = escapeHtml;
+window.escapeAttr = escapeAttr;
+window.renderMarkdown = renderMarkdown;
+window.enforceDomainNameCamelCase = enforceDomainNameCamelCase;
+window.isValidDomainName = isValidDomainName;
+window.showNewDomainDialog = showNewDomainDialog;
 window.fetchOnce = fetchOnce;
 window.fetchOnceInvalidate = fetchOnceInvalidate;
 window.fetchCached = fetchCached;

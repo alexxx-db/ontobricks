@@ -48,6 +48,9 @@ def _make_request(method="GET", path="/", email="user@test.com", headers=None):
     req.method = method
     req.url = MagicMock()
     req.url.path = path
+    # Mirror a real ASGI request: middleware reads the raw routed path from
+    # scope["path"] (BadHost-safe), not the Host-reconstructed url.path.
+    req.scope = {"path": path}
     req.state = State()
     _headers = {
         "x-forwarded-email": email,
@@ -339,7 +342,7 @@ class TestAdminOnlyPaths:
             ("/settings/registry", "GET"),
             ("/settings/registry/domains", "GET"),
             ("/settings/registry/bridges", "GET"),
-            ("/settings/graph-engine", "GET"),
+            ("/settings/delta-warehouse", "GET"),
             ("/settings/graph-engine-config", "GET"),
             ("/settings/graph-engine/lakebase-health", "GET"),
         ],
@@ -353,19 +356,44 @@ class TestAdminOnlyPaths:
         )
         assert result.get("passed")
 
+    @pytest.mark.parametrize("domain_role", [ROLE_EDITOR, ROLE_BUILDER])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/settings/catalogs",
+            "/settings/schemas",
+            "/settings/schemas/main",
+        ],
+    )
+    def test_domain_editors_can_browse_data_source_locations(
+        self, domain_role, path
+    ):
+        """Editors and Builders can populate the Add Data Source picker."""
+        _, _, result = _dispatch_with_roles(
+            ROLE_APP_USER, domain_role, method="GET", path=path
+        )
+        assert result.get("passed")
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/settings/catalogs",
+            "/settings/schemas",
+            "/settings/schemas/main",
+        ],
+    )
+    def test_data_source_location_writes_remain_admin_only(self, path):
+        _, resp, result = _dispatch_with_roles(
+            ROLE_APP_USER, ROLE_BUILDER, method="POST", path=path
+        )
+        assert resp.status_code in (302, 403)
+        assert not result.get("passed")
+
     def test_post_on_registry_exception_is_still_admin_only(self):
         """POST /settings/registry (change registry location) must
         NOT benefit from the read-only GET exception."""
         _, resp, result = _dispatch_with_roles(
             ROLE_APP_USER, ROLE_VIEWER, method="POST", path="/settings/registry"
-        )
-        assert resp.status_code in (302, 403)
-        assert not result.get("passed")
-
-    def test_post_graph_engine_still_admin_only(self):
-        """POST /settings/graph-engine must not use the GET read exception."""
-        _, resp, result = _dispatch_with_roles(
-            ROLE_APP_USER, ROLE_VIEWER, method="POST", path="/settings/graph-engine"
         )
         assert resp.status_code in (302, 403)
         assert not result.get("passed")
@@ -401,10 +429,32 @@ class TestAdminOnlyPaths:
         assert resp.status_code in (302, 403)
         assert not result.get("passed")
 
+    @pytest.mark.parametrize(
+        "path", ["/settings/runs/build", "/settings/runs/analytics"]
+    )
+    def test_cross_domain_run_history_is_admin_only(self, path):
+        """The Runs page reports every domain's builds and analyses, so its
+        readers must not join the read-only exception list the way
+        ``/settings/registry/domains`` did."""
+        _, resp, result = _dispatch_with_roles(
+            ROLE_APP_USER, ROLE_BUILDER, method="GET", path=path
+        )
+        assert resp.status_code in (302, 403)
+        assert not result.get("passed")
+
 
 # ------------------------------------------------------------------
 # Domain-scoped routes require a team entry (new strict model)
 # ------------------------------------------------------------------
+
+
+# Exact POST paths a Viewer may use (must match _VIEWER_READ_ONLY_POSTS).
+_VIEWER_READ_ONLY_POST_PATHS = (
+    "/dtwin/sync/filter",
+    "/dtwin/assistant/chat",
+    "/dtwin/assistant/chat/stream",
+    "/dtwin/graphql/execute",
+)
 
 
 class TestDomainScopedRoutes:
@@ -438,6 +488,104 @@ class TestDomainScopedRoutes:
             ROLE_APP_USER, ROLE_EDITOR, method="POST", path="/ontology/"
         )
         assert result.get("passed")
+
+    @pytest.mark.parametrize("path", _VIEWER_READ_ONLY_POST_PATHS)
+    def test_viewer_can_post_to_read_only_graph_endpoints(self, path):
+        _, _, result = _dispatch_with_roles(
+            ROLE_APP_USER, ROLE_VIEWER, method="POST", path=path
+        )
+        assert result.get("passed")
+
+    @pytest.mark.parametrize("path", _VIEWER_READ_ONLY_POST_PATHS)
+    def test_viewer_can_get_read_only_graph_endpoints(self, path):
+        _, _, result = _dispatch_with_roles(
+            ROLE_APP_USER, ROLE_VIEWER, method="GET", path=path
+        )
+        assert result.get("passed")
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/dtwin/sync/start",
+            "/dtwin/sync/load",
+            "/dtwin/nodes/action/request",
+            "/dtwin/nodes/action/confirm",
+            "/dtwin/nodes/action/cancel",
+            "/dtwin/sync/filter/extra",
+            "/dtwin/assistant/chat/extra",
+            "/dtwin/graphql/execute/extra",
+            "/dtwin/execute",
+            "/dtwin/assistant/history/limit",
+        ],
+    )
+    def test_viewer_still_cannot_post_elsewhere_under_dtwin(self, path):
+        _, resp, result = _dispatch_with_roles(
+            ROLE_APP_USER, ROLE_VIEWER, method="POST", path=path
+        )
+        assert resp.status_code == 403 and not result.get("passed")
+
+    @pytest.mark.parametrize("path", _VIEWER_READ_ONLY_POST_PATHS)
+    @pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+    def test_read_only_paths_accept_post_only(self, method, path):
+        _, resp, result = _dispatch_with_roles(
+            ROLE_APP_USER, ROLE_VIEWER, method=method, path=path
+        )
+        assert resp.status_code == 403 and not result.get("passed")
+
+    @pytest.mark.parametrize("path", _VIEWER_READ_ONLY_POST_PATHS)
+    def test_non_member_still_cannot_use_read_only_posts(self, path):
+        _, resp, result = _dispatch_with_roles(
+            ROLE_APP_USER, ROLE_NONE, method="POST", path=path
+        )
+        assert resp.status_code == 403 and not result.get("passed")
+
+    @pytest.mark.parametrize(
+        "path",
+        ["/dtwin/sync/load", "/dtwin/nodes/action/request", "/dtwin/execute"],
+    )
+    def test_editor_can_still_post_graph_writes(self, path):
+        _, _, result = _dispatch_with_roles(
+            ROLE_APP_USER, ROLE_EDITOR, method="POST", path=path
+        )
+        assert result.get("passed")
+
+    @pytest.mark.parametrize("domain_role", [ROLE_EDITOR, ROLE_BUILDER])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/domain/metadata/list-tables",
+            "/domain/metadata/initialize-async",
+            "/domain/metadata/save",
+            "/domain/metadata/clear",
+            "/domain/metadata/update-table-location",
+            "/domain/metadata/update-async",
+        ],
+    )
+    def test_editors_and_builders_can_manage_data_sources(
+        self, domain_role, path
+    ):
+        _, _, result = _dispatch_with_roles(
+            ROLE_APP_USER, domain_role, method="POST", path=path
+        )
+        assert result.get("passed")
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/domain/metadata/list-tables",
+            "/domain/metadata/initialize-async",
+            "/domain/metadata/save",
+            "/domain/metadata/clear",
+            "/domain/metadata/update-table-location",
+            "/domain/metadata/update-async",
+        ],
+    )
+    def test_viewer_cannot_manage_data_sources(self, path):
+        _, resp, result = _dispatch_with_roles(
+            ROLE_APP_USER, ROLE_VIEWER, method="POST", path=path
+        )
+        assert resp.status_code == 403
+        assert not result.get("passed")
 
     def test_admin_bypasses_domain_gate(self):
         _, _, result = _dispatch_with_roles(
@@ -949,3 +1097,780 @@ class TestImportAndResetEndpoints:
         )
         assert resp.status_code == 403
         assert not result.get("passed")
+
+
+# ------------------------------------------------------------------
+# Single-editor edit-lock gate (authoritative)
+# ------------------------------------------------------------------
+
+
+def _dispatch_with_edit_lock(holder, *, app_role=ROLE_EDITOR, domain_role=ROLE_EDITOR,
+                             method="POST", path="/ontology/"):
+    """Drive a dispatch on a DRAFT version with a stubbed lock holder.
+
+    ``holder`` is the name returned by ``_session_edit_lock_holder`` (``""``
+    means the lock is free / held by the caller — request must pass).
+    """
+    from shared.fastapi.main import PermissionMiddleware
+
+    req = _make_request(method=method, path=path)
+    result = {}
+
+    async def call_next(r):
+        result["passed"] = True
+        return MagicMock(status_code=200)
+
+    middleware = PermissionMiddleware(MagicMock())
+
+    with (
+        patch("back.core.databricks.is_databricks_app", return_value=True),
+        patch.object(
+            PermissionMiddleware, "_resolve_roles",
+            return_value=(app_role, domain_role),
+        ),
+        patch.object(
+            PermissionMiddleware, "_session_version_status", return_value="DRAFT"
+        ),
+        patch.object(
+            PermissionMiddleware, "_session_edit_lock_holder", return_value=holder
+        ),
+    ):
+        resp = _run(middleware.dispatch(req, call_next))
+    return req, resp, result
+
+
+class TestEditLockGate:
+    """The edit-lock gate runs after the lifecycle gate on DRAFT versions:
+    a non-holder mutating a gated edit route is 403'd, while the holder
+    (empty ``_session_edit_lock_holder``) passes through. Admins are NOT
+    exempt — they must take over the lock first."""
+
+    def test_non_holder_editor_blocked(self):
+        _, resp, result = _dispatch_with_edit_lock("Bob")
+        assert resp.status_code == 403
+        assert not result.get("passed")
+
+    def test_holder_passes(self):
+        _, _, result = _dispatch_with_edit_lock("")
+        assert result.get("passed")
+
+    def test_admin_not_exempt_from_lock(self):
+        _, resp, result = _dispatch_with_edit_lock(
+            "Bob", app_role=ROLE_ADMIN, domain_role=ROLE_ADMIN
+        )
+        assert resp.status_code == 403
+        assert not result.get("passed")
+
+    def test_lock_not_checked_on_read(self):
+        """GET is not a status-gated edit, so the lock gate never runs."""
+        called = {}
+
+        def _holder(_self, _req):
+            called["checked"] = True
+            return "Bob"
+
+        from shared.fastapi.main import PermissionMiddleware
+
+        req = _make_request(method="GET", path="/ontology/")
+
+        async def call_next(r):
+            return MagicMock(status_code=200)
+
+        middleware = PermissionMiddleware(MagicMock())
+        with (
+            patch("back.core.databricks.is_databricks_app", return_value=True),
+            patch.object(
+                PermissionMiddleware, "_resolve_roles",
+                return_value=(ROLE_EDITOR, ROLE_EDITOR),
+            ),
+            patch.object(
+                PermissionMiddleware, "_session_edit_lock_holder", _holder
+            ),
+        ):
+            _run(middleware.dispatch(req, call_next))
+        assert "checked" not in called
+
+
+# ------------------------------------------------------------------
+# Data-refresh ops are NOT gated on lifecycle status (issue #78)
+# ------------------------------------------------------------------
+
+
+def _dispatch_with_status(
+    app_role, domain_role, *, version_status, method="POST", path
+):
+    """Drive a dispatch with predetermined roles AND a stubbed version status."""
+    from shared.fastapi.main import PermissionMiddleware
+
+    req = _make_request(method=method, path=path)
+    result = {}
+
+    async def call_next(r):
+        result["passed"] = True
+        return MagicMock(status_code=200)
+
+    middleware = PermissionMiddleware(MagicMock())
+
+    with (
+        patch("back.core.databricks.is_databricks_app", return_value=True),
+        patch.object(
+            PermissionMiddleware, "_resolve_roles",
+            return_value=(app_role, domain_role),
+        ),
+        patch.object(
+            PermissionMiddleware, "_session_version_status",
+            return_value=version_status,
+        ),
+        patch.object(
+            PermissionMiddleware, "_session_edit_lock_holder", return_value="",
+        ),
+    ):
+        resp = _run(middleware.dispatch(req, call_next))
+    return req, resp, result
+
+
+class TestDataRefreshNotStatusGated:
+    """KG data-refresh ops must pass on PUBLISHED / IN-REVIEW domains.
+
+    These paths were previously in ``_STATUS_GATE_EDIT_PATHS`` and blocked
+    all non-DRAFT versions.  After the fix (issue #78) they are status-open:
+    a builder can re-materialise graph data without reverting to DRAFT.
+    Design-editing paths (``/ontology/``) must still be blocked.
+    """
+
+    DATA_REFRESH_PATHS = [
+        "/dtwin/sync/start",
+        "/dtwin/sync/load",
+        "/dtwin/reasoning/materialize",
+        "/dtwin/reasoning/inferred",
+    ]
+
+    @pytest.mark.parametrize("path", DATA_REFRESH_PATHS)
+    @pytest.mark.parametrize("status", ["PUBLISHED", "IN-REVIEW"])
+    def test_builder_can_refresh_on_non_draft(self, path, status):
+        """A builder on a non-DRAFT version must reach data-refresh endpoints."""
+        _, _, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_BUILDER,
+            version_status=status,
+            path=path,
+        )
+        assert result.get("passed"), (
+            f"builder should reach {path} on {status} version"
+        )
+
+    @pytest.mark.parametrize("status", ["PUBLISHED", "IN-REVIEW"])
+    def test_design_edit_still_blocked_on_non_draft(self, status):
+        """Design-editing paths must still be blocked on non-DRAFT versions."""
+        _, resp, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_BUILDER,
+            version_status=status,
+            path="/ontology/entities",
+        )
+        assert resp.status_code == 403, (
+            f"design edit should be blocked on {status} version"
+        )
+        assert not result.get("passed")
+
+    @pytest.mark.parametrize("path", DATA_REFRESH_PATHS)
+    def test_viewer_still_blocked_by_role_gate(self, path):
+        """Role gate still applies: viewers must not reach data-refresh ops."""
+        _, resp, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_VIEWER,
+            version_status="DRAFT",
+            path=path,
+        )
+        assert resp.status_code == 403, (
+            f"viewer should be blocked on {path} regardless of status"
+        )
+        assert not result.get("passed")
+
+    @pytest.mark.parametrize("path", DATA_REFRESH_PATHS)
+    def test_admin_can_refresh_on_published(self, path):
+        """Admins bypass the domain-role gate and must also reach data-refresh
+        paths on non-DRAFT versions."""
+        _, _, result = _dispatch_with_status(
+            ROLE_ADMIN, ROLE_ADMIN,
+            version_status="PUBLISHED",
+            path=path,
+        )
+        assert result.get("passed"), (
+            f"admin should reach {path} on PUBLISHED version"
+        )
+
+    def test_data_refresh_allowed_on_draft_too(self):
+        """Data-refresh ops must of course still work on DRAFT versions."""
+        for path in self.DATA_REFRESH_PATHS:
+            _, _, result = _dispatch_with_status(
+                ROLE_APP_USER, ROLE_BUILDER,
+                version_status="DRAFT",
+                path=path,
+            )
+            assert result.get("passed"), (
+                f"builder should reach {path} on DRAFT version"
+            )
+
+
+# ------------------------------------------------------------------
+# _viewer_write_blocked — pure function unit tests
+# ------------------------------------------------------------------
+
+
+class TestViewerWriteBlocked:
+    """Direct unit tests for the Viewer write-gate classifier."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from shared.fastapi.main import (
+            _VIEWER_BLOCKED_METHODS,
+            _VIEWER_READ_ONLY_POSTS,
+            _viewer_write_blocked,
+        )
+
+        self._blocked_methods = _VIEWER_BLOCKED_METHODS
+        self._posts = _VIEWER_READ_ONLY_POSTS
+        self._fn = _viewer_write_blocked
+
+    def test_allowlist_matches_documented_graph_paths(self):
+        assert self._posts == frozenset(_VIEWER_READ_ONLY_POST_PATHS)
+
+    @pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS"])
+    @pytest.mark.parametrize(
+        "path",
+        list(_VIEWER_READ_ONLY_POST_PATHS) + ["/dtwin/sync/load"],
+    )
+    def test_safe_methods_never_blocked(self, method, path):
+        assert not self._fn(method, path)
+
+    @pytest.mark.parametrize("path", _VIEWER_READ_ONLY_POST_PATHS)
+    def test_post_on_allowlist_not_blocked(self, path):
+        assert not self._fn("POST", path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/dtwin/sync/load",
+            "/dtwin/nodes/action/request",
+            "/dtwin/sync/filter/extra",
+            "/dtwin/graphql/execute/extra",
+        ],
+    )
+    def test_post_off_allowlist_blocked(self, path):
+        assert self._fn("POST", path)
+
+    @pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+    @pytest.mark.parametrize("path", _VIEWER_READ_ONLY_POST_PATHS)
+    def test_non_post_writes_on_allowlist_blocked(self, method, path):
+        assert method in self._blocked_methods
+        assert self._fn(method, path)
+
+
+# ------------------------------------------------------------------
+# _is_status_gated_edit — pure function unit tests
+# ------------------------------------------------------------------
+
+
+class TestIsStatusGatedEdit:
+    """Direct unit tests for the ``_is_status_gated_edit`` classifier.
+
+    Exercises the path/method classification logic without going through
+    the full middleware dispatch stack.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from shared.fastapi.main import _is_status_gated_edit
+        self._fn = _is_status_gated_edit
+
+    # --- GET requests are never gated (only write methods are) ---
+
+    @pytest.mark.parametrize("path", [
+        "/ontology/entities",
+        "/domain/save",
+        "/dtwin/sync/start",
+    ])
+    def test_get_is_never_gated(self, path):
+        assert not self._fn(path, "GET")
+
+    # --- Design-edit prefixes are gated ---
+
+    @pytest.mark.parametrize("path", [
+        "/ontology/",
+        "/ontology/entities",
+        "/mapping/",
+        "/mapping/assignments",
+    ])
+    def test_design_edit_prefixes_are_gated(self, path):
+        assert self._fn(path, "POST")
+
+    # --- Open suffixes under an editing prefix are NOT gated ---
+
+    @pytest.mark.parametrize("path", [
+        "/ontology/entities/generate",
+        "/ontology/validate",
+        "/mapping/assignments/analyze",
+        "/ontology/pitfalls/analyze",
+        "/ontology/chat",
+    ])
+    def test_open_suffixes_exempt_from_gate(self, path):
+        assert not self._fn(path, "POST")
+
+    # --- Explicit design-edit paths (domain/* writes) ---
+
+    @pytest.mark.parametrize("path", [
+        "/domain/save",
+        "/domain/info",
+        "/domain/import",
+        "/domain/reset",
+        "/domain/clear",
+        "/domain/config",
+        "/domain/map-layout",
+        "/domain/save-to-uc",
+        "/domain/design-views/create",
+        "/domain/design-views/rename",
+        "/domain/design-views/delete",
+        "/domain/metadata/",
+        "/domain/documents/",
+    ])
+    def test_explicit_design_edit_paths_are_gated(self, path):
+        assert self._fn(path, "POST")
+
+    # --- Data-refresh ops are NOT gated (issue #78) ---
+
+    @pytest.mark.parametrize("path", [
+        "/dtwin/sync/start",
+        "/dtwin/sync/load",
+        "/dtwin/reasoning/materialize",
+    ])
+    def test_data_refresh_paths_not_gated(self, path):
+        assert not self._fn(path, "POST"), (
+            f"{path} must not be status-gated (data-refresh op)"
+        )
+
+    # --- Other dtwin writes that were always open ---
+
+    @pytest.mark.parametrize("path", [
+        "/dtwin/sync/filter",
+        "/dtwin/reasoning/start",
+        "/dtwin/execute",
+    ])
+    def test_dtwin_non_gated_paths_remain_open(self, path):
+        assert not self._fn(path, "POST")
+
+    # --- Wizard paths are exempt regardless (except an explicit ---
+    # --- carve-out for the one wizard route that actually persists ---
+    # --- into the ontology design: staged Generate's merge). ---
+
+    def test_wizard_path_exempt(self):
+        assert not self._fn("/ontology/wizard/step1", "POST")
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/ontology/wizard/generate/detect",
+            "/ontology/wizard/generate/draft/update",
+            "/ontology/wizard/generate/draft/discard",
+        ],
+    )
+    def test_generate_review_routes_remain_exempt(self, path):
+        """Stage 1 detect and Stage 2 draft mutations only touch the
+        session-scoped draft, never the persisted ontology design — they
+        must stay reachable on a locked/PUBLISHED version exactly like the
+        rest of the wizard."""
+        assert not self._fn(path, "POST")
+
+    def test_generate_complete_is_gated(self):
+        """Stage 3 ``complete`` calls the deterministic append-only merge,
+        which persists new classes/properties/axioms into the loaded
+        version's design (``domain.save()``) — it must be status/lock
+        gated exactly like every other ``/ontology/`` design mutation,
+        despite living under the generally-exempt ``/wizard/`` prefix."""
+        assert self._fn("/ontology/wizard/generate/complete", "POST")
+
+    def test_generate_complete_get_not_gated(self):
+        """Only the mutating verbs matter — GET is never gated."""
+        assert not self._fn("/ontology/wizard/generate/complete", "GET")
+
+
+# ------------------------------------------------------------------
+# Full lifecycle gate in dispatch (design blocked, data-refresh open)
+# ------------------------------------------------------------------
+
+
+class TestLifecycleGateInDispatch:
+    """End-to-end dispatch tests for the lifecycle status gate.
+
+    Complements ``TestIsStatusGatedEdit`` (function) and
+    ``TestDataRefreshNotStatusGated`` (role/status combos) by verifying
+    the gate wires correctly inside the full middleware dispatch.
+    """
+
+    @pytest.mark.parametrize("status", ["PUBLISHED", "IN-REVIEW"])
+    def test_mapping_edit_blocked_on_non_draft(self, status):
+        _, resp, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_BUILDER,
+            version_status=status,
+            path="/mapping/assignments",
+        )
+        assert resp.status_code == 403
+        assert not result.get("passed")
+
+    @pytest.mark.parametrize("path", [
+        "/domain/save",
+        "/domain/metadata/",
+        "/domain/documents/",
+        "/domain/design-views/create",
+    ])
+    def test_explicit_design_paths_blocked_on_published(self, path):
+        _, resp, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_BUILDER,
+            version_status="PUBLISHED",
+            path=path,
+        )
+        assert resp.status_code == 403
+        assert not result.get("passed")
+
+    def test_draft_design_edit_passes(self):
+        """On DRAFT, design edits pass through (role gate allows builder)."""
+        _, _, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_BUILDER,
+            version_status="DRAFT",
+            path="/ontology/entities",
+        )
+        assert result.get("passed")
+
+    @pytest.mark.parametrize("status", ["PUBLISHED", "IN-REVIEW"])
+    def test_kg_filter_allowed_on_non_draft(self, status):
+        """KG filtering is read-only; it must stay available on locked versions."""
+        _, _, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_BUILDER,
+            version_status=status,
+            path="/dtwin/sync/filter",
+        )
+        assert result.get("passed"), (
+            f"KG filter should be allowed on {status} version"
+        )
+
+
+# ------------------------------------------------------------------
+# Staged Generate: POST /ontology/wizard/generate/complete mutates the
+# design (append-only merge), so it must obey the same lifecycle-status
+# and single-editor-lock gate as every other design edit. Stage 1 detect
+# and Stage 2 draft review only touch the session-scoped draft (never the
+# persisted ontology), so they must remain reachable regardless of status
+# or lock, exactly like the rest of the wizard.
+# ------------------------------------------------------------------
+
+
+class TestGenerateCompleteLifecycleGate:
+    COMPLETE_PATH = "/ontology/wizard/generate/complete"
+    REVIEW_ONLY_PATHS = [
+        "/ontology/wizard/generate/detect",
+        "/ontology/wizard/generate/draft/update",
+        "/ontology/wizard/generate/draft/discard",
+    ]
+
+    @pytest.mark.parametrize("status", ["PUBLISHED", "IN-REVIEW"])
+    def test_complete_blocked_on_non_draft(self, status):
+        _, resp, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_BUILDER,
+            version_status=status,
+            path=self.COMPLETE_PATH,
+        )
+        assert resp.status_code == 403
+        assert not result.get("passed")
+
+    def test_complete_passes_on_draft_with_no_lock_holder(self):
+        """Normal builder flow: DRAFT version, lock free/held by the
+        caller — completion must reach the handler."""
+        _, _, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_BUILDER,
+            version_status="DRAFT",
+            path=self.COMPLETE_PATH,
+        )
+        assert result.get("passed")
+
+    def test_complete_blocked_by_other_lock_holder_on_draft(self):
+        """DRAFT version but a *different* user holds the edit lock —
+        completion must be blocked exactly like any other design edit."""
+        _, resp, result = _dispatch_with_edit_lock("Bob", path=self.COMPLETE_PATH)
+        assert resp.status_code == 403
+        assert not result.get("passed")
+
+    def test_complete_admin_not_exempt_from_lock(self):
+        """Admins must take over the lock first, same as every other
+        design-editing route — no route-specific admin bypass."""
+        _, resp, result = _dispatch_with_edit_lock(
+            "Bob", app_role=ROLE_ADMIN, domain_role=ROLE_ADMIN, path=self.COMPLETE_PATH,
+        )
+        assert resp.status_code == 403
+        assert not result.get("passed")
+
+    def test_complete_blocked_for_viewer_role(self):
+        """The plain role gate still applies underneath the lifecycle gate."""
+        _, resp, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_VIEWER,
+            version_status="DRAFT",
+            path=self.COMPLETE_PATH,
+        )
+        assert resp.status_code == 403
+        assert not result.get("passed")
+
+    @pytest.mark.parametrize("path", REVIEW_ONLY_PATHS)
+    @pytest.mark.parametrize("status", ["PUBLISHED", "IN-REVIEW"])
+    def test_review_routes_reachable_on_locked_version(self, path, status):
+        """Stage 1/2 must stay reachable on a locked version — they never
+        touch the persisted design, only the session-scoped draft."""
+        _, _, result = _dispatch_with_status(
+            ROLE_APP_USER, ROLE_BUILDER,
+            version_status=status,
+            path=path,
+        )
+        assert result.get("passed"), f"{path} should be reachable on a {status} version"
+
+    @pytest.mark.parametrize("path", REVIEW_ONLY_PATHS)
+    def test_review_routes_reachable_despite_other_lock_holder(self, path):
+        """Stage 1/2 must not be blocked by the design edit-lock either —
+        it is not a design mutation."""
+        _, _, result = _dispatch_with_edit_lock("Bob", path=path)
+        assert result.get("passed")
+
+
+# ------------------------------------------------------------------
+# Request identity binding (OBO)
+# ------------------------------------------------------------------
+
+
+class TestRequestIdentityBinding:
+    """PermissionMiddleware binds the caller identity for the request scope."""
+
+    def test_identity_bound_during_call_next(self):
+        from shared.fastapi.main import PermissionMiddleware
+        from back.core.databricks.request_identity import get_request_identity
+
+        req = _make_request(
+            method="GET",
+            path="/dtwin/query",
+            headers={"x-forwarded-access-token": "utok"},
+        )
+        seen = {}
+
+        async def call_next(r):
+            ident = get_request_identity()
+            seen["email"] = ident.email
+            seen["token"] = ident.user_token
+            seen["domain_role"] = ident.domain_role
+            return MagicMock(status_code=200)
+
+        middleware = PermissionMiddleware(MagicMock())
+
+        with (
+            patch("back.core.databricks.is_databricks_app", return_value=True),
+            patch.object(
+                PermissionMiddleware,
+                "_resolve_roles",
+                return_value=(ROLE_APP_USER, ROLE_VIEWER),
+            ),
+        ):
+            _run(middleware.dispatch(req, call_next))
+
+        assert seen["email"] == "user@test.com"
+        assert seen["token"] == "utok"
+        assert seen["domain_role"] == ROLE_VIEWER
+        assert req.state.user_token == "utok"
+        # Identity is reset after the request completes.
+        assert get_request_identity().user_token == ""
+
+    def test_local_dev_binds_admin_identity(self):
+        from shared.fastapi.main import PermissionMiddleware
+        from back.core.databricks.request_identity import get_request_identity
+
+        req = _make_request(method="GET", path="/dtwin/query")
+        seen = {}
+
+        async def call_next(r):
+            seen["role"] = get_request_identity().app_role
+            seen["token"] = get_request_identity().user_token
+            return MagicMock(status_code=200)
+
+        middleware = PermissionMiddleware(MagicMock())
+
+        with patch("back.core.databricks.is_databricks_app", return_value=False):
+            _run(middleware.dispatch(req, call_next))
+
+        assert seen["role"] == "admin"
+        assert seen["token"] == ""
+        assert get_request_identity().user_token == ""
+
+
+# ------------------------------------------------------------------
+# Bypass paths still carry the forwarded user token for OBO (MCP)
+# ------------------------------------------------------------------
+
+
+class TestBypassBindsForwardedTokenForOBO:
+    """`/api/*` and `/graphql/*` skip the session role gate, but they must
+    still stamp the forwarded ``x-forwarded-access-token`` into the request
+    identity so Lakehouse / Unity Catalog reads run on-behalf-of the caller
+    (MCP OBO), exactly like Explorer and Graph Chat on the internal routes.
+
+    Missing token → empty (service-principal fallback, unchanged)."""
+
+    @pytest.mark.parametrize("path", ["/api/v1/digitaltwin/triples/find", "/graphql/"])
+    def test_forwarded_token_bound_on_bypass(self, path):
+        from shared.fastapi.main import PermissionMiddleware
+        from back.core.databricks.request_identity import get_request_identity
+
+        req = _make_request(
+            method="GET",
+            path=path,
+            email="user@test.com",
+            headers={"x-forwarded-access-token": "utok"},
+        )
+        seen = {}
+
+        async def call_next(r):
+            ident = get_request_identity()
+            seen["email"] = ident.email
+            seen["token"] = ident.user_token
+            return MagicMock(status_code=200)
+
+        middleware = PermissionMiddleware(MagicMock())
+        with patch("back.core.databricks.is_databricks_app", return_value=True):
+            _run(middleware.dispatch(req, call_next))
+
+        # Session role gate is still bypassed (no redirect for programmatic
+        # / MCP callers) ...
+        assert req.state.user_role == ""
+        assert req.state.user_domain_role == ""
+        # ... but the forwarded user token is available for OBO.
+        assert seen["token"] == "utok"
+        assert seen["email"] == "user@test.com"
+        assert req.state.user_token == "utok"
+        # Identity is reset after the request completes.
+        assert get_request_identity().user_token == ""
+
+    def test_bypass_without_token_stays_service_principal(self):
+        from shared.fastapi.main import PermissionMiddleware
+        from back.core.databricks.request_identity import get_request_identity
+
+        req = _make_request(method="GET", path="/api/v1/domains", email="")
+        seen = {}
+
+        async def call_next(r):
+            seen["token"] = get_request_identity().user_token
+            return MagicMock(status_code=200)
+
+        middleware = PermissionMiddleware(MagicMock())
+        with patch("back.core.databricks.is_databricks_app", return_value=True):
+            _run(middleware.dispatch(req, call_next))
+
+        assert seen["token"] == ""
+        assert req.state.user_token == ""
+
+
+class TestMcpActingIdentitySwap:
+    """Issue #208: MCP → UI hop. Apps stamps x-forwarded-* from the MCP SP;
+    acting headers restore the end user only for that SP."""
+
+    @staticmethod
+    def _settings():
+        s = MagicMock()
+        s.mcp_sp_client_id = "mcp-sp-id"
+        s.ontobricks_app_name = "ontobricks"
+        return s
+
+    def test_bypass_swaps_to_acting_user(self):
+        from shared.fastapi.main import PermissionMiddleware
+        from back.core.databricks.ActingIdentity import ActingIdentity
+        from back.core.databricks.request_identity import get_request_identity
+
+        req = _make_request(
+            method="GET",
+            path="/api/v1/digitaltwin/status",
+            email="mcp-sp-id",
+            headers={
+                "x-forwarded-access-token": "m2m",
+                ActingIdentity.HEADER_EMAIL: "user@x",
+                ActingIdentity.HEADER_TOKEN: "UT",
+            },
+        )
+        seen = {}
+
+        async def call_next(r):
+            ident = get_request_identity()
+            seen["email"] = ident.email
+            seen["token"] = ident.user_token
+            return MagicMock(status_code=200)
+
+        middleware = PermissionMiddleware(MagicMock())
+        with (
+            patch("back.core.databricks.is_databricks_app", return_value=True),
+            patch("shared.fastapi.main.get_settings", return_value=self._settings()),
+        ):
+            _run(middleware.dispatch(req, call_next))
+
+        assert seen["email"] == "user@x"
+        assert seen["token"] == "UT"
+        assert req.state.user_email == "user@x"
+        assert req.state.user_token == "UT"
+
+    def test_browser_user_cannot_spoof_acting_headers(self):
+        from shared.fastapi.main import PermissionMiddleware
+        from back.core.databricks.ActingIdentity import ActingIdentity
+        from back.core.databricks.request_identity import get_request_identity
+
+        req = _make_request(
+            method="GET",
+            path="/api/v1/digitaltwin/status",
+            email="alice@x",
+            headers={
+                "x-forwarded-access-token": "alice-tok",
+                ActingIdentity.HEADER_EMAIL: "eve@x",
+                ActingIdentity.HEADER_TOKEN: "stolen",
+            },
+        )
+        seen = {}
+
+        async def call_next(r):
+            ident = get_request_identity()
+            seen["email"] = ident.email
+            seen["token"] = ident.user_token
+            return MagicMock(status_code=200)
+
+        middleware = PermissionMiddleware(MagicMock())
+        with (
+            patch("back.core.databricks.is_databricks_app", return_value=True),
+            patch("shared.fastapi.main.get_settings", return_value=self._settings()),
+        ):
+            _run(middleware.dispatch(req, call_next))
+
+        assert seen["email"] == "alice@x"
+        assert seen["token"] == "alice-tok"
+
+    def test_mcp_sp_without_acting_email_stays_sp(self):
+        from shared.fastapi.main import PermissionMiddleware
+        from back.core.databricks.request_identity import get_request_identity
+
+        req = _make_request(
+            method="GET",
+            path="/api/v1/digitaltwin/status",
+            email="mcp-sp-id",
+            headers={"x-forwarded-access-token": "m2m"},
+        )
+        seen = {}
+
+        async def call_next(r):
+            ident = get_request_identity()
+            seen["email"] = ident.email
+            seen["token"] = ident.user_token
+            return MagicMock(status_code=200)
+
+        middleware = PermissionMiddleware(MagicMock())
+        with (
+            patch("back.core.databricks.is_databricks_app", return_value=True),
+            patch("shared.fastapi.main.get_settings", return_value=self._settings()),
+        ):
+            _run(middleware.dispatch(req, call_next))
+
+        assert seen["email"] == "mcp-sp-id"
+        assert seen["token"] == "m2m"

@@ -6,7 +6,12 @@ value in an ``X-CSRF-Token`` header.  JavaScript reads the cookie and
 attaches the header automatically.
 
 Safe methods (GET, HEAD, OPTIONS) and bypass paths (static, health, API
-docs, external API) are exempt.
+docs, external API) are exempt.  Every other state-changing request needs
+both the cookie and the header, non-empty and equal.  Non-browser clients
+(MCP server, M2M scripts) must use the stateless ``/api/`` or ``/graphql/``
+surfaces; an ``Authorization`` header is deliberately *not* an exemption
+because the app never authenticates callers with it (identity comes from
+the Databricks Apps proxy headers).
 """
 
 import os
@@ -41,7 +46,9 @@ class CSRFMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        path = request.url.path
+        # Raw routed path, not request.url.path: the latter is reconstructed
+        # from the Host header and could be poisoned (BadHost / CVE-2026-48710).
+        path = request.scope["path"]
 
         if os.getenv("CSRF_DISABLED"):
             return await call_next(request)
@@ -52,7 +59,13 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         if request.method not in _SAFE_METHODS:
             cookie_token = request.cookies.get(_CSRF_COOKIE, "")
             header_token = request.headers.get(_CSRF_HEADER, "")
-            if cookie_token and cookie_token != header_token:
+            if not (
+                cookie_token
+                and header_token
+                and secrets.compare_digest(
+                    cookie_token.encode(), header_token.encode()
+                )
+            ):
                 logger.warning(
                     "CSRF validation failed: %s %s", request.method, path
                 )

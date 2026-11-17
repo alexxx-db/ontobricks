@@ -32,8 +32,12 @@ state or session-awareness justifies it.
 
 ## Don't
 
-- Don't split a class across files.
+- Don't split a class across files, and don't put several public classes in one file — one class per file, one purpose per class, records grouped by aggregate root, no grab-bag `models.py` (`.cursor/07 §Class-First Policy`).
+- Don't let a package grow flat: once it holds more than ~12 modules, or three or more share a topic, move them into a topic sub-package (`.cursor/07 §Package Organisation 5`).
+- Don't add layers or base classes the package doesn't need yet — the simplest code is the best (`.cursor/01 §Key Principles`).
 - Don't put HTTP/FastAPI types in `back/core/`.
 - Don't put `Request`/`Response` in `back/objects/`.
 - Don't import from internal modules outside the package — always import from the package (`.cursor/07 §__init__.py Conventions`).
 - Don't skip the Sphinx page — `make docs` warnings will fail review.
+- Don't write comments, docstrings, logs, changelog sections, or audit-trail
+  strings in a language other than English (`.cursor/05 §English-only artifacts`).

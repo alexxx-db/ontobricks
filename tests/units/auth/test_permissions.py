@@ -1,10 +1,17 @@
 """Tests for back.objects.registry.PermissionService — permission service."""
 
+import importlib
 import json
 import time
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
+import requests
+
+from back.core.errors import InfrastructureError
+
+# Work around __init__.py re-export shadowing the module path.
+_PS_MOD = importlib.import_module("back.objects.registry.PermissionService")
 
 from back.objects.registry.PermissionService import (
     PermissionService,
@@ -129,23 +136,182 @@ class TestIsAdmin:
         assert svc.is_admin("a@b.com", "h", "t", "") is False
 
     def test_sdk_returns_true(self, svc):
-        with patch.object(svc, "_check_admin_sdk", return_value=True):
+        with (
+            patch.object(svc, "_can_manage_principals_sdk", return_value=["a@b.com"]),
+            patch.object(svc, "_get_user_groups", return_value=[]),
+        ):
             assert svc.is_admin("a@b.com", "h", "t", "app") is True
 
     def test_sdk_returns_false(self, svc):
-        with patch.object(svc, "_check_admin_sdk", return_value=False):
+        with (
+            patch.object(svc, "_can_manage_principals_sdk", return_value=["z@b.com"]),
+            patch.object(svc, "_get_user_groups", return_value=[]),
+        ):
             assert svc.is_admin("a@b.com", "h", "t", "app") is False
 
     def test_sdk_fails_rest_succeeds(self, svc):
         with (
-            patch.object(svc, "_check_admin_sdk", return_value=None),
-            patch.object(svc, "_check_admin_rest", return_value=True),
+            patch.object(svc, "_can_manage_principals_sdk", return_value=None),
+            patch.object(svc, "_can_manage_principals_rest", return_value=["a@b.com"]),
+            patch.object(svc, "_get_user_groups", return_value=[]),
         ):
             assert svc.is_admin("a@b.com", "h", "t", "app") is True
 
     def test_cache_hit(self, svc):
         svc._admin_cache["a@b.com"] = (True, time.time())
         assert svc.is_admin("a@b.com", "h", "t", "app") is True
+
+    def test_can_manage_group_makes_member_admin(self, svc):
+        """CAN_MANAGE on a group is inherited by every member."""
+        with (
+            patch.object(svc, "_can_manage_principals_sdk", return_value=["data-eng"]),
+            patch.object(svc, "_get_user_groups", return_value=["data-eng"]),
+        ):
+            assert svc.is_admin("a@b.com", "h", "t", "app") is True
+
+    def test_can_manage_group_does_not_leak_to_non_member(self, svc):
+        with (
+            patch.object(svc, "_can_manage_principals_sdk", return_value=["data-eng"]),
+            patch.object(svc, "_get_user_groups", return_value=["marketing"]),
+        ):
+            assert svc.is_admin("a@b.com", "h", "t", "app") is False
+
+    def test_group_match_is_case_insensitive(self, svc):
+        with (
+            patch.object(svc, "_can_manage_principals_sdk", return_value=["Data-Eng"]),
+            patch.object(svc, "_get_user_groups", return_value=["data-eng"]),
+        ):
+            assert svc.is_admin("a@b.com", "h", "t", "app") is True
+
+    def test_user_token_path_wins_over_sdk(self, svc):
+        """A definitive answer from the user token stops the fallback chain."""
+        with (
+            patch.object(
+                svc, "_can_manage_principals_rest", return_value=["a@b.com"]
+            ) as rest,
+            patch.object(svc, "_can_manage_principals_sdk") as sdk,
+            patch.object(svc, "_get_user_groups", return_value=[]),
+        ):
+            assert svc.is_admin("a@b.com", "h", "t", "app", user_token="ut") is True
+            rest.assert_called_once_with("h", "ut", "app")
+            sdk.assert_not_called()
+
+    def test_all_paths_fail_is_not_admin(self, svc):
+        with (
+            patch.object(svc, "_can_manage_principals_rest", return_value=None),
+            patch.object(svc, "_can_manage_principals_sdk", return_value=None),
+        ):
+            assert svc.is_admin("a@b.com", "h", "t", "app") is False
+
+
+class TestExtractCanManage:
+    def test_users_and_groups_are_both_returned(self, svc):
+        payload = {
+            "access_control_list": [
+                {
+                    "user_name": "alice@x.com",
+                    "all_permissions": [{"permission_level": "CAN_MANAGE"}],
+                },
+                {
+                    "group_name": "data-eng",
+                    "all_permissions": [{"permission_level": "CAN_MANAGE"}],
+                },
+                {
+                    "group_name": "readers",
+                    "all_permissions": [{"permission_level": "CAN_USE"}],
+                },
+            ]
+        }
+        assert svc._extract_can_manage(payload) == ["alice@x.com", "data-eng"]
+
+    def test_principal_listed_once_per_acl_entry(self, svc):
+        payload = {
+            "access_control_list": [
+                {
+                    "group_name": "data-eng",
+                    "all_permissions": [
+                        {"permission_level": "CAN_MANAGE"},
+                        {"permission_level": "CAN_MANAGE", "inherited": True},
+                    ],
+                }
+            ]
+        }
+        assert svc._extract_can_manage(payload) == ["data-eng"]
+
+    def test_empty_payload(self, svc):
+        assert svc._extract_can_manage({}) == []
+
+
+class TestCanManagePrincipalsRest:
+    def test_forbidden_fallback_does_not_emit_warning(self, svc):
+        response = Mock(status_code=403)
+        response.raise_for_status.side_effect = requests.HTTPError(
+            "403 Client Error: Forbidden", response=response
+        )
+        with (
+            patch("requests.get", return_value=response),
+            patch.object(_PS_MOD.logger, "debug") as debug,
+            patch.object(_PS_MOD.logger, "warning") as warning,
+        ):
+            assert svc._can_manage_principals_rest("https://host", "token", "app") is None
+
+        debug.assert_called_once_with(
+            "REST admin check forbidden for app %s; using fallback",
+            "app",
+        )
+        warning.assert_not_called()
+
+    def test_unexpected_http_failure_still_emits_warning(self, svc):
+        response = Mock(status_code=500)
+        response.raise_for_status.side_effect = requests.HTTPError(
+            "500 Server Error", response=response
+        )
+        with (
+            patch("requests.get", return_value=response),
+            patch.object(_PS_MOD.logger, "warning") as warning,
+        ):
+            assert svc._can_manage_principals_rest("https://host", "token", "app") is None
+
+        warning.assert_called_once()
+        assert warning.call_args[0][0] == "REST admin check failed: %s"
+
+
+class TestGetUserGroups:
+    def test_scim_me_is_preferred_when_user_token_present(self, svc):
+        with (
+            patch.object(
+                svc, "_groups_via_scim_me", return_value=["data-eng"]
+            ) as me,
+            patch.object(svc, "_groups_via_scim_users") as users,
+        ):
+            groups = svc._get_user_groups("a@b.com", "h", "t", user_token="ut")
+            assert groups == ["data-eng"]
+            me.assert_called_once_with("h", "ut")
+            users.assert_not_called()
+
+    def test_falls_back_to_scim_users_when_me_fails(self, svc):
+        with (
+            patch.object(svc, "_groups_via_scim_me", return_value=None),
+            patch.object(svc, "_groups_via_scim_users", return_value=["fallback"]),
+        ):
+            groups = svc._get_user_groups("a@b.com", "h", "t", user_token="ut")
+            assert groups == ["fallback"]
+
+    def test_failure_is_not_cached(self, svc):
+        """A transient 403 must not pin an empty list for the cache window."""
+        with (
+            patch.object(svc, "_groups_via_scim_me", return_value=None),
+            patch.object(svc, "_groups_via_scim_users", return_value=None),
+        ):
+            assert svc._get_user_groups("a@b.com", "h", "t") == []
+        assert "a@b.com" not in svc._user_groups_cache
+
+    def test_success_is_cached(self, svc):
+        with patch.object(svc, "_groups_via_scim_me", return_value=["g1"]):
+            svc._get_user_groups("a@b.com", "h", "t", user_token="ut")
+        with patch.object(svc, "_groups_via_scim_me") as me:
+            assert svc._get_user_groups("a@b.com", "h", "t", user_token="ut") == ["g1"]
+            me.assert_not_called()
 
 
 class TestAdminCache:
@@ -213,16 +379,10 @@ class TestPrincipalsCache:
                     {"display_name": "everyone"},
                 ]
 
-        with patch(
-            "back.objects.registry.PermissionService.DatabricksClient",
-            return_value=_AppFakeClient(),
-        ):
+        with patch.object(_PS_MOD, "DatabricksClient", return_value=_AppFakeClient()):
             app = svc.list_app_principals("h", "t", "ontobricks")
 
-        with patch(
-            "back.objects.registry.PermissionService.DatabricksClient",
-            return_value=_DirFakeClient(),
-        ):
+        with patch.object(_PS_MOD, "DatabricksClient", return_value=_DirFakeClient()):
             ws_users = svc.list_users("h", "t")
             ws_groups = svc.list_groups("h", "t")
 
@@ -236,8 +396,9 @@ class TestPrincipalsCache:
 
         # A second call to list_app_principals must come from the
         # app-scoped cache and still report the small set.
-        with patch(
-            "back.objects.registry.PermissionService.DatabricksClient",
+        with patch.object(
+            _PS_MOD,
+            "DatabricksClient",
             side_effect=AssertionError("should hit cache, not the API"),
         ):
             app_again = svc.list_app_principals("h", "t", "ontobricks")
@@ -258,6 +419,7 @@ class TestLoadDomainPermissions:
 
     def test_load_empty_when_missing(self, svc):
         store = type("S", (), {})()
+        store.backend = "memory"
         store.load_domain_permissions = lambda folder: {
             "version": 1,
             "permissions": [],
@@ -280,6 +442,7 @@ class TestLoadDomainPermissions:
 
     def test_caching(self, svc):
         store = type("S", (), {})()
+        store.backend = "memory"
         calls = {"n": 0}
 
         def _load(_folder):
@@ -291,6 +454,99 @@ class TestLoadDomainPermissions:
             svc.load_domain_permissions("h", "t", REGISTRY_CFG, DOMAIN)
             svc.load_domain_permissions("h", "t", REGISTRY_CFG, DOMAIN)
         assert calls["n"] == 1
+
+
+class TestDomainPermissionReadFailure:
+    """A failed read must never be mistaken for "no grants"."""
+
+    GRANTS = {
+        "version": 1,
+        "permissions": [
+            {"principal": "a@b.com", "principal_type": "user", "role": "builder"},
+            {"principal": "c@d.com", "principal_type": "user", "role": "viewer"},
+        ],
+    }
+
+    @staticmethod
+    def _store(*results):
+        """Store whose successive reads raise or return the given *results*."""
+        store = type("S", (), {"backend": "lakebase"})()
+        queue = list(results)
+
+        def _load(_folder):
+            item = queue.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        store.load_domain_permissions = _load
+        return store
+
+    def test_failed_read_is_not_cached(self, svc):
+        store = self._store(InfrastructureError("down"), self.GRANTS)
+        with patch.object(PermissionService, "_store_for", return_value=store):
+            first = svc.load_domain_permissions("h", "t", REGISTRY_CFG, DOMAIN)
+            assert first["permissions"] == []
+            assert DOMAIN not in svc._domain_perm_cache
+            second = svc.load_domain_permissions("h", "t", REGISTRY_CFG, DOMAIN)
+        assert len(second["permissions"]) == 2
+
+    def test_authorization_read_fails_closed(self, svc):
+        store = self._store(RuntimeError("down"))
+        with patch.object(PermissionService, "_store_for", return_value=store):
+            role = svc.get_domain_role(
+                "a@b.com", "h", "t", REGISTRY_CFG, "app", DOMAIN,
+                app_role=ROLE_APP_USER,
+            )
+        assert role == ROLE_NONE
+
+    def test_add_raises_and_does_not_save(self, svc):
+        store = self._store(InfrastructureError("down"))
+        with (
+            patch.object(PermissionService, "_store_for", return_value=store),
+            patch.object(svc, "save_domain_permissions") as save,
+        ):
+            with pytest.raises(InfrastructureError):
+                svc.add_or_update_domain_entry(
+                    "h", "t", REGISTRY_CFG, DOMAIN, "x@y.com", "user", "X", "editor"
+                )
+        save.assert_not_called()
+
+    def test_remove_raises_and_does_not_save(self, svc):
+        store = self._store(RuntimeError("down"))
+        with (
+            patch.object(PermissionService, "_store_for", return_value=store),
+            patch.object(svc, "save_domain_permissions") as save,
+        ):
+            with pytest.raises(InfrastructureError):
+                svc.remove_domain_entry("h", "t", REGISTRY_CFG, DOMAIN, "a@b.com")
+        save.assert_not_called()
+
+    def test_batch_reports_failure_and_does_not_save(self, svc):
+        store = self._store(InfrastructureError("down"))
+        with (
+            patch.object(PermissionService, "_store_for", return_value=store),
+            patch.object(svc, "save_domain_permissions") as save,
+        ):
+            saved, failed = svc.save_domain_permissions_batch(
+                "h", "t", REGISTRY_CFG,
+                [{"domain_folder": DOMAIN, "principal": "x@y.com", "role": "viewer"}],
+            )
+        save.assert_not_called()
+        assert saved == [] and failed[0]["domain"] == DOMAIN
+
+    def test_add_after_successful_read_keeps_other_grants(self, svc):
+        store = self._store(json.loads(json.dumps(self.GRANTS)))
+        with (
+            patch.object(PermissionService, "_store_for", return_value=store),
+            patch.object(svc, "save_domain_permissions", return_value=(True, "ok")) as save,
+        ):
+            ok, _ = svc.add_or_update_domain_entry(
+                "h", "t", REGISTRY_CFG, DOMAIN, "x@y.com", "user", "X", "editor"
+            )
+        assert ok is True
+        principals = [e["principal"] for e in save.call_args[0][4]["permissions"]]
+        assert principals == ["a@b.com", "c@d.com", "x@y.com"]
 
 
 class TestSaveDomainPermissions:
@@ -401,6 +657,93 @@ class TestResolveDomainEntryRole:
             )
             assert result == ROLE_VIEWER
 
+    def test_highest_role_wins_across_two_groups(self, svc):
+        dp = {
+            "version": 1,
+            "permissions": [
+                {"principal": "readers", "principal_type": "group", "role": "viewer"},
+                {"principal": "builders", "principal_type": "group", "role": "builder"},
+            ],
+        }
+        with (
+            patch.object(svc, "load_domain_permissions", return_value=dp),
+            patch.object(
+                svc, "_get_user_groups", return_value=["readers", "builders"]
+            ),
+        ):
+            result = svc._resolve_domain_entry_role(
+                "a@b.com", "h", "t", REGISTRY_CFG, DOMAIN
+            )
+            assert result == ROLE_BUILDER
+
+    def test_group_role_beats_lower_direct_role(self, svc):
+        dp = {
+            "version": 1,
+            "permissions": [
+                {"principal": "a@b.com", "principal_type": "user", "role": "viewer"},
+                {"principal": "editors", "principal_type": "group", "role": "editor"},
+            ],
+        }
+        with (
+            patch.object(svc, "load_domain_permissions", return_value=dp),
+            patch.object(svc, "_get_user_groups", return_value=["editors"]),
+        ):
+            result = svc._resolve_domain_entry_role(
+                "a@b.com", "h", "t", REGISTRY_CFG, DOMAIN
+            )
+            assert result == ROLE_EDITOR
+
+    def test_direct_role_beats_lower_group_role(self, svc):
+        dp = {
+            "version": 1,
+            "permissions": [
+                {"principal": "a@b.com", "principal_type": "user", "role": "builder"},
+                {"principal": "readers", "principal_type": "group", "role": "viewer"},
+            ],
+        }
+        with (
+            patch.object(svc, "load_domain_permissions", return_value=dp),
+            patch.object(svc, "_get_user_groups", return_value=["readers"]),
+        ):
+            result = svc._resolve_domain_entry_role(
+                "a@b.com", "h", "t", REGISTRY_CFG, DOMAIN
+            )
+            assert result == ROLE_BUILDER
+
+    def test_membership_is_not_resolved_without_group_entries(self, svc):
+        """No group rows on the domain means no SCIM round-trip."""
+        dp = {
+            "version": 1,
+            "permissions": [
+                {"principal": "a@b.com", "principal_type": "user", "role": "editor"}
+            ],
+        }
+        with (
+            patch.object(svc, "load_domain_permissions", return_value=dp),
+            patch.object(svc, "_get_user_groups") as groups,
+        ):
+            result = svc._resolve_domain_entry_role(
+                "a@b.com", "h", "t", REGISTRY_CFG, DOMAIN
+            )
+            assert result == ROLE_EDITOR
+            groups.assert_not_called()
+
+    def test_non_member_of_group_gets_no_role(self, svc):
+        dp = {
+            "version": 1,
+            "permissions": [
+                {"principal": "data-team", "principal_type": "group", "role": "viewer"}
+            ],
+        }
+        with (
+            patch.object(svc, "load_domain_permissions", return_value=dp),
+            patch.object(svc, "_get_user_groups", return_value=["other-team"]),
+        ):
+            result = svc._resolve_domain_entry_role(
+                "a@b.com", "h", "t", REGISTRY_CFG, DOMAIN
+            )
+            assert result is None
+
 
 class TestDomainPermCRUD:
     def test_list_domain_entries(self, svc):
@@ -509,7 +852,7 @@ class TestSaveDomainPermissionsBatch:
         }
         saved_payloads: dict[str, dict] = {}
 
-        def fake_load(_h, _t, _cfg, domain_folder, force=False):
+        def fake_load(_h, _t, _cfg, domain_folder, for_update=False):
             return json.loads(json.dumps(initial[domain_folder]))
 
         def fake_save(_h, _t, _cfg, domain_folder, data):
@@ -587,7 +930,7 @@ class TestSaveDomainPermissionsBatch:
     def test_partial_failure(self, svc):
         dp = {"version": 1, "permissions": []}
 
-        def fake_load(_h, _t, _cfg, _df, force=False):
+        def fake_load(_h, _t, _cfg, _df, for_update=False):
             return dict(dp)
 
         def fake_save(_h, _t, _cfg, domain_folder, _data):
@@ -641,37 +984,25 @@ class TestAppPrincipalsBootstrap:
 
     def test_success_clears_bootstrap_flag(self, svc):
         fake = self._FakeClient([{"email": "a@b.com"}], [], 200)
-        with patch(
-            "back.objects.registry.PermissionService.DatabricksClient",
-            return_value=fake,
-        ):
+        with patch.object(_PS_MOD, "DatabricksClient", return_value=fake):
             svc.list_app_principals("h", "t", "ontobricks")
         assert svc.is_app_principals_forbidden() is False
 
     def test_403_sets_bootstrap_flag(self, svc):
         fake = self._FakeClient([], [], 403)
-        with patch(
-            "back.objects.registry.PermissionService.DatabricksClient",
-            return_value=fake,
-        ):
+        with patch.object(_PS_MOD, "DatabricksClient", return_value=fake):
             svc.list_app_principals("h", "t", "ontobricks")
         assert svc.is_app_principals_forbidden() is True
 
     def test_non_403_errors_do_not_set_flag(self, svc):
         fake = self._FakeClient([], [], 500)
-        with patch(
-            "back.objects.registry.PermissionService.DatabricksClient",
-            return_value=fake,
-        ):
+        with patch.object(_PS_MOD, "DatabricksClient", return_value=fake):
             svc.list_app_principals("h", "t", "ontobricks")
         assert svc.is_app_principals_forbidden() is False
 
     def test_clear_cache_resets_flag(self, svc):
         fake = self._FakeClient([], [], 403)
-        with patch(
-            "back.objects.registry.PermissionService.DatabricksClient",
-            return_value=fake,
-        ):
+        with patch.object(_PS_MOD, "DatabricksClient", return_value=fake):
             svc.list_app_principals("h", "t", "ontobricks")
         assert svc.is_app_principals_forbidden() is True
         svc.clear_principals_cache()

@@ -1,6 +1,8 @@
 """Tests for OWL ontology generator."""
 
 import pytest
+from rdflib import Graph, RDF, RDFS, OWL, URIRef
+
 from back.core.w3c.owl.OntologyGenerator import OntologyGenerator
 from back.core.w3c.owl.OntologyParser import OntologyParser
 
@@ -55,11 +57,288 @@ class TestClassGeneration:
         owl = gen.generate()
         assert "subClassOf" in owl
 
+    def test_generate_emits_external_class_and_parent_uris(self):
+        gen = OntologyGenerator(
+            base_uri="http://example.org/onto#",
+            ontology_name="Test Ontology",
+            classes=[
+                {
+                    "name": "Customer",
+                    "uri": "http://classes.example/Customer",
+                    "label": "Customer",
+                    "parent": "Party",
+                    "parent_uri": "http://example.org/other-onto#Party",
+                }
+            ],
+            properties=[],
+        )
+        graph = Graph()
+        graph.parse(data=gen.generate(), format="turtle")
+        class_uri = URIRef("http://classes.example/Customer")
+        assert (class_uri, RDF.type, OWL.Class) in graph
+        assert (
+            class_uri,
+            RDFS.subClassOf,
+            URIRef("http://example.org/other-onto#Party"),
+        ) in graph
+
+    def test_renamed_class_ignores_stale_uri_and_keeps_references_aligned(self):
+        classes = [
+            {
+                "name": "Client",
+                "uri": "http://example.org/onto#Customer",
+                "parent": "Party",
+            },
+            {
+                "name": "PriorityClient",
+                "parent": "Client",
+                "parent_uri": "http://example.org/onto#Customer",
+            },
+        ]
+        graph = Graph()
+        graph.parse(data=_make_generator(classes=classes).generate(), format="turtle")
+        client_uri = URIRef("http://test.org/ontology#Client")
+        assert (client_uri, RDF.type, OWL.Class) in graph
+        assert (
+            URIRef("http://test.org/ontology#PriorityClient"),
+            RDFS.subClassOf,
+            client_uri,
+        ) in graph
+        assert (
+            URIRef("http://example.org/onto#Customer"),
+            RDF.type,
+            OWL.Class,
+        ) not in graph
+
+    def test_slash_namespace_is_preserved_for_subjects_and_references(self):
+        classes = [
+            {"name": "A", "uri": "http://ex.org/o/A"},
+            {"name": "B", "parent": "A", "parent_uri": "http://ex.org/o/A"},
+        ]
+        graph = Graph()
+        generator = OntologyGenerator(
+            base_uri="http://ex.org/o/",
+            ontology_name="Slash ontology",
+            classes=classes,
+            properties=[],
+        )
+        graph.parse(data=generator.generate(), format="turtle")
+        assert (URIRef("http://ex.org/o/A"), RDF.type, OWL.Class) in graph
+        assert (
+            URIRef("http://ex.org/o/B"),
+            RDFS.subClassOf,
+            URIRef("http://ex.org/o/A"),
+        ) in graph
+
+    def test_non_http_parent_uri_falls_back_to_parent_name(self):
+        classes = [
+            {
+                "name": "Customer",
+                "parent": "Party",
+                "parent_uri": "urn:example:Party",
+            }
+        ]
+        graph = Graph()
+        graph.parse(data=_make_generator(classes=classes).generate(), format="turtle")
+        assert (
+            URIRef("http://test.org/ontology#Customer"),
+            RDFS.subClassOf,
+            URIRef("http://test.org/ontology#Party"),
+        ) in graph
+
     def test_class_with_emoji(self):
         classes = [{"name": "Customer", "label": "Customer", "emoji": "👤"}]
         gen = _make_generator(classes=classes)
         owl = gen.generate()
         assert "👤" in owl
+
+    def test_class_with_dataset_roundtrip(self):
+        dataset = {
+            "catalog": "main",
+            "schema": "sales",
+            "asset": "orders",
+            "type": "TABLE",
+            "fullName": "main.sales.orders",
+        }
+        classes = [{"name": "Customer", "label": "Customer", "dataset": dataset}]
+        gen = _make_generator(classes=classes)
+        owl = gen.generate()
+        assert "dataset" in owl
+
+        parser = OntologyParser(owl_content=owl)
+        parsed = {c["name"]: c for c in parser.get_classes()}
+        assert parsed["Customer"]["datasets"] == [dataset]
+        assert parsed["Customer"]["dataset"] == dataset
+
+    def test_class_with_multiple_datasets_roundtrip(self):
+        datasets = [
+            {
+                "catalog": "main",
+                "schema": "sales",
+                "asset": "orders",
+                "type": "TABLE",
+                "fullName": "main.sales.orders",
+                "key_column": "customer_id",
+            },
+            {
+                "catalog": "main",
+                "schema": "metrics",
+                "asset": "customer_kpis",
+                "type": "METRIC_VIEW",
+                "fullName": "main.metrics.customer_kpis",
+                "key_column": "customer_id",
+            },
+        ]
+        classes = [{"name": "Customer", "label": "Customer", "datasets": datasets}]
+        gen = _make_generator(classes=classes)
+        owl = gen.generate()
+        parser = OntologyParser(owl_content=owl)
+        parsed = {c["name"]: c for c in parser.get_classes()}
+        assert parsed["Customer"]["datasets"] == datasets
+        assert parsed["Customer"]["dataset"] == datasets[0]
+
+    def test_alternate_labels_export_import_roundtrip(self):
+        """Synonyms (``alternate_labels``) are first-class ontology data
+        (task 4 review finding #4), serialized as ``skos:altLabel`` and
+        preserved verbatim across a full export/import cycle."""
+        classes = [
+            {
+                "name": "Carrier",
+                "label": "Carrier",
+                "alternate_labels": ["Shipper", "Hauler"],
+            }
+        ]
+        gen = _make_generator(classes=classes)
+        owl = gen.generate()
+        assert "altLabel" in owl
+        assert "Shipper" in owl and "Hauler" in owl
+
+        parser = OntologyParser(owl_content=owl)
+        parsed = {c["name"]: c for c in parser.get_classes()}
+        assert set(parsed["Carrier"]["alternate_labels"]) == {"Shipper", "Hauler"}
+
+    def test_no_alternate_labels_omits_skos_altlabel(self):
+        classes = [{"name": "Customer", "label": "Customer"}]
+        gen = _make_generator(classes=classes)
+        owl = gen.generate()
+        assert "altLabel" not in owl
+
+    def test_class_without_dataset_has_none(self):
+        classes = [{"name": "Customer", "label": "Customer"}]
+        gen = _make_generator(classes=classes)
+        owl = gen.generate()
+        parser = OntologyParser(owl_content=owl)
+        parsed = {c["name"]: c for c in parser.get_classes()}
+        assert parsed["Customer"]["datasets"] == []
+        assert parsed["Customer"]["dataset"] is None
+
+    def test_class_with_actions_roundtrip(self):
+        actions = [
+            {
+                "catalog": "main",
+                "schema": "ops",
+                "function": "recompute_risk",
+                "fullName": "main.ops.recompute_risk",
+                "description": "Recompute the customer risk score",
+                "returns_table": False,
+            },
+            {
+                "catalog": "main",
+                "schema": "ops",
+                "function": "risk_history",
+                "fullName": "main.ops.risk_history",
+                "description": "Risk score history",
+                "returns_table": True,
+            },
+        ]
+        classes = [{"name": "Customer", "label": "Customer", "actions": actions}]
+        gen = _make_generator(classes=classes)
+        owl = gen.generate()
+        assert "actions" in owl
+
+        parser = OntologyParser(owl_content=owl)
+        parsed = {c["name"]: c for c in parser.get_classes()}
+        assert parsed["Customer"]["actions"] == actions
+
+    def test_class_without_actions_has_empty_list(self):
+        classes = [{"name": "Customer", "label": "Customer"}]
+        gen = _make_generator(classes=classes)
+        owl = gen.generate()
+        parser = OntologyParser(owl_content=owl)
+        parsed = {c["name"]: c for c in parser.get_classes()}
+        assert parsed["Customer"]["actions"] == []
+
+    def test_class_with_virtual_attributes_roundtrip(self):
+        virtual_attributes = [
+            {
+                "catalog": "main",
+                "schema": "kg",
+                "function": "customer_risk",
+                "fullName": "main.kg.customer_risk",
+                "description": "Live credit risk",
+                "returns_table": True,
+                "attributes": [
+                    {
+                        "name": "risk_score",
+                        "column": "risk_score",
+                        "label": "Risk score",
+                        "dataType": "DOUBLE",
+                    },
+                    {
+                        "name": "risk_band",
+                        "column": "risk_band",
+                        "label": "Risk band",
+                        "dataType": "STRING",
+                    },
+                ],
+            }
+        ]
+        classes = [
+            {
+                "name": "Customer",
+                "label": "Customer",
+                "virtualAttributes": virtual_attributes,
+            }
+        ]
+        gen = _make_generator(classes=classes)
+        owl = gen.generate()
+        assert "virtualAttributes" in owl
+
+        parser = OntologyParser(owl_content=owl)
+        parsed = {c["name"]: c for c in parser.get_classes()}
+        assert parsed["Customer"]["virtualAttributes"] == virtual_attributes
+
+    def test_virtual_attributes_are_not_datatype_properties(self):
+        """They are computed on demand, so they must stay out of the mapped
+        attribute list that R2RML and the build pipeline read."""
+        classes = [
+            {
+                "name": "Customer",
+                "label": "Customer",
+                "virtualAttributes": [
+                    {
+                        "fullName": "main.kg.customer_risk",
+                        "returns_table": True,
+                        "attributes": [{"name": "risk_score", "column": "risk_score"}],
+                    }
+                ],
+            }
+        ]
+        gen = _make_generator(classes=classes)
+        owl = gen.generate()
+
+        parser = OntologyParser(owl_content=owl)
+        parsed = {c["name"]: c for c in parser.get_classes()}
+        assert parsed["Customer"]["dataProperties"] == []
+        assert "risk_score" in parsed["Customer"]["virtualAttributes"][0]["attributes"][0]["name"]
+
+    def test_class_without_virtual_attributes_has_empty_list(self):
+        classes = [{"name": "Customer", "label": "Customer"}]
+        gen = _make_generator(classes=classes)
+        owl = gen.generate()
+        parser = OntologyParser(owl_content=owl)
+        parsed = {c["name"]: c for c in parser.get_classes()}
+        assert parsed["Customer"]["virtualAttributes"] == []
 
     def test_class_with_data_properties(self):
         classes = [
@@ -114,6 +393,108 @@ class TestPropertyGeneration:
         owl = gen.generate()
         assert "DatatypeProperty" in owl
 
+    def test_generate_emits_external_property_domain_and_range_uris(self):
+        props = [
+            {
+                "name": "hasParty",
+                "uri": "http://properties.example/hasParty",
+                "type": "ObjectProperty",
+                "domain": "Account",
+                "domain_uri": "http://example.org/domain-onto#Account",
+                "range": "Party",
+                "range_uri": "http://example.org/other-onto#Party",
+            }
+        ]
+        graph = Graph()
+        graph.parse(data=_make_generator(properties=props).generate(), format="turtle")
+        prop_uri = URIRef("http://properties.example/hasParty")
+        assert (prop_uri, RDF.type, OWL.ObjectProperty) in graph
+        assert (
+            prop_uri,
+            RDFS.domain,
+            URIRef("http://example.org/domain-onto#Account"),
+        ) in graph
+        assert (
+            prop_uri,
+            RDFS.range,
+            URIRef("http://example.org/other-onto#Party"),
+        ) in graph
+
+    def test_renamed_property_and_changed_endpoints_ignore_stale_uris(self):
+        props = [
+            {
+                "name": "serves",
+                "uri": "http://example.org/onto#hasParty",
+                "type": "ObjectProperty",
+                "domain": "Client",
+                "domain_uri": "http://example.org/onto#Account",
+                "range": "Organization",
+                "range_uri": "http://example.org/onto#Party",
+            }
+        ]
+        graph = Graph()
+        graph.parse(data=_make_generator(properties=props).generate(), format="turtle")
+        prop_uri = URIRef("http://test.org/ontology#serves")
+        assert (prop_uri, RDF.type, OWL.ObjectProperty) in graph
+        assert (
+            prop_uri,
+            RDFS.domain,
+            URIRef("http://test.org/ontology#Client"),
+        ) in graph
+        assert (
+            prop_uri,
+            RDFS.range,
+            URIRef("http://test.org/ontology#Organization"),
+        ) in graph
+
+    def test_non_http_domain_and_range_uris_fall_back_to_local_names(self):
+        props = [
+            {
+                "name": "hasParty",
+                "type": "ObjectProperty",
+                "domain": "Account",
+                "domain_uri": "urn:example:Account",
+                "range": "Party",
+                "range_uri": "urn:example:Party",
+            }
+        ]
+        graph = Graph()
+        graph.parse(data=_make_generator(properties=props).generate(), format="turtle")
+        prop_uri = URIRef("http://test.org/ontology#hasParty")
+        assert (
+            prop_uri,
+            RDFS.domain,
+            URIRef("http://test.org/ontology#Account"),
+        ) in graph
+        assert (
+            prop_uri,
+            RDFS.range,
+            URIRef("http://test.org/ontology#Party"),
+        ) in graph
+
+    def test_class_data_property_keeps_its_uri_and_class_domain_uri(self):
+        classes = [
+            {
+                "name": "Customer",
+                "uri": "http://classes.example/Customer",
+                "dataProperties": [
+                    {
+                        "name": "legalName",
+                        "uri": "http://properties.example/legalName",
+                    }
+                ],
+            }
+        ]
+        graph = Graph()
+        graph.parse(data=_make_generator(classes=classes).generate(), format="turtle")
+        prop_uri = URIRef("http://properties.example/legalName")
+        assert (prop_uri, RDF.type, OWL.DatatypeProperty) in graph
+        assert (
+            prop_uri,
+            RDFS.domain,
+            URIRef("http://classes.example/Customer"),
+        ) in graph
+
 
 class TestConstraintGeneration:
     def test_functional_property(self):
@@ -134,6 +515,52 @@ class TestConstraintGeneration:
         gen = _make_generator(constraints=constraints)
         owl = gen.generate()
         assert "minCardinality" in owl
+
+    def test_constraints_axioms_and_groups_follow_effective_entity_uris(self):
+        generator = OntologyGenerator(
+            base_uri="http://test.org/ontology#",
+            ontology_name="Renamed entities",
+            classes=[
+                {"name": "Client", "uri": "http://old.example#Customer"},
+                {"name": "Party"},
+            ],
+            properties=[
+                {
+                    "name": "serves",
+                    "uri": "http://old.example#hasCustomer",
+                    "type": "ObjectProperty",
+                }
+            ],
+            constraints=[
+                {
+                    "type": "minCardinality",
+                    "className": "Client",
+                    "property": "serves",
+                    "cardinalityValue": 1,
+                }
+            ],
+            axioms=[
+                {
+                    "type": "equivalentClass",
+                    "subject": "Client",
+                    "objects": ["Party"],
+                }
+            ],
+            groups=[{"name": "Actors", "members": ["Client", "Party"]}],
+        )
+        graph = Graph()
+        graph.parse(data=generator.generate(), format="turtle")
+        client_uri = URIRef("http://test.org/ontology#Client")
+        property_uri = URIRef("http://test.org/ontology#serves")
+        assert (
+            client_uri,
+            OWL.equivalentClass,
+            URIRef("http://test.org/ontology#Party"),
+        ) in graph
+        restrictions = list(graph.objects(client_uri, RDFS.subClassOf))
+        assert any((restriction, OWL.onProperty, property_uri) in graph for restriction in restrictions)
+        union_lists = list(graph.objects(None, OWL.unionOf))
+        assert any(client_uri in list(graph.items(items)) for items in union_lists)
 
 
 class TestSwrlGeneration:
@@ -186,6 +613,119 @@ class TestExpressionGeneration:
         gen = _make_generator(expressions=expressions)
         owl = gen.generate()
         assert "intersectionOf" in owl
+
+
+class TestDeletedAttributeNotReexported:
+    """Regression tests for issue #50 — deleted attributes reappear in OWL export.
+
+    ``classes[].dataProperties`` is the authoritative store for class attributes.
+    A domain-scoped ``DatatypeProperty`` left in the top-level ``properties[]``
+    list (a parser shadow) must not be re-emitted once the attribute has been
+    removed from its owning class.
+    """
+
+    def test_stale_datatype_shadow_skipped(self):
+        # Designer state after deleting "firstName": only "lastName" remains on
+        # the class, but both shadows still linger in properties[].
+        classes = [
+            {
+                "name": "Customer",
+                "label": "Customer",
+                "dataProperties": [{"name": "lastName", "label": "Last Name"}],
+            }
+        ]
+        properties = [
+            {
+                "name": "firstName",
+                "type": "DatatypeProperty",
+                "domain": "Customer",
+                "range": "xsd:string",
+            },
+            {
+                "name": "lastName",
+                "type": "DatatypeProperty",
+                "domain": "Customer",
+                "range": "xsd:string",
+            },
+        ]
+        gen = _make_generator(classes=classes, properties=properties)
+        owl = gen.generate()
+        assert "lastName" in owl
+        assert "firstName" not in owl
+
+    def test_surviving_datatype_shadow_kept(self):
+        # When the class still declares the attribute, the shadow is preserved
+        # so its declared range survives the round-trip.
+        classes = [
+            {
+                "name": "Customer",
+                "label": "Customer",
+                "dataProperties": [{"name": "age", "label": "Age"}],
+            }
+        ]
+        properties = [
+            {
+                "name": "age",
+                "type": "DatatypeProperty",
+                "domain": "Customer",
+                "range": "xsd:integer",
+            }
+        ]
+        gen = _make_generator(classes=classes, properties=properties)
+        owl = gen.generate()
+        assert "age" in owl
+        assert "xsd:integer" in owl
+
+    def test_datatype_with_unknown_domain_kept(self):
+        # A datatype property whose domain class is not in the generator's class
+        # set cannot be proven stale and must be kept (conservative).
+        properties = [
+            {
+                "name": "globalId",
+                "type": "DatatypeProperty",
+                "domain": "Customer",
+                "range": "xsd:string",
+            }
+        ]
+        gen = _make_generator(properties=properties)
+        owl = gen.generate()
+        assert "globalId" in owl
+
+    def test_roundtrip_delete_then_export(self):
+        owl_in = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix : <http://test.org/ontology#> .
+
+<http://test.org/ontology> a owl:Ontology ; rdfs:label "T" .
+:Customer a owl:Class ; rdfs:label "Customer" .
+:firstName a owl:DatatypeProperty ; rdfs:label "firstName" ;
+    rdfs:domain :Customer ; rdfs:range xsd:string .
+:lastName a owl:DatatypeProperty ; rdfs:label "lastName" ;
+    rdfs:domain :Customer ; rdfs:range xsd:string .
+"""
+        parser = OntologyParser(owl_in)
+        info = parser.get_ontology_info()
+        classes = parser.get_classes()
+        properties = parser.get_properties()
+
+        # Designer deletes "firstName" from the class attribute list only.
+        for cls in classes:
+            if cls["name"] == "Customer":
+                cls["dataProperties"] = [
+                    dp for dp in cls["dataProperties"] if dp["name"] != "firstName"
+                ]
+
+        gen = OntologyGenerator(
+            base_uri=info["namespace"],
+            ontology_name=info["label"],
+            classes=classes,
+            properties=properties,
+        )
+        owl_out = gen.generate()
+        assert "lastName" in owl_out
+        assert "firstName" not in owl_out
 
 
 class TestRoundtrip:

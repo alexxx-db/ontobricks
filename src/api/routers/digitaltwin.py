@@ -1,5 +1,5 @@
 """
-Digital Twin External REST API
+Knowledge Graph External REST API
 
 Provides programmatic access to the triple store: status, insights,
 build trigger, and triple retrieval.
@@ -16,7 +16,9 @@ targets a specific version; when omitted, the latest version is used.
 Use ``GET /api/v1/domain/versions?domain_name=...`` to discover available versions.
 """
 
-from fastapi import APIRouter, Depends, Query
+import time
+
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import AliasChoices, BaseModel, Field
 from typing import Any, Dict, List, Optional
 
@@ -25,25 +27,66 @@ from back.core.errors import ValidationError, NotFoundError, InfrastructureError
 from api.constants import DEFAULT_BASE_URI, DEFAULT_GRAPH_NAME
 from back.objects.session import SessionManager, get_session_manager
 from shared.config.settings import get_settings, Settings
-from back.core.triplestore import get_triplestore
+from back.core.graphdb import get_graphdb
 from back.core.helpers import (
-    get_databricks_credentials,
+    get_triplestore_sql_credentials,
     get_databricks_client,
     sql_escape,
     effective_view_table,
     effective_graph_name,
+    effective_graph_query_table,
     run_blocking,
 )
-from back.objects.digitaltwin import CohortService, DigitalTwin, DomainSnapshot
+from back.objects.digitaltwin import (
+    CohortService,
+    DigitalTwin,
+    DomainSnapshot,
+    NodeContextService,
+    NodeShaclResponse,
+    NodeShaclService,
+)
 
 # Tests may patch ``api.routers.digitaltwin`` for registry resolution helpers.
 _resolve_registry = DigitalTwin.resolve_registry
 _extract_local_id = DigitalTwin.extract_local_id
 _expand_uri_aliases = DigitalTwin.expand_uri_aliases
+# Re-exported for tests that assert against the RDF type constant.
+_RDF_TYPE = NodeContextService.RDF_TYPE
 
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+
+def assert_public_graph_read(request, domain, settings) -> None:
+    """Team gate for the public graph-read surface (see ``_graph_access``).
+
+    Imported lazily to avoid an import cycle: this external (Block A) module
+    is imported *by* the ``api.routers.internal`` package during its own
+    initialization, so a top-level import of the internal gate would recurse.
+    """
+    from api.routers.internal._graph_access import (
+        assert_public_graph_read as _impl,
+    )
+
+    _impl(request, domain, settings)
+
+
+def assert_public_graph_write(request, domain, settings) -> None:
+    """Builder gate for public routes that write to the graph (lazy import, see above)."""
+    from api.routers.internal._graph_access import (
+        assert_public_graph_write as _impl,
+    )
+
+    _impl(request, domain, settings)
+
+# Short-TTL, in-process cache for ``GET /stats`` results keyed by the graph
+# query table. Triple-store stats only change on a build, so a small TTL
+# removes the 3–4 full-table aggregate scans from repeated read-only tool
+# calls (e.g. an agent probing ``list_entity_types`` several times) while
+# staying fresh within a working session.
+_STATS_CACHE_TTL_SECONDS = 60
+_stats_cache: Dict[str, Dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +125,7 @@ class StatsResponse(BaseModel):
     label_count: int = 0
     type_assertion_count: int = 0
     relationship_count: int = 0
+    inferred_triples: int = 0
     message: Optional[str] = None
 
 
@@ -159,9 +203,159 @@ class FindResponse(BaseModel):
     triples: List[TripleRow] = []
     count: int = Field(0, description="Triples returned in this page")
     total: int = Field(0, description="Total triples found across all pages")
+    has_more: bool = Field(
+        False, description="Whether more triples exist beyond this page"
+    )
     limit: int = Field(1000, description="Page size used")
     offset: int = Field(0, description="Offset used")
     entity_count: int = 0
+    message: Optional[str] = None
+    cache_used: bool = Field(
+        False, description="Whether adjacency/entity-search companions were read"
+    )
+    cache_mode: str = Field(
+        "auto",
+        description="Resolved cache mode: auto, force_on, or force_off",
+    )
+
+
+class NodeContextDataset(BaseModel):
+    fullName: str
+    type: Optional[str] = None
+    key_column: Optional[str] = None
+    key_column_missing: Optional[bool] = None
+    description: Optional[str] = None
+    rows: Optional[List[Dict[str, Any]]] = None
+
+
+class NodeContextBridge(BaseModel):
+    target_domain: str
+    target_domain_description: str = ""
+    target_class_name: str
+    target_class_uri: str = ""
+    label: str = ""
+    entities: Optional[List[Dict[str, Any]]] = None
+
+
+class NodeContextAction(BaseModel):
+    """A class action: Unity Catalog function or Databricks Job.
+
+    UC functions take exactly one parameter (entity ID). Jobs are identified
+    as ``job:<job_id>`` and must declare an ``entity_id`` job parameter.
+    """
+
+    fullName: str
+    function: str = ""
+    description: Optional[str] = None
+    returns_table: bool = False
+    kind: Optional[str] = None
+    job_id: Optional[int] = None
+    job_name: Optional[str] = None
+
+
+class NodeContextBusinessRule(BaseModel):
+    """A SWRL rule declared on the node's ontology class, runnable on the node."""
+
+    name: str
+    description: Optional[str] = None
+    antecedent: str = ""
+    consequent: str = ""
+
+
+class NodeContextVirtualAttribute(BaseModel):
+    name: str
+    column: str = ""
+    label: str = ""
+    dataType: Optional[str] = None
+
+
+class NodeContextVirtualAttributeGroup(BaseModel):
+    """The virtual attributes produced by one Unity Catalog function.
+
+    ``values`` is absent until the caller asks for the computation; the
+    declaration is always available.
+    """
+
+    fullName: str
+    function: str = ""
+    description: Optional[str] = None
+    returns_table: bool = False
+    attributes: List[NodeContextVirtualAttribute] = []
+    values: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    message: Optional[str] = None
+
+
+class NodeContextResponse(BaseModel):
+    success: bool
+    entity_uri: str = ""
+    entity_local_id: str = ""
+    class_name: Optional[str] = None
+    datasets: Optional[List[NodeContextDataset]] = None
+    dataset: Optional[NodeContextDataset] = None
+    bridges: Optional[List[NodeContextBridge]] = None
+    actions: Optional[List[NodeContextAction]] = None
+    business_rules: Optional[List[NodeContextBusinessRule]] = None
+    virtual_attributes: Optional[List[NodeContextVirtualAttributeGroup]] = None
+    shacl_shape_count: Optional[int] = None
+    message: Optional[str] = None
+
+
+class NodeActionRequest(BaseModel):
+    entity_uri: str = Field(..., description="Instance URI of the node to act on")
+    action_full_name: str = Field(
+        ...,
+        description="UC function FQN (catalog.schema.function) or job:<job_id>",
+    )
+    domain_name: Optional[str] = Field(None, description="Domain name in the registry")
+    domain_version: Optional[str] = Field(None, description="Domain version to load")
+    registry_catalog: Optional[str] = None
+    registry_schema: Optional[str] = None
+    registry_volume: Optional[str] = None
+
+
+class NodeActionResponse(BaseModel):
+    success: bool
+    entity_uri: str = ""
+    entity_local_id: str = ""
+    class_name: Optional[str] = None
+    action: Optional[str] = None
+    kind: Optional[str] = None
+    returns_table: bool = False
+    rows: Optional[List[Dict[str, Any]]] = None
+    task_id: Optional[str] = None
+    run_id: Optional[int] = None
+    run_state: Optional[str] = None
+    run_page_url: Optional[str] = None
+    message: Optional[str] = None
+
+
+class NodeBusinessRuleRequest(BaseModel):
+    entity_uri: str = Field(..., description="Instance URI of the node to apply the rule to")
+    rule: str = Field(..., description="Name of a SWRL business rule declared on the class")
+    domain_name: Optional[str] = Field(None, description="Domain name in the registry")
+    domain_version: Optional[str] = Field(None, description="Domain version to load")
+    registry_catalog: Optional[str] = None
+    registry_schema: Optional[str] = None
+    registry_volume: Optional[str] = None
+
+
+class InferredTripleOut(BaseModel):
+    subject: str
+    predicate: str
+    object: str
+
+
+class NodeBusinessRuleResponse(BaseModel):
+    success: bool
+    entity_uri: str = ""
+    entity_local_id: str = ""
+    class_name: Optional[str] = None
+    rule: Optional[str] = None
+    inferred_count: int = 0
+    materialized_count: int = 0
+    triples: List[InferredTripleOut] = []
+    truncated: bool = False
     message: Optional[str] = None
 
 
@@ -170,8 +364,12 @@ class DataQualityRequest(BaseModel):
         None, description="Filter shapes by category (e.g. 'cardinality', 'value')"
     )
     backend: str = Field(
-        "graph",
-        description="Backend to run checks against: 'view' (SQL) or 'graph' (in-memory)",
+        "view",
+        deprecated=True,
+        description=(
+            "Deprecated and ignored. Checks always run as SQL against the "
+            "triple-store VIEW, which every graph engine builds."
+        ),
     )
 
 
@@ -262,6 +460,7 @@ async def dt_registry(
     "and how many triples it currently contains.",
 )
 async def dt_status(
+    request: Request,
     domain_name: Optional[str] = Query(
         None,
         validation_alias=AliasChoices("domain_name", "project_name"),
@@ -292,11 +491,13 @@ async def dt_status(
         registry_schema,
         registry_volume,
         domain_version,
+        read_only=True,
     )
+    assert_public_graph_read(request, domain, settings)
     view_table = effective_view_table(domain, settings).strip()
     graph_name = effective_graph_name(domain)
 
-    graph_store = get_triplestore(domain, settings, backend="graph")
+    graph_store = get_graphdb(domain, settings)
     if not graph_store:
         return StatusResponse(
             success=True,
@@ -305,15 +506,17 @@ async def dt_status(
             reason="Graph backend not configured",
         )
 
+    query_table = effective_graph_query_table(domain, settings, store=graph_store)
+
     try:
-        if not graph_store.table_exists(graph_name):
+        if not graph_store.table_exists(query_table):
             return StatusResponse(
                 success=True,
                 view_table=view_table,
                 graph_name=graph_name,
                 reason="Graph does not exist yet",
             )
-        status = graph_store.get_status(graph_name)
+        status = graph_store.get_status(query_table)
         count = status.get("count", 0)
         last_mod = status.get("last_modified")
         return StatusResponse(
@@ -327,7 +530,7 @@ async def dt_status(
     except Exception as e:
         logger.exception("dt_status failed: %s", e)
         raise InfrastructureError(
-            "Digital Twin status check failed", detail=str(e)
+            "Knowledge Graph status check failed", detail=str(e)
         ) from e
 
 
@@ -344,6 +547,7 @@ async def dt_status(
     "label/relationship totals.",
 )
 async def dt_stats(
+    request: Request,
     domain_name: Optional[str] = Query(
         None,
         validation_alias=AliasChoices("domain_name", "project_name"),
@@ -374,34 +578,39 @@ async def dt_stats(
         registry_schema,
         registry_volume,
         domain_version,
+        read_only=True,
     )
+    assert_public_graph_read(request, domain, settings)
     graph_name = effective_graph_name(domain)
 
     if not graph_name:
         raise ValidationError("Graph name not configured")
 
-    store = get_triplestore(domain, settings, backend="graph")
+    store = get_graphdb(domain, settings)
     if not store:
         raise ValidationError("Graph backend not configured")
 
-    try:
-        stats = store.get_aggregate_stats(graph_name)
+    query_table = effective_graph_query_table(domain, settings, store=store)
+
+    cached = _stats_cache.get(query_table)
+    if cached and (time.monotonic() - cached["_ts"]) < _STATS_CACHE_TTL_SECONDS:
+        logger.info("dt_stats: cache hit for %s", query_table)
+        return cached["resp"]
+
+    def _compute_stats() -> StatsResponse:
+        stats = store.get_aggregate_stats(query_table)
         total = stats["total"]
-        subj = stats["distinct_subjects"]
-        pred = stats["distinct_predicates"]
         type_cnt = stats["type_assertion_count"]
         lbl = stats["label_count"]
 
-        entity_rows = store.get_type_distribution(graph_name)
-        pred_rows = store.get_predicate_distribution(graph_name)
-
-        rel_cnt = max(total - type_cnt - lbl, 0)
+        entity_rows = store.get_type_distribution(query_table)
+        pred_rows = store.get_predicate_distribution(query_table)
 
         return StatsResponse(
             success=True,
             total_triples=total,
-            distinct_subjects=subj,
-            distinct_predicates=pred,
+            distinct_subjects=stats["distinct_subjects"],
+            distinct_predicates=stats["distinct_predicates"],
             entity_types=[
                 EntityTypeStat(uri=r["type_uri"], count=int(r["cnt"]))
                 for r in entity_rows
@@ -412,8 +621,22 @@ async def dt_stats(
             ],
             label_count=lbl,
             type_assertion_count=type_cnt,
-            relationship_count=rel_cnt,
+            relationship_count=max(total - type_cnt - lbl, 0),
+            inferred_triples=store.get_inferred_triple_count(query_table),
         )
+
+    try:
+        t0 = time.perf_counter()
+        # Run the (blocking) SQL off the event loop so a slow scan does not
+        # stall other concurrent MCP tool calls.
+        resp = await run_blocking(_compute_stats)
+        logger.info(
+            "dt_stats: computed for %s in %.0fms",
+            query_table,
+            (time.perf_counter() - t0) * 1000,
+        )
+        _stats_cache[query_table] = {"resp": resp, "_ts": time.monotonic()}
+        return resp
     except Exception as e:
         logger.exception("dt_stats failed: %s", e)
         raise InfrastructureError(
@@ -429,7 +652,7 @@ async def dt_stats(
 @router.post(
     "/build",
     response_model=BuildStartedResponse,
-    summary="Start a Digital Twin build",
+    summary="Start a Knowledge Graph build",
     description="Generate all triples from the current ontology + mapping configuration "
     "and write them to the configured triple store backend. "
     "Returns a `task_id` that can be polled via `GET /build/{task_id}`.",
@@ -484,7 +707,7 @@ async def dt_build(
     if not r2rml:
         raise ValidationError("No R2RML mapping available")
 
-    host, token, warehouse_id = get_databricks_credentials(domain, settings)
+    host, token, warehouse_id = get_triplestore_sql_credentials(domain, settings)
     if not host or not token:
         raise ValidationError("Databricks not configured")
     if not warehouse_id:
@@ -499,7 +722,7 @@ async def dt_build(
 
     tm = get_task_manager()
     task = tm.create_task(
-        name="Digital Twin Build (API)",
+        name="Knowledge Graph Build (API)",
         task_type="triplestore_sync",
         steps=[
             {"name": "prepare", "description": "Preparing"},
@@ -559,14 +782,22 @@ async def dt_build_progress(task_id: str):
     summary="Find entities and traverse relationships",
     description="Search for entities by type and/or label text, then traverse "
     "their relationships up to N levels deep (BFS graph walk). "
-    "Returns all triples discovered during traversal.",
+    "Returns all triples discovered during traversal. "
+    "Query param ``cache`` (true/false) overrides the domain Search cache "
+    "switch; omitted uses the domain policy.",
 )
 async def dt_triples_find(
+    request: Request,
     entity_type: Optional[str] = None,
     search: Optional[str] = None,
     depth: int = 1,
     limit: int = 1000,
     offset: int = 0,
+    cache: Optional[str] = Query(
+        None,
+        description="true/false: force search companions on or off. "
+        "Omitted uses Domain → General → Backend Search cache.",
+    ),
     domain_name: Optional[str] = Query(
         None,
         validation_alias=AliasChoices("domain_name", "project_name"),
@@ -603,81 +834,50 @@ async def dt_triples_find(
         registry_schema,
         registry_volume,
         domain_version,
+        read_only=True,
     )
-    table = effective_graph_name(domain)
-    if not table:
-        raise ValidationError("Graph name not configured")
-
-    store = get_triplestore(domain, settings, backend="graph")
+    assert_public_graph_read(request, domain, settings)
+    store = get_graphdb(domain, settings)
     if not store:
         raise ValidationError("Graph backend not configured")
 
-    rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+    from back.core.graphdb.search_cache import (
+        apply_search_cache_to_store,
+        parse_cache_param,
+        search_cache_usage,
+    )
 
-    try:
-        rdfs_label = "http://www.w3.org/2000/01/rdf-schema#label"
+    request_cache = parse_cache_param(cache)
+    apply_search_cache_to_store(store, domain, request_cache)
 
-        seed_conditions: list[str] = []
+    table = effective_graph_query_table(domain, settings, store=store)
+    if not table:
+        raise ValidationError("Graph name not configured")
 
-        if entity_type:
-            esc = sql_escape(entity_type).lower()
-            seed_conditions.append(
-                f"subject IN (SELECT subject FROM {table} "
-                f"WHERE predicate = '{rdf_type}' AND "
-                f"(LOWER(object) LIKE '%#{esc}' OR LOWER(object) LIKE '%/{esc}'))"
-            )
-
-        if search:
-            esc = sql_escape(search).lower()
-            seed_conditions.append(
-                f"(subject IN (SELECT subject FROM {table} "
-                f"WHERE (predicate = '{rdfs_label}' "
-                f"OR predicate LIKE '%#label' OR predicate LIKE '%/label' "
-                f"OR predicate LIKE '%#name' OR predicate LIKE '%/name') "
-                f"AND LOWER(object) LIKE '%{esc}%') "
-                f"OR LOWER(subject) LIKE '%/{esc}%' "
-                f"OR LOWER(subject) LIKE '%#{esc}%')"
-            )
-
-        seed_where = " WHERE " + " AND ".join(seed_conditions)
-
-        bfs_rows = store.bfs_traversal(
+    def _run_find() -> FindResponse:
+        result = DigitalTwin.find_triples_bfs(
+            store,
             table,
-            seed_where,
-            depth,
-            search=search or "",
-            entity_type=entity_type or "",
+            entity_type=entity_type,
+            search=search,
+            depth=depth,
+            limit=limit,
+            offset=offset,
         )
-
-        if not bfs_rows:
+        if result.get("message") and not result.get("triples"):
+            mode, used = search_cache_usage(store, table)
             return FindResponse(
                 success=True,
                 seed_count=0,
                 depth=depth,
-                message="No matching entities found",
+                message=result["message"],
+                cache_used=used,
+                cache_mode=mode,
             )
-
-        all_entities = {r["entity"] for r in bfs_rows}
-        seed_count = sum(1 for r in bfs_rows if int(r.get("min_lvl", 0)) == 0)
-
-        all_entities = DigitalTwin.expand_uri_aliases(store, table, all_entities)
-
-        all_rows = store.get_triples_for_subjects(table, list(all_entities))
-
-        seen_triples: set = set()
-        all_triples: list = []
-        for r in all_rows:
-            key = (r["subject"], r["predicate"], r["object"])
-            if key not in seen_triples:
-                seen_triples.add(key)
-                all_triples.append(r)
-
-        total = len(all_triples)
-        page = all_triples[offset : offset + limit]
-
+        mode, used = search_cache_usage(store, table)
         return FindResponse(
             success=True,
-            seed_count=seed_count,
+            seed_count=result["seed_count"],
             depth=depth,
             triples=[
                 TripleRow(
@@ -685,14 +885,35 @@ async def dt_triples_find(
                     predicate=r.get("predicate", ""),
                     object=r.get("object", ""),
                 )
-                for r in page
+                for r in result["triples"]
             ],
-            count=len(page),
-            total=total,
+            count=result["count"],
+            total=result["total"],
+            has_more=bool(result.get("has_more", False)),
             limit=limit,
             offset=offset,
-            entity_count=len(all_entities),
+            entity_count=result["entity_count"],
+            cache_used=used,
+            cache_mode=mode,
         )
+
+    try:
+        t0 = time.perf_counter()
+        # BFS traversal + alias expansion + bulk triple fetch are all
+        # blocking SQL; run them off the event loop so a dense neighbourhood
+        # walk does not stall other concurrent MCP tool calls.
+        resp = await run_blocking(_run_find)
+        logger.info(
+            "dt_triples_find: search=%r type=%r depth=%d → %d triples in %.0fms",
+            search,
+            entity_type,
+            depth,
+            resp.total,
+            (time.perf_counter() - t0) * 1000,
+        )
+        return resp
+    except (ValidationError, InfrastructureError, NotFoundError):
+        raise
     except Exception as e:
         logger.exception("dt_triples_find failed: %s", e)
         raise InfrastructureError("Triple search failed", detail=str(e)) from e
@@ -712,6 +933,7 @@ async def dt_triples_find(
     "and pagination via limit/offset.",
 )
 async def dt_triples(
+    request: Request,
     subject: Optional[str] = None,
     predicate: Optional[str] = None,
     object: Optional[str] = None,
@@ -753,18 +975,19 @@ async def dt_triples(
         registry_volume,
         domain_version,
     )
-    be = backend or "graph"
+    assert_public_graph_read(request, domain, settings)
+    engine = None if (backend or "graph") == "graph" else backend
+    store = get_graphdb(domain, settings, engine=engine)
+    if not store:
+        raise ValidationError("Backend not configured")
+
     table = (
         effective_view_table(domain, settings).strip()
-        if be == "view"
-        else effective_graph_name(domain)
+        if backend == "view"
+        else effective_graph_query_table(domain, settings, store=store)
     )
     if not table:
         raise ValidationError("Triple store not configured")
-
-    store = get_triplestore(domain, settings, backend=be)
-    if not store:
-        raise ValidationError("Backend not configured")
 
     try:
         conditions = []
@@ -882,11 +1105,11 @@ async def dt_dataquality_start(
             + (f" (category={body.category})" if body.category else ""),
         )
 
-    view_table = effective_view_table(domain, settings).strip()
-    graph_name = effective_graph_name(domain)
-    triplestore_table = graph_name if body.backend == "graph" else view_table
+    triplestore_table = effective_view_table(domain, settings).strip()
     if not triplestore_table:
-        raise ValidationError("Triple store not configured")
+        raise ValidationError(
+            "The triple-store VIEW is not available. Build the Knowledge Graph first."
+        )
 
     total = len(shapes) + len(swrl_rules)
     domain_snap = DigitalTwin.make_snapshot(domain)
@@ -898,8 +1121,6 @@ async def dt_dataquality_start(
         steps=[{"name": "running", "description": f"Running {total} quality checks"}],
     )
 
-    requested_backend = body.backend
-
     def _run():
         DigitalTwin.run_data_quality_task(
             tm,
@@ -908,7 +1129,6 @@ async def dt_dataquality_start(
             domain_snap,
             shapes,
             triplestore_table,
-            requested_backend,
             total,
             swrl_rules=swrl_rules,
             ontology_dict=ontology_dict,
@@ -921,7 +1141,7 @@ async def dt_dataquality_start(
         success=True,
         task_id=task.id,
         shape_count=total,
-        message=f"Data quality checks started ({total} shapes, backend={body.backend})",
+        message=f"Data quality checks started ({total} shapes)",
     )
 
 
@@ -1116,7 +1336,7 @@ async def dt_inference_progress(task_id: str):
 # parameters used by the rest of this router.
 #
 # Why under ``/digitaltwin``:
-#   The cohort engine writes to the *digital twin's* knowledge graph (and
+#   The cohort engine writes to the *knowledge graph's* graph store (and
 #   optionally a UC Delta table). Grouping the routes here keeps a single
 #   resource path for everything that operates on the materialised twin —
 #   ``status``, ``stats``, ``triples``, ``inference``, and now ``cohorts``.
@@ -1270,10 +1490,11 @@ def _resolve_cohort_context(
     graph_name = effective_graph_name(domain)
     if not graph_name:
         raise ValidationError("Graph name is not configured")
-    store = get_triplestore(domain, settings, backend="graph")
+    store = get_graphdb(domain, settings)
     if not store:
         raise InfrastructureError("Graph backend is not configured")
-    return domain, store, graph_name, CohortService(domain)
+    query_table = effective_graph_query_table(domain, settings, store=store)
+    return domain, store, query_table, CohortService(domain)
 
 
 # ---------------------------------------------------------------------------
@@ -1506,7 +1727,8 @@ async def dt_cohort_materialize(
     def _label_resolver(uris):
         try:
             metadata = store.get_entity_metadata(graph_name, list(uris))
-        except Exception:
+        except Exception as exc:
+            logger.debug("Label resolver: entity metadata unavailable: %s", exc)
             return {}
         return {row.get("uri", ""): row.get("label", "") for row in metadata or []}
 
@@ -1538,3 +1760,246 @@ async def dt_cohort_materialize(
         materialize_graph_error=result.get("materialize_graph_error"),
         materialize_uc_error=result.get("materialize_uc_error"),
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /nodes/context
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/nodes/context",
+    response_model=NodeContextResponse,
+    response_model_exclude_none=True,
+    summary="Complete node context (dataset + bridges + virtual attributes)",
+    description="Resolve the ontology class for an entity URI and return linked "
+    "dataset metadata (with optional row retrieval), bridge definitions "
+    "(with optional cross-domain entity traversal) and the virtual attributes "
+    "declared on the class (with optional on-demand computation).",
+)
+async def dt_nodes_context(
+    request: Request,
+    entity_uri: str = Query(..., description="Full URI of the entity node"),
+    domain_name: Optional[str] = Query(
+        None,
+        validation_alias=AliasChoices("domain_name", "project_name"),
+        description="Domain name in the registry",
+    ),
+    domain_version: Optional[str] = Query(None),
+    fetch_dataset_rows: bool = Query(False, description="Fetch rows from the linked UC table/view"),
+    dataset_row_limit: int = Query(5, ge=1, le=20, description="Max rows to return (1–20)"),
+    follow_bridges: bool = Query(False, description="Traverse bridge target domains"),
+    bridge_depth: int = Query(
+        1,
+        ge=1,
+        le=5,
+        description="Bridge traversal depth (BFS hops in the target domain graph)",
+    ),
+    compute_virtual_attributes: bool = Query(
+        False,
+        description="Run the class's virtual attribute functions and return "
+        "their values. Declarations are returned either way.",
+    ),
+    registry_catalog: Optional[str] = Query(None),
+    registry_schema: Optional[str] = Query(None),
+    registry_volume: Optional[str] = Query(None),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    domain = DigitalTwin.resolve_domain(
+        domain_name, session_mgr, settings,
+        registry_catalog, registry_schema, registry_volume,
+        domain_version, read_only=True,
+    )
+    assert_public_graph_read(request, domain, settings)
+    payload = await NodeContextService.resolve_context(
+        domain,
+        settings,
+        entity_uri=entity_uri,
+        session_mgr=session_mgr,
+        fetch_dataset_rows=fetch_dataset_rows,
+        dataset_row_limit=dataset_row_limit,
+        follow_bridges=follow_bridges,
+        bridge_depth=bridge_depth,
+        compute_virtual_attributes=compute_virtual_attributes,
+        registry_catalog=registry_catalog,
+        registry_schema=registry_schema,
+        registry_volume=registry_volume,
+        context_policy=NodeContextService.resolve_context_policy(domain),
+    )
+    return NodeContextResponse(**payload)
+
+
+# ---------------------------------------------------------------------------
+# POST /nodes/action
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/nodes/action",
+    response_model=NodeActionResponse,
+    response_model_exclude_none=True,
+    summary="Invoke a Unity Catalog function action on a node",
+    description="Run one of the ontology class's configured Unity Catalog "
+    "function actions against a node. The function receives exactly one "
+    "argument: the entity's local ID. Only functions declared on the resolved "
+    "class may be invoked.",
+)
+async def dt_nodes_action(
+    payload: NodeActionRequest,
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    domain = DigitalTwin.resolve_domain(
+        payload.domain_name, session_mgr, settings,
+        payload.registry_catalog, payload.registry_schema, payload.registry_volume,
+        payload.domain_version, read_only=True,
+    )
+    assert_public_graph_read(request, domain, settings)
+    result = await NodeContextService.invoke_action(
+        domain,
+        settings,
+        entity_uri=payload.entity_uri,
+        action_full_name=payload.action_full_name,
+        context_policy=NodeContextService.resolve_context_policy(domain),
+    )
+    return NodeActionResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# POST /nodes/business-rule
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/nodes/business-rule",
+    response_model=NodeBusinessRuleResponse,
+    response_model_exclude_none=True,
+    summary="Trigger a SWRL business rule on a node",
+    description="Run one of the SWRL business rules declared on the node's "
+    "ontology class, restricted to that node, and write the inferred triples "
+    "to the graph. Requires the Builder role on the domain. Only rules "
+    "declared on the resolved class may be triggered.",
+)
+async def dt_nodes_business_rule(
+    payload: NodeBusinessRuleRequest,
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    domain = DigitalTwin.resolve_domain(
+        payload.domain_name, session_mgr, settings,
+        payload.registry_catalog, payload.registry_schema, payload.registry_volume,
+        payload.domain_version, read_only=True,
+    )
+    assert_public_graph_write(request, domain, settings)
+    result = await NodeContextService.run_business_rule(
+        domain,
+        settings,
+        entity_uri=payload.entity_uri,
+        rule_name=payload.rule,
+        context_policy=NodeContextService.resolve_context_policy(domain),
+    )
+    return NodeBusinessRuleResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# GET /nodes/shacl
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/nodes/shacl",
+    response_model=NodeShaclResponse,
+    response_model_exclude_none=True,
+    summary="Evaluate the SHACL shapes related to a node",
+    description="Check every enabled SHACL shape that targets the entity's "
+    "class, one of its ancestors, or no class, against that entity only. "
+    "Each facet reports pass, fail, not_applicable, not_evaluated or error, "
+    "with the values the entity carries on the constrained property. "
+    "Read-only; shapes are always read from the domain.",
+)
+async def dt_nodes_shacl(
+    request: Request,
+    entity_uri: str = Query(..., description="Full URI of the entity node"),
+    domain_name: Optional[str] = Query(
+        None,
+        validation_alias=AliasChoices("domain_name", "project_name"),
+        description="Domain name in the registry",
+    ),
+    domain_version: Optional[str] = Query(None),
+    registry_catalog: Optional[str] = Query(None),
+    registry_schema: Optional[str] = Query(None),
+    registry_volume: Optional[str] = Query(None),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    domain = DigitalTwin.resolve_domain(
+        domain_name, session_mgr, settings,
+        registry_catalog, registry_schema, registry_volume,
+        domain_version, read_only=True,
+    )
+    assert_public_graph_read(request, domain, settings)
+    payload = await NodeShaclService.evaluate(domain, settings, entity_uri=entity_uri)
+    return NodeShaclResponse(**payload)
+
+
+# ---------------------------------------------------------------------------
+# GET /nodes/virtual-attributes
+# ---------------------------------------------------------------------------
+
+
+class ComputeVirtualAttributesResponse(BaseModel):
+    success: bool
+    entity_uri: str = ""
+    entity_local_id: str = ""
+    class_name: Optional[str] = None
+    virtual_attributes: Optional[List[NodeContextVirtualAttributeGroup]] = None
+    message: Optional[str] = None
+
+
+@router.get(
+    "/nodes/virtual-attributes",
+    response_model=ComputeVirtualAttributesResponse,
+    response_model_exclude_none=True,
+    summary="Compute virtual attributes for a node",
+    description="Run the Unity Catalog functions declared as virtual attributes "
+    "on the entity's ontology class. Omit *function* to compute every group; "
+    "pass a fully qualified name to compute one group only. Each function "
+    "receives exactly one argument: the entity's local ID.",
+)
+async def dt_nodes_virtual_attributes(
+    request: Request,
+    entity_uri: str = Query(..., description="Full URI of the entity node"),
+    function: Optional[str] = Query(
+        None,
+        description="Fully qualified UC function name (catalog.schema.function). "
+        "When omitted, every virtual attribute group on the class is computed.",
+    ),
+    domain_name: Optional[str] = Query(
+        None,
+        validation_alias=AliasChoices("domain_name", "project_name"),
+        description="Domain name in the registry",
+    ),
+    domain_version: Optional[str] = Query(None),
+    registry_catalog: Optional[str] = Query(None),
+    registry_schema: Optional[str] = Query(None),
+    registry_volume: Optional[str] = Query(None),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    domain = DigitalTwin.resolve_domain(
+        domain_name, session_mgr, settings,
+        registry_catalog, registry_schema, registry_volume,
+        domain_version, read_only=True,
+    )
+    assert_public_graph_read(request, domain, settings)
+    payload = await NodeContextService.compute_virtual_attributes(
+        domain,
+        settings,
+        entity_uri=entity_uri,
+        function_full_name=function,
+        context_policy=NodeContextService.resolve_context_policy(domain),
+    )
+    return ComputeVirtualAttributesResponse(**payload)

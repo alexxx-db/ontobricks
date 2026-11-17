@@ -2,60 +2,33 @@
 
 Use :class:`Ontology` with a :class:`~back.objects.session.DomainSession` for
 operations that persist to the session; use static methods for pure transforms.
+
+Capability classes (Fowler Extract Class) own the bodies; this facade keeps
+one-line delegators so ``Ontology.parse_owl`` / ``Ontology.add_class`` stay.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Set
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-from back.core.logging import get_logger
-from back.core.errors import (
-    InfrastructureError,
-    NotFoundError,
-    OntoBricksError,
-    ValidationError,
-)
-from shared.config.constants import DEFAULT_BASE_URI
-from back.core.industry import (
-    fetch_and_parse_cdisc,
-    fetch_and_parse_fibo,
-    fetch_and_parse_fhir,
-    fetch_and_parse_iof,
-)
-from back.core.w3c import OntologyGenerator, OntologyParser
 from back.core.w3c.shacl.constants import QUALITY_CATEGORIES
+from shared.config.constants import DEFAULT_BASE_URI
+from back.objects.ontology.ClassModel import ClassModel
+from back.objects.ontology.Editor import Editor
+from back.objects.ontology.EntityImport import EntityImport
+from back.objects.ontology.Groups import Groups
+from back.objects.ontology.Import import IndustryKind, Import
+from back.objects.ontology.Owl import Owl
+from back.objects.ontology.Rules import Rules
 
 if TYPE_CHECKING:
     from agents.agent_auto_icon_assign.engine import (
         AgentResult as IconAssignAgentResult,
     )
-    from agents.agent_owl_generator.engine import AgentResult
+    from agents.agent_business_rules_generator.engine import (
+        AgentResult as BusinessRulesAgentResult,
+    )
     from back.objects.session.DomainSession import DomainSession
-
-IndustryKind = Literal["fibo", "cdisc", "iof", "fhir"]
-
-logger = get_logger(__name__)
-
-_INDUSTRY_EMPTY_MESSAGE: Dict[IndustryKind, str] = {
-    "fibo": "No FIBO domains selected.",
-    "cdisc": "No CDISC domains selected.",
-    "iof": "No IOF domains selected.",
-    "fhir": "No FHIR domains selected.",
-}
-
-_INDUSTRY_LOG_LABEL: Dict[IndustryKind, str] = {
-    "fibo": "FIBO",
-    "cdisc": "CDISC",
-    "iof": "IOF",
-    "fhir": "FHIR",
-}
-
-_INDUSTRY_FETCH = {
-    "fibo": fetch_and_parse_fibo,
-    "cdisc": fetch_and_parse_cdisc,
-    "iof": fetch_and_parse_iof,
-    "fhir": fetch_and_parse_fhir,
-}
 
 
 class Ontology:
@@ -64,26 +37,27 @@ class Ontology:
     def __init__(self, session: "DomainSession") -> None:
         self._domain = session
 
-    def generate_with_agent(
+    def generate_rules_with_agent(
         self,
         *,
         host: str,
         token: str,
         endpoint_name: str,
-        metadata: Dict[str, Any],
-        guidelines: str = "",
         options: Optional[Dict[str, Any]] = None,
+        guidelines: str = "",
         selected_docs: Optional[List[str]] = None,
+        warehouse_id: str = "",
         on_step: Optional[Callable[[str], None]] = None,
-    ) -> "AgentResult":
-        """Run ``agent_owl_generator`` for this project (blocking).
+    ) -> "BusinessRulesAgentResult":
+        """Run ``agent_business_rules_generator`` for this project (blocking).
 
-        Resolves ``base_uri``, registry, project folder, and table selection from
-        the session and the provided ``metadata`` (same rules as the wizard).
+        Feeds the live ontology design (classes/attributes + relationships) and
+        the domain's uploaded documents to the agent, which proposes SWRL,
+        decision-table, SPARQL, and aggregate rules for the user to review.
 
         Typical use: call from a background thread; poll task status from HTTP.
         """
-        from agents.agent_owl_generator import run_agent
+        from agents.agent_business_rules_generator import run_agent
 
         s = self._domain
         ont = s.ontology
@@ -92,53 +66,78 @@ class Ontology:
             or ont.get("info", {}).get("base_uri")
             or DEFAULT_BASE_URI
         )
-        selected_tables = [
-            t.get("full_name") or t.get("name")
-            for t in (metadata or {}).get("tables", [])
-        ]
         return run_agent(
             host=host,
             token=token,
             endpoint_name=endpoint_name,
             registry=dict(s.registry),
-            metadata=metadata or {},
-            guidelines=guidelines or "",
-            options=options or {},
+            ontology_design=self.agent_ontology_context(connected_only=True),
             base_uri=base_uri,
+            options=options or {},
+            guidelines=guidelines or "",
             domain_name=s.info.get("name", ""),
             domain_folder=s.domain_folder,
             domain_version=s.current_version,
-            selected_tables=selected_tables,
             selected_docs=list(selected_docs or []),
+            warehouse_id=warehouse_id or "",
             on_step=on_step,
         )
 
-    def agent_ontology_context(self) -> Dict[str, Any]:
-        """Ontology snapshot for agents: entities (classes + attributes) + object-property rels."""
+    def agent_ontology_context(
+        self, connected_only: bool = False
+    ) -> Dict[str, Any]:
+        """Ontology snapshot for agents: entities (classes + attributes) + object-property rels.
+
+        Args:
+            connected_only: When True, drop entities that do not participate in
+                any business relationship (object property) as domain or range.
+                Entities related only through inheritance — or not at all — are
+                excluded so the consuming agent never references them.
+        """
         s = self._domain
         classes = s.get_classes()
         properties = s.get_properties()
-        return {
-            "entities": [
-                {
-                    "name": c.get("name", ""),
-                    "uri": c.get("uri", ""),
-                    "attributes": [
-                        dp.get("name", "") for dp in c.get("dataProperties", [])
-                    ],
-                }
-                for c in classes
-            ],
-            "relationships": [
-                {
-                    "name": p.get("name", ""),
-                    "domain": p.get("domain", ""),
-                    "range": p.get("range", ""),
-                }
-                for p in properties
-                if p.get("type") in ("ObjectProperty", "owl:ObjectProperty", None)
-            ],
-        }
+
+        relationships = [
+            {
+                "name": p.get("name", ""),
+                "domain": p.get("domain", ""),
+                "range": p.get("range", ""),
+            }
+            for p in properties
+            if p.get("type") in ("ObjectProperty", "owl:ObjectProperty", None)
+        ]
+
+        def _local(ref: str) -> str:
+            return ref.rsplit("#", 1)[-1].rsplit("/", 1)[-1] if ref else ""
+
+        entities = [
+            {
+                "name": c.get("name", ""),
+                "uri": c.get("uri", ""),
+                "attributes": [
+                    dp.get("name", "") for dp in c.get("dataProperties", [])
+                ],
+            }
+            for c in classes
+        ]
+
+        if connected_only:
+            endpoints: Set[str] = set()
+            for rel in relationships:
+                for ref in (rel["domain"], rel["range"]):
+                    if ref:
+                        endpoints.add(ref.lower())
+                        endpoints.add(_local(ref).lower())
+            entities = [
+                e
+                for e in entities
+                if (e["name"] and e["name"].lower() in endpoints)
+                or (e["uri"] and e["uri"].lower() in endpoints)
+                or (e["uri"] and _local(e["uri"]).lower() in endpoints)
+            ]
+
+        return {"entities": entities, "relationships": relationships}
 
     def assign_icons_with_agent(
         self,
@@ -167,50 +166,23 @@ class Ontology:
 
     @staticmethod
     def ensure_uris(config: Dict[str, Any]) -> Dict[str, Any]:
-        """Ensure all classes and properties have URIs.
+        return ClassModel.ensure_uris(config)
 
-        Args:
-            config: Ontology configuration dict
+    @staticmethod
+    def prune_orphaned_datatype_properties(config: Dict[str, Any]) -> int:
+        return ClassModel.prune_orphaned_datatype_properties(config)
 
-        Returns:
-            dict: Configuration with URIs ensured
-        """
-        base_uri = config.get("base_uri", "http://example.org/")
-        if not base_uri.endswith("#") and not base_uri.endswith("/"):
-            base_uri = base_uri + "#"
+    @staticmethod
+    def sync_class_data_properties(config: Dict[str, Any]) -> None:
+        return ClassModel.sync_class_data_properties(config)
 
-        for cls in config.get("classes", []):
-            if not cls.get("uri") and cls.get("name"):
-                cls["uri"] = base_uri + cls["name"]
-            if not cls.get("localName") and cls.get("name"):
-                cls["localName"] = cls["name"]
-
-        for prop in config.get("properties", []):
-            if not prop.get("uri") and prop.get("name"):
-                prop["uri"] = base_uri + prop["name"]
-            if not prop.get("localName") and prop.get("name"):
-                prop["localName"] = prop["name"]
-
-        return config
+    @staticmethod
+    def finalize_class_attributes(config: Dict[str, Any]) -> None:
+        return ClassModel.finalize_class_attributes(config)
 
     @staticmethod
     def get_ontology_stats(config: Dict[str, Any]) -> Dict[str, int]:
-        """Get statistics from ontology configuration.
-
-        Args:
-            config: Ontology configuration dict
-
-        Returns:
-            dict: Stats with counts
-        """
-        return {
-            "classes": len(config.get("classes", [])),
-            "properties": len(config.get("properties", [])),
-            "constraints": len(config.get("constraints", [])),
-            "swrl_rules": len(config.get("swrl_rules", [])),
-            "axioms": len(config.get("axioms", [])),
-            "expressions": len(config.get("expressions", [])),
-        }
+        return Owl.get_ontology_stats(config)
 
     @staticmethod
     def normalize_property_domain_range(
@@ -218,266 +190,58 @@ class Ontology:
         *,
         on_replace: Optional[Callable[[Dict[str, Any], str, Any, Any], None]] = None,
     ) -> bool:
-        """Align property ``domain`` / ``range`` with canonical class names (case-insensitive).
-
-        Mutates ``ontology_config['properties']`` in place. If ``on_replace`` is set, it is
-        called as ``(prop_dict, field_name, old_value, new_value)`` for each change.
-
-        Returns:
-            True if any property field was updated.
-        """
-        classes = ontology_config.get("classes", [])
-        properties = ontology_config.get("properties", [])
-        class_name_lookup = {
-            c["name"].lower(): c["name"] for c in classes if c.get("name")
-        }
-        modified = False
-        for prop in properties:
-            for field in ("domain", "range"):
-                val = prop.get(field, "")
-                if val and val not in class_name_lookup.values():
-                    canonical = class_name_lookup.get(str(val).lower())
-                    if canonical:
-                        if on_replace is not None:
-                            on_replace(prop, field, val, canonical)
-                        prop[field] = canonical
-                        modified = True
-        return modified
+        return ClassModel.normalize_property_domain_range(ontology_config, on_replace=on_replace)
 
     def prune_mappings_to_ontology_uris(
         self,
         class_uris: Set[str],
         property_uris: Set[str],
     ) -> Dict[str, int]:
-        """Drop entity/relationship mappings whose URIs are not in the given sets.
+        return Editor(self._domain).prune_mappings_to_ontology_uris(class_uris, property_uris)
 
-        Updates session assignment only when rows are removed.
+    @staticmethod
+    def _diff_by_uri(
+        old_list: Optional[List[Dict[str, Any]]],
+        new_list: Optional[List[Dict[str, Any]]],
+    ) -> Tuple[list, list, list]:
+        return Editor._diff_by_uri(old_list, new_list)
 
-        Returns:
-            Counts ``entity_mappings_removed`` and ``relationship_mappings_removed``.
-        """
-        s = self._domain
-        entity_mappings = s.get_entity_mappings()
-        cleaned_entity = [
-            m for m in entity_mappings if m.get("ontology_class") in class_uris
-        ]
-        removed_entity = len(entity_mappings) - len(cleaned_entity)
-
-        rel_mappings = s.get_relationship_mappings()
-        cleaned_rel = [m for m in rel_mappings if m.get("property") in property_uris]
-        removed_rel = len(rel_mappings) - len(cleaned_rel)
-
-        if removed_entity > 0:
-            s._data["assignment"]["entities"] = cleaned_entity
-        if removed_rel > 0:
-            s._data["assignment"]["relationships"] = cleaned_rel
-
-        return {
-            "entity_mappings_removed": removed_entity,
-            "relationship_mappings_removed": removed_rel,
-        }
+    def _record_ontology_diff(
+        self,
+        old_classes: Optional[List[Dict[str, Any]]],
+        new_classes: Optional[List[Dict[str, Any]]],
+        old_props: Optional[List[Dict[str, Any]]],
+        new_props: Optional[List[Dict[str, Any]]],
+        *,
+        source: str = "user",
+    ) -> None:
+        return Editor(self._domain)._record_ontology_diff(old_classes, new_classes, old_props, new_props, source=source)
 
     def save_ontology_config_from_editor(
         self, raw_body: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Persist ontology from the visual editor API (wrapped or bare config dict)."""
-        s = self._domain
-        ontology_config = raw_body.get("config", raw_body)
-        ontology_config = Ontology.ensure_uris(ontology_config)
+        return Editor(self._domain).save_ontology_config_from_editor(raw_body)
 
-        def _on_replace(prop: Dict[str, Any], field: str, old: Any, new: Any) -> None:
-            logger.debug(
-                "Normalizing property %s.%s: %r → %r",
-                prop.get("name"),
-                field,
-                old,
-                new,
-            )
-
-        Ontology.normalize_property_domain_range(
-            ontology_config, on_replace=_on_replace
-        )
-
-        existing_constraints = s.constraints
-        existing_swrl_rules = s.swrl_rules
-        existing_axioms = s.axioms
-        existing_expressions = s.expressions
-
-        new_class_uris = {
-            c.get("uri") for c in ontology_config.get("classes", []) if c.get("uri")
-        }
-        new_property_uris = {
-            p.get("uri") for p in ontology_config.get("properties", []) if p.get("uri")
-        }
-
-        entity_before = s.get_entity_mappings()
-        removed_counts = self.prune_mappings_to_ontology_uris(
-            new_class_uris, new_property_uris
-        )
-        removed_entity = removed_counts["entity_mappings_removed"]
-        removed_rel = removed_counts["relationship_mappings_removed"]
-
-        if removed_entity > 0 or removed_rel > 0:
-            orphaned_uris = [
-                m.get("ontology_class")
-                for m in entity_before
-                if m.get("ontology_class") not in new_class_uris
-            ]
-            logger.warning(
-                "Orphan cleanup: removing %d entity mappings (orphan URIs: %s) and %d rel mappings. "
-                "New class URIs: %s",
-                removed_entity,
-                orphaned_uris,
-                removed_rel,
-                list(new_class_uris)[:10],
-            )
-
-        s.clear_generated_content()
-        canonical_name = s.info.get("name", "").lower() or ontology_config.get(
-            "name", ""
-        )
-        s.ontology.update(
-            {
-                "name": canonical_name,
-                "base_uri": ontology_config.get("base_uri", ""),
-                "description": ontology_config.get("description", ""),
-                "classes": ontology_config.get("classes", []),
-                "properties": ontology_config.get("properties", []),
-                "constraints": ontology_config.get("constraints", existing_constraints),
-                "swrl_rules": ontology_config.get("swrl_rules", existing_swrl_rules),
-                "axioms": ontology_config.get("axioms", existing_axioms),
-                "expressions": ontology_config.get("expressions", existing_expressions),
-            }
-        )
-        s.save()
-
-        return {
-            "success": True,
-            "message": "Ontology saved",
-            "stats": Ontology.get_ontology_stats(ontology_config),
-            "mappings_cleaned": {
-                "entity_mappings_removed": removed_entity,
-                "relationship_mappings_removed": removed_rel,
-            },
-        }
+    def _sync_design_layout_with_ontology(self) -> None:
+        return Editor(self._domain)._sync_design_layout_with_ontology()
 
     def delete_class_by_uri(self, class_uri: Optional[str]) -> Dict[str, Any]:
-        """Remove a class by URI and drop entity mappings that reference it."""
-        if not class_uri:
-            raise ValidationError("Class URI is required")
-        s = self._domain
-        classes = list(s.get_classes())
-        original_len = len(classes)
-        classes = [c for c in classes if c.get("uri") != class_uri]
-        if len(classes) >= original_len:
-            raise NotFoundError("Class not found")
-
-        s.ontology["classes"] = classes
-        entity_mappings = s.get_entity_mappings()
-        original_mapping_len = len(entity_mappings)
-        entity_mappings = [
-            m for m in entity_mappings if m.get("ontology_class") != class_uri
-        ]
-        if len(entity_mappings) < original_mapping_len:
-            s._data["assignment"]["entities"] = entity_mappings
-
-        s.clear_generated_content()
-        s.save()
-        return {
-            "success": True,
-            "mapping_removed": len(entity_mappings) < original_mapping_len,
-        }
+        return Editor(self._domain).delete_class_by_uri(class_uri)
 
     def delete_property_by_uri(self, property_uri: Optional[str]) -> Dict[str, Any]:
-        """Remove an object property by URI and drop relationship mappings that reference it."""
-        if not property_uri:
-            raise ValidationError("Property URI is required")
-        s = self._domain
-        properties = list(s.get_properties())
-        original_len = len(properties)
-        properties = [p for p in properties if p.get("uri") != property_uri]
-        if len(properties) >= original_len:
-            raise NotFoundError("Property not found")
-
-        s.ontology["properties"] = properties
-        rel_mappings = s.get_relationship_mappings()
-        original_mapping_len = len(rel_mappings)
-        rel_mappings = [m for m in rel_mappings if m.get("property") != property_uri]
-        if len(rel_mappings) < original_mapping_len:
-            s._data["assignment"]["relationships"] = rel_mappings
-
-        s.clear_generated_content()
-        s.save()
-        return {
-            "success": True,
-            "mapping_removed": len(rel_mappings) < original_mapping_len,
-        }
+        return Editor(self._domain).delete_property_by_uri(property_uri)
 
     def add_class(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Build a class from *data*, append if unique URI and name, clear cache and save."""
-        s = self._domain
-        classes = list(s.get_classes())
-        new_class = Ontology.build_class_from_data(data)
-        if any(c.get("uri") == new_class["uri"] for c in classes):
-            raise ValidationError("Class with this URI already exists")
-        if any(c.get("name") == new_class["name"] for c in classes):
-            raise ValidationError("Class with this name already exists")
-        classes.append(new_class)
-        s.ontology["classes"] = classes
-        s.clear_generated_content()
-        s.save()
-        return {"success": True, "class": new_class}
+        return Editor(self._domain).add_class(data)
 
     def update_class(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Find class by *uri* in data, merge updates, clear cache and save."""
-        s = self._domain
-        classes = list(s.get_classes())
-        class_uri = data.get("uri")
-        new_name = data.get("name")
-        for i, cls in enumerate(classes):
-            if cls.get("uri") == class_uri:
-                if new_name and new_name != cls.get("name"):
-                    if any(c.get("name") == new_name for j, c in enumerate(classes) if j != i):
-                        raise ValidationError("Class with this name already exists")
-                classes[i] = Ontology.build_class_from_data(data, cls)
-                s.ontology["classes"] = classes
-                s.clear_generated_content()
-                s.save()
-                return {"success": True, "class": classes[i]}
-        raise NotFoundError("Class not found")
+        return Editor(self._domain).update_class(data)
 
     def add_property(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Build a property from *data*, append if unique URI and name, clear cache and save."""
-        s = self._domain
-        properties = list(s.get_properties())
-        new_property = Ontology.build_property_from_data(data)
-        if any(p.get("uri") == new_property["uri"] for p in properties):
-            raise ValidationError("Property with this URI already exists")
-        if any(p.get("name") == new_property["name"] for p in properties):
-            raise ValidationError("Property with this name already exists")
-        properties.append(new_property)
-        s.ontology["properties"] = properties
-        s.clear_generated_content()
-        s.save()
-        return {"success": True, "property": new_property}
+        return Editor(self._domain).add_property(data)
 
     def update_property(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Find property by *uri* in data, merge updates, clear cache and save."""
-        s = self._domain
-        properties = list(s.get_properties())
-        property_uri = data.get("uri")
-        new_name = data.get("name")
-        for i, prop in enumerate(properties):
-            if prop.get("uri") == property_uri:
-                if new_name and new_name != prop.get("name"):
-                    if any(p.get("name") == new_name for j, p in enumerate(properties) if j != i):
-                        raise ValidationError("Property with this name already exists")
-                properties[i] = Ontology.build_property_from_data(data, prop)
-                s.ontology["properties"] = properties
-                s.clear_generated_content()
-                s.save()
-                return {"success": True, "property": properties[i]}
-        raise NotFoundError("Property not found")
+        return Editor(self._domain).update_property(data)
 
     def ingest_owl(
         self,
@@ -486,111 +250,55 @@ class Ontology:
         name_fallback_to_domain: bool = True,
         outcome: str = "import",
     ) -> Dict[str, Any]:
-        """Parse OWL content, apply to project, return the appropriate success payload.
-
-        ``outcome`` controls the response shape:
-        - ``"import"``  → :meth:`build_import_owl_success_payload`
-        - ``"parse"``   → :meth:`build_parse_owl_success_payload`
-        - ``"load_file"``→ :meth:`build_load_owl_file_success_payload`
-        """
-        result = Ontology.parse_owl(owl_content, extract_advanced=True)
-        (
-            ontology_info,
-            classes,
-            properties,
-            constraints,
-            swrl_rules,
-            axioms,
-            expressions,
-            groups,
-        ) = result
-
-        resolved_name = self.apply_parsed_owl_to_domain(
-            ontology_info,
-            classes,
-            properties,
-            constraints,
-            swrl_rules,
-            axioms,
-            expressions,
-            groups=groups,
-            name_fallback_to_domain=name_fallback_to_domain,
-        )
-
-        if outcome == "parse":
-            return self.build_parse_owl_success_payload(
-                ontology_info,
-                classes,
-                properties,
-                constraints,
-                swrl_rules,
-                axioms,
-                expressions,
-                resolved_name,
-            )
-        if outcome == "load_file":
-            return self.build_load_owl_file_success_payload(
-                classes,
-                properties,
-                constraints,
-                swrl_rules,
-                axioms,
-                expressions,
-            )
-        return self.build_import_owl_success_payload(classes, properties, constraints)
+        return Import(self._domain).ingest_owl(owl_content, name_fallback_to_domain=name_fallback_to_domain, outcome=outcome)
 
     def apply_parsed_rdfs_to_domain(
         self,
         rdfs_content: str,
     ) -> Dict[str, Any]:
-        """Parse RDFS content, apply to project, return success payload."""
-        ontology_info, classes, properties = Ontology.parse_rdfs(rdfs_content)
-        self._domain.ontology.update(
-            {
-                "name": ontology_info.get("label", "Imported Vocabulary"),
-                "base_uri": ontology_info.get(
-                    "namespace", ontology_info.get("uri", "")
-                ),
-                "classes": classes,
-                "properties": properties,
-            }
-        )
-        self._domain.save()
-        return {
-            "success": True,
-            "ontology": {
-                "info": ontology_info,
-                "classes": classes,
-                "properties": properties,
-            },
-            "config": self._domain.ontology,
-            "stats": {"classes": len(classes), "properties": len(properties)},
-        }
+        return Import(self._domain).apply_parsed_rdfs_to_domain(rdfs_content)
+
+    def _try_import_as_shacl(self, content: str) -> Optional[Dict[str, Any]]:
+        return Import(self._domain)._try_import_as_shacl(content)
+
+    def analyze_import(
+        self,
+        owl_content: str,
+        *,
+        format: str = "owl",
+    ) -> Dict[str, Any]:
+        return Import(self._domain).analyze_import(owl_content, format=format)
+
+    def merge_parsed_owl_to_domain(
+        self,
+        owl_content: str,
+        resolutions: Dict[str, str],
+        *,
+        format: str = "owl",
+        name_fallback_to_domain: bool = True,
+    ) -> Dict[str, Any]:
+        return Import(self._domain).merge_parsed_owl_to_domain(owl_content, resolutions, format=format, name_fallback_to_domain=name_fallback_to_domain)
+
+    def _merge_rdfs(
+        self,
+        rdfs_content: str,
+        resolutions: Dict[str, str],
+    ) -> Dict[str, Any]:
+        return Import(self._domain)._merge_rdfs(rdfs_content, resolutions)
+
+    @staticmethod
+    def _apply_resolutions(
+        entity_type: str,
+        existing: list,
+        report: ConflictReport,
+        resolutions: Dict[str, str],
+    ) -> list:
+        return Import._apply_resolutions(entity_type, existing, report, resolutions)
 
     def rename_relationship_references(
         self, old_name: str, new_name: str
     ) -> Dict[str, int]:
-        """Rename a relationship across mappings, constraints, and axioms. Saves session."""
-        s = self._domain
-        updates: Dict[str, int] = {
-            "mappings_updated": 0,
-            "constraints_updated": 0,
-            "axioms_updated": 0,
-        }
-        for rel_mapping in s.get_relationship_mappings():
-            if rel_mapping.get("property_label") == old_name:
-                rel_mapping["property_label"] = new_name
-                updates["mappings_updated"] += 1
-        for constraint in s.constraints:
-            if constraint.get("property") == old_name:
-                constraint["property"] = new_name
-                updates["constraints_updated"] += 1
-        for axiom in s.axioms:
-            if axiom.get("property") == old_name:
-                axiom["property"] = new_name
-                updates["axioms_updated"] += 1
-        s.save()
-        return updates
+        return Editor(self._domain).rename_relationship_references(old_name, new_name)
 
     def apply_agent_ontology_changes(
         self,
@@ -604,6 +312,8 @@ class Ontology:
         Returns the config dict suitable for ``response["config"]``.
         """
         s = self._domain
+        old_classes = list(s.get_classes())
+        old_props = list(s.get_properties())
         base_uri = s.ontology.get("base_uri") or DEFAULT_BASE_URI
         ontology_config = {
             "name": s.ontology.get("name", ""),
@@ -630,6 +340,13 @@ class Ontology:
                 "properties": ontology_config["properties"],
             }
         )
+        self._record_ontology_diff(
+            old_classes,
+            ontology_config["classes"],
+            old_props,
+            ontology_config["properties"],
+            source="agent",
+        )
         s.save()
 
         return {
@@ -642,15 +359,50 @@ class Ontology:
 
     @staticmethod
     def validate_swrl_rule(rule: Dict[str, Any]) -> List[str]:
-        """Validate a SWRL rule dict, return list of error strings (empty = valid)."""
-        errors: List[str] = []
-        if not rule.get("name"):
-            errors.append("Rule name is required")
-        if not rule.get("antecedent"):
-            errors.append("Rule antecedent is required")
-        if not rule.get("consequent"):
-            errors.append("Rule consequent is required")
-        return errors
+        return Rules.validate_swrl_rule(rule)
+
+    _SWRL_ATOM_RE = Rules._SWRL_ATOM_RE
+
+    _SWRL_BUILTIN_PREFIXES = Rules._SWRL_BUILTIN_PREFIXES
+
+    @staticmethod
+    def swrl_reference_errors(
+        rule: Dict[str, Any],
+        class_names: Set[str],
+        property_names: Set[str],
+    ) -> List[str]:
+        return Rules.swrl_reference_errors(rule, class_names, property_names)
+
+    @staticmethod
+    def _ref_local_name(term: str):
+        return Rules._ref_local_name(term)
+
+    @staticmethod
+    def decision_table_reference_errors(
+        rule: Dict[str, Any], class_names: Set[str], property_names: Set[str]
+    ) -> List[str]:
+        return Rules.decision_table_reference_errors(rule, class_names, property_names)
+
+    @staticmethod
+    def aggregate_reference_errors(
+        rule: Dict[str, Any], class_names: Set[str], property_names: Set[str]
+    ) -> List[str]:
+        return Rules.aggregate_reference_errors(rule, class_names, property_names)
+
+    @staticmethod
+    def sparql_reference_errors(
+        rule: Dict[str, Any], class_names: Set[str], property_names: Set[str]
+    ) -> List[str]:
+        return Rules.sparql_reference_errors(rule, class_names, property_names)
+
+    @staticmethod
+    def rule_reference_errors(
+        key: str,
+        rule: Dict[str, Any],
+        class_names: Set[str],
+        property_names: Set[str],
+    ) -> List[str]:
+        return Rules.rule_reference_errors(key, rule, class_names, property_names)
 
     @staticmethod
     def merge_icon_suggestions(
@@ -669,169 +421,35 @@ class Ontology:
 
     @staticmethod
     def postprocess_generated_owl(content: str) -> tuple:
-        """Clean LLM output and compute stats in one step. Returns ``(turtle, stats)``."""
-        turtle = Ontology.clean_owl_output(content)
-        stats = Ontology.calculate_owl_stats(turtle)
-        return turtle, stats
+        return Owl.postprocess_generated_owl(content)
 
     @staticmethod
     def build_class_from_data(
         data: Dict[str, Any], existing: Dict[str, Any] = None
     ) -> Dict[str, Any]:
-        """Build a class dict from request data.
-
-        Args:
-            data: Request data
-            existing: Existing class data (for updates)
-
-        Returns:
-            dict: Built class
-        """
-        existing = existing or {}
-        return {
-            "uri": data.get("uri", existing.get("uri", "")),
-            "name": data.get("name", existing.get("name", "")),
-            "label": data.get("label", data.get("name", existing.get("label", ""))),
-            "description": data.get("description", existing.get("description", "")),
-            "parent": data.get("parent", existing.get("parent", "")),
-            "emoji": data.get("emoji", existing.get("emoji", "📦")),
-            "properties": data.get("properties", existing.get("properties", [])),
-            "dataProperties": data.get(
-                "dataProperties", existing.get("dataProperties", [])
-            ),
-            "dashboard": data.get("dashboard", existing.get("dashboard", "")),
-            "dashboardParams": data.get(
-                "dashboardParams", existing.get("dashboardParams", {})
-            ),
-            "bridges": data.get("bridges", existing.get("bridges", [])),
-        }
+        return ClassModel.build_class_from_data(data, existing)
 
     @staticmethod
     def build_property_from_data(
         data: Dict[str, Any], existing: Dict[str, Any] = None
     ) -> Dict[str, Any]:
-        """Build a property dict from request data.
-
-        Args:
-            data: Request data
-            existing: Existing property data (for updates)
-
-        Returns:
-            dict: Built property
-        """
-        existing = existing or {}
-        return {
-            "uri": data.get("uri", existing.get("uri", "")),
-            "name": data.get("name", existing.get("name", "")),
-            "label": data.get("label", data.get("name", existing.get("label", ""))),
-            "description": data.get("description", existing.get("description", "")),
-            "type": data.get("type", existing.get("type", "")),
-            "domain": data.get("domain", existing.get("domain", "")),
-            "range": data.get("range", existing.get("range", "")),
-            "direction": data.get("direction", existing.get("direction", "forward")),
-            "properties": data.get("properties", existing.get("properties", [])),
-        }
+        return ClassModel.build_property_from_data(data, existing)
 
     @staticmethod
     def validate_constraint(constraint: Dict[str, Any]) -> Optional[str]:
-        """Validate constraint and return error message if invalid.
-
-        Args:
-            constraint: Constraint data
-
-        Returns:
-            str: Error message if invalid, None if valid
-        """
-        constraint_type = constraint.get("type")
-        if not constraint_type:
-            return "Constraint type is required"
-
-        property_characteristics = [
-            "functional",
-            "inverseFunctional",
-            "transitive",
-            "symmetric",
-            "asymmetric",
-            "reflexive",
-            "irreflexive",
-        ]
-        cardinality_constraints = [
-            "minCardinality",
-            "maxCardinality",
-            "exactCardinality",
-        ]
-        value_constraints = [
-            "valueCheck",
-            "entityValueCheck",
-            "entityLabelCheck",
-            "attributeConstraint",
-            "globalRule",
-        ]
-
-        if constraint_type in cardinality_constraints:
-            if not constraint.get("property"):
-                return "Relationship (property) is required for cardinality constraints"
-            if constraint.get("cardinalityValue") is None:
-                return "Cardinality value is required"
-        elif constraint_type in value_constraints:
-            if constraint_type != "globalRule" and not constraint.get("className"):
-                return "Entity (className) is required for value constraints"
-        elif constraint_type in property_characteristics:
-            if not constraint.get("property"):
-                return "Property is required for property characteristics"
-
-        return None
+        return Rules.validate_constraint(constraint)
 
     @staticmethod
     def validate_shape(shape: Dict[str, Any]) -> Optional[str]:
-        """Validate a SHACL shape dict, return error message or None."""
-        category = shape.get("category", "")
-        if category not in QUALITY_CATEGORIES:
-            return f"Invalid category '{category}'. Must be one of: {', '.join(QUALITY_CATEGORIES)}"
-
-        shacl_type = shape.get("shacl_type", "")
-        if not shacl_type:
-            return "shacl_type is required"
-
-        if shacl_type not in ("sh:sparql", "sh:closed"):
-            if not shape.get("property_path") and not shape.get("property_uri"):
-                return "A property path or URI is required for this constraint type"
-
-        params = shape.get("parameters", {})
-        if shacl_type in ("sh:minCount", "sh:maxCount"):
-            for key in ("sh:minCount", "sh:maxCount"):
-                if key in params:
-                    try:
-                        int(params[key])
-                    except (ValueError, TypeError):
-                        return f"{key} must be an integer"
-
-        return None
+        return Rules.validate_shape(shape)
 
     @staticmethod
     def validate_classes(classes: List[Dict[str, Any]]) -> tuple:
-        """Check ontology classes for completeness.
-
-        Returns:
-            ``(is_valid, issues)`` where *issues* is a list of human-readable
-            strings and *is_valid* is ``True`` when ``classes`` is non-empty
-            and all entries have at least a URI, name, or localName.
-        """
-        issues: List[str] = []
-        for cls in classes:
-            if not cls.get("uri") and not cls.get("name") and not cls.get("localName"):
-                issues.append(f"Entity '{cls.get('label', 'Unknown')}' has no URI")
-        if not classes:
-            issues.append("No entities defined")
-        return (len(classes) > 0 and len(issues) == 0), issues
+        return ClassModel.validate_classes(classes)
 
     @staticmethod
     def generate_shacl(shapes: list, base_uri: str = "") -> str:
-        """Generate SHACL Turtle from shape dicts."""
-        from back.core.w3c import SHACLService
-
-        svc = SHACLService(base_uri=base_uri or "http://example.org/ontology#")
-        return svc.generate_turtle(shapes, base_uri=base_uri or None)
+        return Rules.generate_shacl(shapes, base_uri)
 
     @staticmethod
     def generate_owl(
@@ -842,86 +460,15 @@ class Ontology:
         expressions=None,
         groups=None,
     ):
-        """Generate OWL from ontology configuration.
-
-        Args:
-            data: dict with base_uri, name, classes, properties
-            constraints: list of property constraints (optional)
-            swrl_rules: list of SWRL rules (optional)
-            axioms: list of OWL axioms (optional)
-            expressions: list of OWL class expressions (optional)
-            groups: list of entity group definitions (optional)
-
-        Returns:
-            str: Generated OWL content
-        """
-        generator = OntologyGenerator(
-            base_uri=data.get("base_uri", DEFAULT_BASE_URI),
-            ontology_name=data.get("name", "MyOntology"),
-            classes=data.get("classes", []),
-            properties=data.get("properties", []),
-            constraints=constraints,
-            swrl_rules=swrl_rules,
-            axioms=axioms,
-            expressions=expressions,
-            groups=groups,
-        )
-        return generator.generate()
+        return Owl.generate_owl(data, constraints, swrl_rules, axioms, expressions, groups)
 
     @staticmethod
     def parse_owl(content, extract_advanced=True):
-        """Parse OWL content and return structured data.
-
-        Args:
-            content: OWL/Turtle content
-            extract_advanced: If True, also extract constraints, SWRL rules, axioms, expressions, and groups
-
-        Returns:
-            tuple: (ontology_info, classes, properties) or
-                   (ontology_info, classes, properties, constraints, swrl_rules, axioms, expressions, groups)
-                   if extract_advanced=True
-        """
-        parser = OntologyParser(content)
-        ontology_info = parser.get_ontology_info()
-        classes = parser.get_classes()
-        properties = parser.get_properties()
-
-        if extract_advanced:
-            constraints = parser.get_constraints()
-            swrl_rules = parser.get_swrl_rules()
-            split = parser.get_axioms_and_expressions()
-            groups = parser.get_groups()
-            return (
-                ontology_info,
-                classes,
-                properties,
-                constraints,
-                swrl_rules,
-                split["axioms"],
-                split["expressions"],
-                groups,
-            )
-
-        return ontology_info, classes, properties
+        return Owl.parse_owl(content, extract_advanced)
 
     @staticmethod
     def parse_rdfs(content):
-        """Parse RDFS content and return structured data.
-
-        Args:
-            content: RDFS content (Turtle, RDF/XML, N3, etc.)
-
-        Returns:
-            tuple: (ontology_info, classes, properties)
-        """
-        from back.core.w3c import RDFSParser
-
-        parser = RDFSParser(content)
-        ontology_info = parser.get_ontology_info()
-        classes = parser.get_classes()
-        properties = parser.get_properties()
-
-        return ontology_info, classes, properties
+        return Owl.parse_rdfs(content)
 
     def import_industry_ontology(
         self,
@@ -929,76 +476,18 @@ class Ontology:
         domain_keys: List[str],
         version: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Fetch industry modules, merge, parse, persist to project session.
+        return Import(self._domain).import_industry_ontology(kind, domain_keys, version)
 
-        Args:
-            kind: Industry standard identifier (fibo, cdisc, iof, fhir).
-            domain_keys: Domain bucket keys to import.
-            version: Version string for importers that support it (currently FHIR only).
-
-        Returns the same dict shape as the former /import-fibo|cdisc|iof handlers.
-        """
-        if not domain_keys:
-            raise ValidationError(_INDUSTRY_EMPTY_MESSAGE[kind])
-
-        try:
-            if kind == "fhir":
-                from back.core.industry.fhir import FhirImportService
-                fhir_version = version or FhirImportService.DEFAULT_VERSION
-                result = _INDUSTRY_FETCH[kind](domain_keys, version=fhir_version)
-            else:
-                result = _INDUSTRY_FETCH[kind](domain_keys)
-
-            info = result["ontology_info"]
-            if kind == "cdisc":
-                ont_name = info.get("label", "CDISC")
-                base_uri = info.get("uri", "http://rdf.cdisc.org/")
-                desc_prefix = "CDISC Foundational Standards in RDF – "
-            elif kind == "fibo":
-                ont_name = info.get("name", "FIBO")
-                base_uri = info.get("uri", "https://spec.edmcouncil.org/fibo/ontology/")
-                desc_prefix = "Financial Industry Business Ontology (FIBO) – "
-            elif kind == "fhir":
-                fhir_ver = info.get("version", fhir_version)
-                ont_name = info.get("name", f"HL7 FHIR {fhir_ver}")
-                base_uri = info.get("base_uri", "http://hl7.org/fhir/")
-                desc_prefix = f"HL7 FHIR {fhir_ver} – "
-            else:
-                ont_name = info.get("name", "IOF")
-                base_uri = info.get(
-                    "uri", "https://spec.industrialontologies.org/ontology/"
-                )
-                desc_prefix = "Industrial Ontologies Foundry (IOF) – "
-
-            self._domain.ontology.update(
-                {
-                    "name": ont_name,
-                    "base_uri": base_uri,
-                    "description": desc_prefix + ", ".join(domain_keys),
-                    "classes": result["classes"],
-                    "properties": result["properties"],
-                    "constraints": result["constraints"],
-                    "swrl_rules": result["swrl_rules"],
-                    "axioms": result["axioms"],
-                    "expressions": result["expressions"],
-                }
-            )
-            self._domain.save()
-
-            return {
-                "success": True,
-                "message": result["message"],
-                "stats": result["stats"],
-                "failed": result["failed"],
-            }
-        except OntoBricksError:
-            raise
-        except Exception as exc:
-            logger.exception("%s import failed: %s", _INDUSTRY_LOG_LABEL[kind], exc)
-            raise InfrastructureError(
-                f"{_INDUSTRY_LOG_LABEL[kind]} import failed",
-                detail=str(exc),
-            ) from exc
+    def import_entities_from_domain(
+        self,
+        source: Dict[str, Any],
+        names: List[str],
+        renames: Dict[str, str],
+        *,
+        source_domain: str,
+        source_version: str,
+    ) -> Dict[str, Any]:
+        return EntityImport(self._domain).import_entities(source, names, renames, source_domain=source_domain, source_version=source_version)
 
     def apply_parsed_owl_to_domain(
         self,
@@ -1013,28 +502,7 @@ class Ontology:
         groups: list = None,
         name_fallback_to_domain: bool = True,
     ) -> str:
-        """Write parse result into self._domain.ontology and save. Returns resolved ontology name."""
-        if name_fallback_to_domain:
-            default_name = self._domain.info.get("name", "")
-            resolved_name = ontology_info.get("name", "") or default_name
-        else:
-            resolved_name = ontology_info.get("name", "")
-
-        self._domain.ontology.update(
-            {
-                "name": resolved_name,
-                "base_uri": ontology_info.get("uri", ""),
-                "classes": classes,
-                "properties": properties,
-                "constraints": constraints,
-                "swrl_rules": swrl_rules,
-                "axioms": axioms,
-                "expressions": expressions or [],
-                "groups": groups or [],
-            }
-        )
-        self._domain.save()
-        return resolved_name
+        return Import(self._domain).apply_parsed_owl_to_domain(ontology_info, classes, properties, constraints, swrl_rules, axioms, expressions, groups=groups, name_fallback_to_domain=name_fallback_to_domain)
 
     def build_import_owl_success_payload(
         self,
@@ -1042,15 +510,7 @@ class Ontology:
         properties: list,
         constraints: list,
     ) -> Dict[str, Any]:
-        return {
-            "success": True,
-            "config": self._domain.ontology,
-            "stats": {
-                "classes": len(classes),
-                "properties": len(properties),
-                "constraints": len(constraints),
-            },
-        }
+        return Import(self._domain).build_import_owl_success_payload(classes, properties, constraints)
 
     def build_parse_owl_success_payload(
         self,
@@ -1063,27 +523,7 @@ class Ontology:
         expressions: list = None,
         resolved_name: str = "",
     ) -> Dict[str, Any]:
-        return {
-            "success": True,
-            "ontology": {
-                "info": {
-                    "label": resolved_name,
-                    "namespace": ontology_info.get("uri", ""),
-                    "uri": ontology_info.get("uri", ""),
-                },
-                "classes": classes,
-                "properties": properties,
-            },
-            "config": self._domain.ontology,
-            "stats": {
-                "classes": len(classes),
-                "properties": len(properties),
-                "constraints": len(constraints),
-                "swrl_rules": len(swrl_rules),
-                "axioms": len(axioms),
-                "expressions": len(expressions or []),
-            },
-        }
+        return Import(self._domain).build_parse_owl_success_payload(ontology_info, classes, properties, constraints, swrl_rules, axioms, expressions, resolved_name)
 
     def build_load_owl_file_success_payload(
         self,
@@ -1094,325 +534,48 @@ class Ontology:
         axioms: list,
         expressions: list = None,
     ) -> Dict[str, Any]:
-        return {
-            "success": True,
-            "ontology": self._domain.ontology,
-            "stats": {
-                "classes": len(classes),
-                "properties": len(properties),
-                "constraints": len(constraints),
-                "swrl_rules": len(swrl_rules),
-                "axioms": len(axioms),
-                "expressions": len(expressions or []),
-            },
-        }
+        return Import(self._domain).build_load_owl_file_success_payload(classes, properties, constraints, swrl_rules, axioms, expressions)
 
     @staticmethod
     def _turtle_to_camel(words: list, is_pascal: bool) -> str:
-        """Convert a list of words to camelCase or PascalCase."""
-        if not words:
-            return ""
-        if is_pascal:
-            return "".join(w.capitalize() for w in words if w)
-        result = words[0].lower()
-        for w in words[1:]:
-            if w:
-                result += w.capitalize()
-        return result
+        return Owl._turtle_to_camel(words, is_pascal)
 
     @staticmethod
     def _fix_snake_kebab_local_names(content: str) -> str:
-        """Convert snake_case / kebab-case local names to camelCase in Turtle."""
-        import re
-
-        def _fix_match(match):
-            prefix = match.group(1)
-            name = match.group(2)
-            words = re.split(r"[_-]+", name)
-            if len(words) <= 1:
-                return match.group(0)
-            is_pascal = words[0] and words[0][0].isupper()
-            return prefix + Ontology._turtle_to_camel(words, is_pascal)
-
-        pattern = r"(?<![a-zA-Z])(:)([a-zA-Z][a-zA-Z0-9]*(?:[_-][a-zA-Z][a-zA-Z0-9]*)+)"
-        return re.sub(pattern, _fix_match, content)
+        return Owl._fix_snake_kebab_local_names(content)
 
     @staticmethod
     def _fix_spaced_local_names(content: str) -> str:
-        """Join space-separated words in bare ``:LocalName`` tokens."""
-        _TURTLE_KEYWORDS = frozenset(
-            {"a", "rdf", "rdfs", "owl", "xsd", "xml", "true", "false"}
-        )
-
-        def _fix_line(line: str) -> str:
-            stripped = line.strip()
-            if (
-                stripped.startswith("#")
-                or stripped.startswith("@prefix")
-                or stripped.startswith("@base")
-            ):
-                return line
-
-            result: list = []
-            i = 0
-            while i < len(line):
-                if line[i] == ":" and (i == 0 or line[i - 1] in " \t;.,()[]"):
-                    j = i + 1
-                    if j >= len(line):
-                        result.append(line[i])
-                        i += 1
-                        continue
-
-                    words: list = []
-                    current_word = ""
-                    while j < len(line):
-                        ch = line[j]
-                        if ch.isalnum():
-                            current_word += ch
-                            j += 1
-                        elif ch == " " and current_word:
-                            k = j + 1
-                            while k < len(line) and line[k] == " ":
-                                k += 1
-                            if k < len(line) and line[k].isalpha():
-                                nwe = k
-                                while nwe < len(line) and line[nwe].isalnum():
-                                    nwe += 1
-                                nw = line[k:nwe]
-                                an = nwe
-                                while an < len(line) and line[an] == " ":
-                                    an += 1
-                                if (
-                                    (an < len(line) and line[an] == ":")
-                                    or nw.lower() in _TURTLE_KEYWORDS
-                                    or len(nw) == 1
-                                ):
-                                    words.append(current_word)
-                                    break
-                                words.append(current_word)
-                                current_word = ""
-                                j = k
-                            elif k < len(line):
-                                words.append(current_word)
-                                break
-                            else:
-                                words.append(current_word)
-                                break
-                        else:
-                            if current_word:
-                                words.append(current_word)
-                            break
-
-                    if words:
-                        is_pascal = words[0] and words[0][0].isupper()
-                        result.append(":")
-                        result.append(Ontology._turtle_to_camel(words, is_pascal))
-                        i = j
-                    else:
-                        result.append(line[i])
-                        i += 1
-                else:
-                    result.append(line[i])
-                    i += 1
-            return "".join(result)
-
-        return "\n".join(_fix_line(ln) for ln in content.split("\n"))
+        return Owl._fix_spaced_local_names(content)
 
     @staticmethod
     def _fix_local_names(content: str) -> str:
-        """Fix local names with spaces, underscores, or hyphens in Turtle content.
-
-        Converts patterns like:
-        - :street address -> :streetAddress
-        - :Street Address -> :StreetAddress
-        - :first_name -> :firstName
-        - :customer-id -> :customerId
-        """
-        content = Ontology._fix_snake_kebab_local_names(content)
-        return Ontology._fix_spaced_local_names(content)
+        return Owl._fix_local_names(content)
 
     @staticmethod
     def clean_owl_output(content: str) -> str:
-        """Clean up LLM output to extract valid Turtle content."""
-        content = content.strip()
-
-        # Remove markdown code fences
-        if "```" in content:
-            import re
-
-            m = re.search(
-                r"```(?:turtle|ttl|sparql|rdf)?\s*\n(.*?)```", content, re.DOTALL
-            )
-            if m:
-                content = m.group(1).strip()
-            elif content.startswith("```"):
-                lines = content.split("\n")
-                lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                content = "\n".join(lines)
-
-        content = content.strip()
-
-        # Strip any natural-language preamble before the first @prefix or @base
-        prefix_idx = content.find("@prefix")
-        base_idx = content.find("@base")
-        candidates = [i for i in (prefix_idx, base_idx) if i > 0]
-        if candidates:
-            content = content[min(candidates) :]
-
-        content = content.strip()
-
-        # Fix any local names with spaces, underscores, or hyphens
-        content = Ontology._fix_local_names(content)
-
-        return content
-
-    # ------------------------------------------------------------------
-    # Group management (entity groups modelled as owl:unionOf)
-    # ------------------------------------------------------------------
+        return Owl.clean_owl_output(content)
 
     def save_group(self, group: Dict, index: int = -1) -> List[Dict]:
-        """Create or update an entity group.
-
-        Args:
-            group: Group dict with keys *name*, *label*, *description*, *color*,
-                   *icon*, *members*.
-            index: When ``>= 0`` the group at that position is replaced;
-                   otherwise a new group is appended (duplicate names are rejected).
-
-        Returns:
-            The updated list of all groups.
-
-        Raises:
-            ValidationError: if the name is missing or already exists (on create).
-        """
-        name = (group.get("name") or "").strip()
-        if not name:
-            raise ValidationError("Group name is required")
-
-        groups = self._domain.groups
-
-        if 0 <= index < len(groups):
-            groups[index] = group
-        else:
-            if any(g.get("name") == name for g in groups):
-                raise ValidationError(f'Group "{name}" already exists')
-            groups.append(group)
-
-        self._enforce_exclusive_membership(groups, name)
-        self._sync_class_group_field(groups)
-        self._domain.groups = groups
-        self._domain.save()
-        return self._domain.groups
+        return Groups(self._domain).save_group(group, index)
 
     def delete_group(self, *, index: int = -1, name: str = "") -> List[Dict]:
-        """Delete an entity group by *index* or *name*.
-
-        Returns:
-            The updated list of all groups.
-
-        Raises:
-            ValidationError: if neither *index* nor *name* identifies a group.
-        """
-        groups = self._domain.groups
-
-        if 0 <= index < len(groups):
-            groups.pop(index)
-        elif name:
-            groups[:] = [g for g in groups if g.get("name") != name]
-        else:
-            raise ValidationError("Provide index or name to identify the group")
-
-        self._sync_class_group_field(groups)
-        self._domain.groups = groups
-        self._domain.save()
-        return self._domain.groups
+        return Groups(self._domain).delete_group(index=index, name=name)
 
     def update_group_members(
         self, group_name: str, *, add: List[str] = None, remove: List[str] = None
     ) -> List[Dict]:
-        """Add or remove members from the group identified by *group_name*.
-
-        Returns:
-            The updated list of all groups.
-
-        Raises:
-            ValidationError: if *group_name* is empty or not found.
-        """
-        if not group_name:
-            raise ValidationError("Group name is required")
-
-        groups = self._domain.groups
-        target = next((g for g in groups if g.get("name") == group_name), None)
-        if target is None:
-            raise ValidationError(f'Group "{group_name}" not found')
-
-        to_remove = set(remove or [])
-        members = [m for m in target.get("members", []) if m not in to_remove]
-        existing = set(members)
-        for m in add or []:
-            if m and m not in existing:
-                members.append(m)
-                existing.add(m)
-        target["members"] = members
-
-        self._enforce_exclusive_membership(groups, group_name)
-        self._sync_class_group_field(groups)
-        self._domain.groups = groups
-        self._domain.save()
-        return self._domain.groups
+        return Groups(self._domain).update_group_members(group_name, add=add, remove=remove)
 
     @staticmethod
     def _enforce_exclusive_membership(
         groups: List[Dict], authoritative_group_name: str
     ) -> None:
-        """Ensure every entity belongs to at most one group.
-
-        After the group identified by *authoritative_group_name* has been
-        updated, remove any of its members that appear in other groups.
-        """
-        target = next(
-            (g for g in groups if g.get("name") == authoritative_group_name), None
-        )
-        if target is None:
-            return
-        owner_members = set(target.get("members", []))
-        for g in groups:
-            if g.get("name") == authoritative_group_name:
-                continue
-            g["members"] = [m for m in g.get("members", []) if m not in owner_members]
+        return Groups._enforce_exclusive_membership(groups, authoritative_group_name)
 
     def _sync_class_group_field(self, groups: List[Dict]) -> None:
-        """Keep each class's ``group`` field in sync with the groups list."""
-        class_to_group: Dict[str, str] = {}
-        for g in groups:
-            for m in g.get("members", []):
-                class_to_group[m] = g.get("name", "")
-        for cls in self._domain.get_classes():
-            cls["group"] = class_to_group.get(cls.get("name", ""), "")
+        return Groups(self._domain)._sync_class_group_field(groups)
 
     @staticmethod
     def calculate_owl_stats(owl_content: str) -> Dict:
-        """Calculate statistics from OWL content."""
-        stats = {"classes": 0, "properties": 0, "dataProperties": 0}
-
-        try:
-            # Count owl:Class declarations
-            stats["classes"] = owl_content.count("a owl:Class") + owl_content.count(
-                "rdf:type owl:Class"
-            )
-
-            # Count owl:ObjectProperty declarations
-            stats["properties"] = owl_content.count(
-                "a owl:ObjectProperty"
-            ) + owl_content.count("rdf:type owl:ObjectProperty")
-
-            # Count owl:DatatypeProperty declarations
-            stats["dataProperties"] = owl_content.count(
-                "a owl:DatatypeProperty"
-            ) + owl_content.count("rdf:type owl:DatatypeProperty")
-        except Exception as exc:
-            logger.warning("OWL stats calculation error: %s", exc)
-
-        return stats
+        return Owl.calculate_owl_stats(owl_content)

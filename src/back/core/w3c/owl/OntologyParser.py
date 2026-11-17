@@ -2,10 +2,13 @@
 
 import json
 from rdflib import Graph, RDF, RDFS, OWL, BNode
-from typing import List, Dict
+from rdflib.namespace import SKOS
+from typing import Any, Dict, List
 
 from back.core.logging import get_logger
 from back.core.errors import ValidationError
+from back.core.w3c.owl.OntologyRdfExtras import OntologyRdfExtras
+from back.objects.ontology.ClassModel import ClassModel
 from shared.config.constants import DEFAULT_BASE_URI, ONTOBRICKS_NS
 
 logger = get_logger(__name__)
@@ -189,7 +192,7 @@ class OntologyParser:
         are returned by :meth:`get_groups` instead).
 
         Returns:
-            List of dicts with 'uri', 'name', 'label', 'comment', 'emoji', 'parent', 'group', 'dashboard', 'dashboardParams', 'dataProperties'
+            List of dicts with 'uri', 'name', 'label', 'comment', 'emoji', 'parent', 'group', 'dashboard', 'dashboardParams', 'bridges', 'datasets', 'dataset', 'dataProperties'
         """
         classes = []
         group_uris = self._get_group_class_uris()
@@ -213,38 +216,7 @@ class OntologyParser:
 
         # First, collect all DatatypeProperties with their domains
         # to reconstruct class attributes (dataProperties)
-        domain_to_dataprops = {}
-        for prop in self.graph.subjects(RDF.type, OWL.DatatypeProperty):
-            # Skip blank nodes
-            if isinstance(prop, BNode):
-                continue
-            prop_uri = str(prop)
-
-            # Get the domain (which class this property belongs to)
-            for domain in self.graph.objects(prop, RDFS.domain):
-                # Skip blank nodes
-                if isinstance(domain, BNode):
-                    continue
-                domain_uri = str(domain)
-
-                # Get property label
-                prop_label = None
-                for lbl in self.graph.objects(prop, RDFS.label):
-                    prop_label = str(lbl)
-                    break
-
-                prop_local_name = self._extract_local_name(prop_uri)
-
-                if domain_uri not in domain_to_dataprops:
-                    domain_to_dataprops[domain_uri] = []
-                domain_to_dataprops[domain_uri].append(
-                    {
-                        "name": prop_local_name,
-                        "localName": prop_local_name,
-                        "label": prop_label or prop_local_name,
-                        "uri": prop_uri,
-                    }
-                )
+        domain_to_dataprops = self._build_domain_to_dataprops()
 
         for cls in self.graph.subjects(RDF.type, OWL.Class):
             # Skip blank nodes (anonymous classes like restrictions, unions, etc.)
@@ -261,14 +233,25 @@ class OntologyParser:
 
             # Get label
             label = None
+            label_lang = None
             for lbl in self.graph.objects(cls, RDFS.label):
                 label = str(lbl)
+                label_lang = getattr(lbl, "language", None)
                 break
+
+            # Get synonyms (alternate labels) from the standard SKOS
+            # altLabel vocabulary (task 4 review finding #4) — first-class
+            # ontology data, not an OntoBricks custom property.
+            alternate_labels = sorted(
+                {str(alt) for alt in self.graph.objects(cls, SKOS.altLabel)}
+            )
 
             # Get comment
             comment = None
+            comment_lang = None
             for cmt in self.graph.objects(cls, RDFS.comment):
                 comment = str(cmt)
+                comment_lang = getattr(cmt, "language", None)
                 break
 
             # Get emoji/icon from OntoBricks custom property
@@ -301,14 +284,50 @@ class OntologyParser:
                     pass
                 break
 
+            # Linked UC datasets (JSON array, or legacy singular object)
+            datasets: List[Dict] = []
+            for ds in self.graph.objects(cls, ONTOBRICKS_NS.dataset):
+                try: datasets = ClassModel.normalize_datasets(json.loads(str(ds)))
+                except (json.JSONDecodeError, ValueError): pass
+                break
+
+            # Get linked Unity Catalog function actions from OntoBricks property
+            actions = []
+            for act in self.graph.objects(cls, ONTOBRICKS_NS.actions):
+                try:
+                    actions = json.loads(str(act))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                break
+
+            # Get referenced SWRL business rules from OntoBricks property
+            business_rules = []
+            for br in self.graph.objects(cls, ONTOBRICKS_NS.businessRules):
+                try:
+                    business_rules = json.loads(str(br))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                break
+
+            # Get virtual attribute declarations from OntoBricks property
+            virtual_attributes = []
+            for va in self.graph.objects(cls, ONTOBRICKS_NS.virtualAttributes):
+                try:
+                    virtual_attributes = json.loads(str(va))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                break
+
             # Get parent class (subClassOf)
             parent = None
+            parent_uri = ""
             for parent_cls in self.graph.objects(cls, RDFS.subClassOf):
-                parent_uri = str(parent_cls)
+                candidate_parent_uri = str(parent_cls)
                 # Skip blank nodes and Thing
-                if not isinstance(parent_cls, BNode) and not parent_uri.endswith(
-                    "Thing"
-                ):
+                if not isinstance(
+                    parent_cls, BNode
+                ) and not candidate_parent_uri.endswith("Thing"):
+                    parent_uri = candidate_parent_uri
                     parent = self._extract_local_name(parent_uri)
                     break
 
@@ -323,19 +342,128 @@ class OntologyParser:
                     "uri": uri,
                     "name": name,
                     "label": label or name,
+                    "label_lang": label_lang,
+                    "alternate_labels": alternate_labels,
                     "comment": comment or "",
+                    "comment_lang": comment_lang,
                     "emoji": emoji or "",
                     "parent": parent or "",
+                    "parent_uri": parent_uri,
                     "group": group,
                     "dashboard": dashboard or "",
                     "dashboardParams": dashboard_params,
                     "bridges": bridges,
+                    "datasets": datasets,
+                    "dataset": datasets[0] if datasets else None,
+                    "actions": actions,
+                    "business_rules": business_rules,
+                    "virtualAttributes": virtual_attributes,
                     "dataProperties": data_properties,
                 }
             )
 
         classes = self._propagate_inherited_properties(classes)
         return sorted(classes, key=lambda x: x["name"])
+
+    def _build_domain_to_dataprops(self) -> Dict[str, List[Dict]]:
+        """Map class URI → datatype properties declared via domain or restrictions."""
+        domain_to_dataprops: Dict[str, List[Dict]] = {}
+
+        for prop in self.graph.subjects(RDF.type, OWL.DatatypeProperty):
+            if isinstance(prop, BNode):
+                continue
+            prop_uri = str(prop)
+
+            prop_label = None
+            for lbl in self.graph.objects(prop, RDFS.label):
+                prop_label = str(lbl)
+                break
+
+            prop_local_name = self._extract_local_name(prop_uri)
+            prop_entry = {
+                "name": prop_local_name,
+                "localName": prop_local_name,
+                "label": prop_label or prop_local_name,
+                "uri": prop_uri,
+            }
+
+            for domain in self.graph.objects(prop, RDFS.domain):
+                if isinstance(domain, BNode):
+                    continue
+                self._append_dataprop_entry(
+                    domain_to_dataprops, str(domain), prop_entry
+                )
+
+        for cls in self.graph.subjects(RDF.type, OWL.Class):
+            if isinstance(cls, BNode):
+                continue
+            cls_uri = str(cls)
+            for restriction in self._iter_class_restriction_nodes(cls):
+                prop_uri = None
+                for p in self.graph.objects(restriction, OWL.onProperty):
+                    prop_uri = str(p)
+                    break
+                if not prop_uri or prop_uri.startswith("_:"):
+                    continue
+                if not self._is_datatype_property_uri(prop_uri):
+                    continue
+
+                prop_label = None
+                for lbl in self.graph.objects(prop_uri, RDFS.label):
+                    prop_label = str(lbl)
+                    break
+                prop_local_name = self._extract_local_name(prop_uri)
+                self._append_dataprop_entry(
+                    domain_to_dataprops,
+                    cls_uri,
+                    {
+                        "name": prop_local_name,
+                        "localName": prop_local_name,
+                        "label": prop_label or prop_local_name,
+                        "uri": prop_uri,
+                    },
+                )
+
+        return domain_to_dataprops
+
+    @staticmethod
+    def _append_dataprop_entry(
+        domain_to_dataprops: Dict[str, List[Dict]],
+        domain_uri: str,
+        prop_entry: Dict,
+    ) -> None:
+        existing = domain_to_dataprops.setdefault(domain_uri, [])
+        if any(p.get("name") == prop_entry.get("name") for p in existing):
+            return
+        existing.append(prop_entry)
+
+    def _is_datatype_property_uri(self, prop_uri: str) -> bool:
+        from rdflib import URIRef
+
+        prop_ref = URIRef(prop_uri)
+        return (prop_ref, RDF.type, OWL.DatatypeProperty) in self.graph
+
+    def _iter_class_restriction_nodes(self, cls) -> List:
+        restrictions = []
+        for sub in self.graph.objects(cls, RDFS.subClassOf):
+            restrictions.extend(self._collect_restriction_nodes(sub))
+        return restrictions
+
+    def _collect_restriction_nodes(self, node) -> List:
+        if isinstance(node, BNode):
+            if (node, RDF.type, OWL.Restriction) in self.graph:
+                return [node]
+            for members in self.graph.objects(node, OWL.intersectionOf):
+                collected = []
+                for member in self._parse_rdf_list_nodes(members):
+                    collected.extend(self._collect_restriction_nodes(member))
+                return collected
+            return []
+
+        collected = []
+        for sub in self.graph.objects(node, RDFS.subClassOf):
+            collected.extend(self._collect_restriction_nodes(sub))
+        return collected
 
     @staticmethod
     def _propagate_inherited_properties(classes: List[Dict]) -> List[Dict]:
@@ -413,26 +541,34 @@ class OntologyParser:
 
                 # Get label
                 label = None
+                label_lang = None
                 for lbl in self.graph.objects(prop, RDFS.label):
                     label = str(lbl)
+                    label_lang = getattr(lbl, "language", None)
                     break
 
                 # Get comment
                 comment = None
+                comment_lang = None
                 for cmt in self.graph.objects(prop, RDFS.comment):
                     comment = str(cmt)
+                    comment_lang = getattr(cmt, "language", None)
                     break
 
                 # Get domain - extract local name
                 domain = None
+                domain_uri = ""
                 for dom in self.graph.objects(prop, RDFS.domain):
-                    domain = self._extract_local_name(str(dom))
+                    domain_uri = str(dom)
+                    domain = self._extract_local_name(domain_uri)
                     break
 
                 # Get range - extract local name
                 range_val = None
+                range_uri = ""
                 for rng in self.graph.objects(prop, RDFS.range):
-                    range_val = self._extract_local_name(str(rng))
+                    range_uri = str(rng)
+                    range_val = self._extract_local_name(range_uri)
                     break
 
                 properties.append(
@@ -440,16 +576,20 @@ class OntologyParser:
                         "uri": uri,
                         "name": name,
                         "label": label or name,
+                        "label_lang": label_lang,
                         "comment": comment or "",
+                        "comment_lang": comment_lang,
                         "type": prop_type,
                         "domain": domain or "",
+                        "domain_uri": domain_uri,
                         "range": range_val or "",
+                        "range_uri": range_uri,
                     }
                 )
 
         return sorted(properties, key=lambda x: x["name"])
 
-    def get_ontology_info(self) -> Dict[str, str]:
+    def get_ontology_info(self) -> Dict[str, Any]:
         """Get basic ontology information.
 
         Returns:
@@ -461,14 +601,18 @@ class OntologyParser:
 
             # Get label
             label = None
+            label_lang = None
             for lbl in self.graph.objects(onto, RDFS.label):
                 label = str(lbl)
+                label_lang = getattr(lbl, "language", None)
                 break
 
             # Get comment
             comment = None
+            comment_lang = None
             for cmt in self.graph.objects(onto, RDFS.comment):
                 comment = str(cmt)
+                comment_lang = getattr(cmt, "language", None)
                 break
 
             # Determine namespace (add # if not present)
@@ -479,16 +623,42 @@ class OntologyParser:
             return {
                 "uri": uri,
                 "label": label or self._extract_local_name(uri) or "Ontology",
+                "label_lang": label_lang,
                 "comment": comment or "",
+                "comment_lang": comment_lang,
                 "namespace": namespace,
             }
 
+        # No owl:Ontology declaration in the file. Fall back to the default
+        # base URI for BOTH ``uri`` and ``namespace`` — never the literal
+        # "Unknown", which used to leak into the domain's stored base_uri and
+        # surface on the Registry Browse page. The empty label lets importers
+        # fall back to the domain name.
         return {
-            "uri": "Unknown",
-            "label": "Unknown Ontology",
+            "uri": DEFAULT_BASE_URI,
+            "label": "",
+            "label_lang": None,
             "comment": "",
+            "comment_lang": None,
             "namespace": DEFAULT_BASE_URI,
         }
+
+    def get_rdf_extras(
+        self,
+        ontology_info: Dict[str, Any] = None,
+        classes: List[Dict] = None,
+        properties: List[Dict] = None,
+    ) -> dict:
+        """Extract unmodeled RDF triples without repeating supplied parse work."""
+        ontology_info = ontology_info or self.get_ontology_info()
+        classes = classes if classes is not None else self.get_classes()
+        properties = properties if properties is not None else self.get_properties()
+        return OntologyRdfExtras().extract(
+            self.graph,
+            ontology_uri=ontology_info["uri"],
+            class_uris={item["uri"] for item in classes if item.get("uri")},
+            property_uris={item["uri"] for item in properties if item.get("uri")},
+        )
 
     def get_constraints(self) -> List[Dict]:
         """Extract property constraints from the ontology.
@@ -901,6 +1071,27 @@ class OntologyParser:
                     )
 
         return axioms
+
+    def _parse_rdf_list_nodes(self, node) -> List:
+        """Parse an RDF list and return member nodes (including blank nodes)."""
+        from rdflib import RDF as RDF_NS
+
+        items = []
+        current = node
+        nil_uri = str(RDF_NS.nil)
+
+        while current and str(current) != nil_uri:
+            for first in self.graph.objects(current, RDF_NS.first):
+                items.append(first)
+
+            rest = None
+            for r in self.graph.objects(current, RDF_NS.rest):
+                rest = r
+                break
+
+            current = rest
+
+        return items
 
     def _parse_rdf_list(self, node) -> List[str]:
         """Parse an RDF list (collection) and return its items as URIs.

@@ -53,7 +53,7 @@
                     <i class="bi bi-database"></i>
                 </div>
                 <div class="validation-tile-body">
-                    <div class="validation-tile-label">Data Sources</div>
+                    <div class="validation-tile-label">Data Assets</div>
                     <div class="validation-tile-status" id="metadataTileStatus">Checking...</div>
                 </div>
             </div>
@@ -190,12 +190,34 @@
         </div>
     </div>
 
-    <!-- Digital Twin + Missing Items (1-column) -->
+    <!-- Ontology Precision Score -->
+    <div class="row g-3 mb-4">
+        <div class="col-12">
+            <div class="card validation-detail-card" id="precisionScoreCard">
+                <div class="card-header d-flex justify-content-between align-items-center py-2">
+                    <span><i class="bi bi-patch-check me-1"></i> Ontology Precision Score</span>
+                    <span id="domainPrecisionLabel" class="fw-semibold small">&mdash;</span>
+                </div>
+                <div class="card-body py-3 px-3">
+                    <div class="progress" style="height:10px" title="Ontology precision score">
+                        <div id="domainPrecisionBar" class="progress-bar" role="progressbar"
+                             style="width:0%" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+                    </div>
+                    <div class="small text-muted mt-2" id="domainPrecisionHint">
+                        <i class="bi bi-info-circle me-1"></i>Last score from the
+                        <strong>Pitfalls</strong> analysis. Run an analysis to refresh.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Knowledge Graph + Missing Items (1-column) -->
     <div class="row g-3 mb-4">
     <div class="col-12">
     <div class="card validation-detail-card h-100" id="dtwinValidationCard">
         <div class="card-header d-flex justify-content-between align-items-center">
-            <span><i class="bi bi-box-fill me-1"></i> Digital Twin</span>
+            <span><i class="bi bi-radar me-1"></i> Knowledge Graph</span>
             <div class="d-flex align-items-center gap-2">
                 <span id="dtwinValidationBadge" class="badge bg-secondary">Checking...</span>
                 <a href="/dtwin/" class="btn btn-outline-primary btn-sm py-0 px-2 validation-dtwin-link">
@@ -209,7 +231,7 @@
                 <i class="bi bi-exclamation-triangle-fill flex-shrink-0 mt-1"></i>
                 <div>
                     <strong>Ontology or assignments have changed</strong> since the last build.
-                    <span class="d-block text-muted">Open Digital Twin to rebuild.</span>
+                    <span class="d-block text-muted">Open Knowledge Graph to rebuild.</span>
                 </div>
             </div>
 
@@ -227,29 +249,31 @@
                 </div>
             </div>
 
-            <!-- Architecture diagram: Triple Store → Sync → Graph DB (Lakebase) -->
+            <!-- Architecture diagram: Triple-Store Gateway → Sync → Graph DB (Lakebase) -->
             <div class="dt-arch-diagram">
 
-                <!-- Card 1: Triple Store (Unity Catalog VIEW) -->
+                <!-- Card 1: Triple-Store Gateway (Unity Catalog VIEW) -->
                 <div class="dt-arch-node" id="psDtZeroCopyCard">
                     <div class="dt-arch-header">
                         <i class="bi bi-database fs-4 dt-arch-icon-triplestore flex-shrink-0"></i>
-                        <span class="dt-arch-title">Triple Store</span>
+                        <span class="dt-arch-title">Triple-Store Gateway</span>
                         <span class="dt-arch-badge" id="psDtExistView"></span>
                     </div>
                     <code class="dt-arch-name" id="psDtViewName">N/A</code>
                     <div id="psDtViewReason" class="text-danger dt-arch-reason" style="display:none;"></div>
                 </div>
 
-                <!-- Lakebase section: arrow + Sync + arrow + Graph DB -->
+                <!-- Engine-specific bridge + Graph DB. The middle bridge differs by
+                     engine: Lakebase Sync (persistent UC-synced table) vs Neo4j Bolt
+                     writer (transient Cypher UNWIND/MERGE at build time). -->
                 <div id="psDtLakebaseDetails" class="d-none dt-arch-lakebase-section">
 
-                    <!-- Arrow: Triple Store → Sync -->
+                    <!-- Arrow: Triple-Store Gateway → Bridge -->
                     <div class="dt-arch-connector">
                         <i class="bi bi-arrow-right"></i>
                     </div>
 
-                    <!-- Card 2: UC Sync Object -->
+                    <!-- Card 2a: UC Sync Object (Lakebase) -->
                     <div class="dt-arch-node" id="psDtLakebaseSyncedUcRow">
                         <div class="dt-arch-header">
                             <i class="bi bi-arrow-repeat fs-4 dt-arch-icon-sync-lg flex-shrink-0"></i>
@@ -259,21 +283,38 @@
                         <code class="dt-arch-name" id="psDtLakebaseSyncedUc">—</code>
                     </div>
 
-                    <!-- Arrow: Sync → Graph DB -->
+                    <!-- Card 2b: Bolt writer (Neo4j) — hidden by default; JS shows it -->
+                    <div class="dt-arch-node d-none" id="psDtNeo4jBoltCard">
+                        <div class="dt-arch-header">
+                            <i class="bi bi-lightning-charge-fill fs-4 dt-arch-icon-sync-lg flex-shrink-0" style="color:#018BFF;"></i>
+                            <span class="dt-arch-title">Bolt</span>
+                            <span class="dt-arch-badge"><span class="badge bg-info bg-opacity-10 text-info border border-info" style="font-size:.65rem;"><i class="bi bi-broadcast me-1"></i>UNWIND · MERGE</span></span>
+                        </div>
+                        <code class="dt-arch-name">Cypher write at build time</code>
+                    </div>
+
+                    <!-- Arrow: Bridge → Graph DB -->
                     <div class="dt-arch-connector">
                         <i class="bi bi-arrow-right"></i>
                     </div>
 
-                    <!-- Card 3: Graph DB (Lakebase) -->
+                    <!-- Card 3: Graph DB (engine-aware) -->
                     <div class="dt-arch-node" id="psDtGraphCard">
                         <div class="dt-arch-header">
-                            <img src="/static/global/img/lakebase-icon.svg" class="dt-arch-icon-lakebase-img flex-shrink-0" alt="Lakebase">
+                            <i id="psDtGraphBackendIcon" class="ob-brand-icon ob-icon-postgresql dt-arch-icon-lakebase-img flex-shrink-0" aria-hidden="true"></i>
                             <span class="dt-arch-title" id="psDtGraphBackendTitle">Graph DB (Lakebase)</span>
                             <span class="dt-arch-badge" id="psDtLakebaseTableExists"></span>
                         </div>
                         <code class="dt-arch-name" id="psDtLakebaseFullName">—</code>
                         <div class="dt-arch-triple-count text-muted mt-1" id="psDtTripleArea" style="display:none;">
                             <i class="bi bi-database me-1"></i><span id="psDtTripleValue">0</span> triples
+                        </div>
+                        <div class="dt-arch-triple-count text-muted mt-1"
+                             title="Generated companion triples from reasoning and cohorts">
+                            <i class="bi bi-lightning me-1"></i>
+                            Materialized inferences:
+                            <strong id="psDtMaterializedInferenceCount"
+                                    data-materialized-inference-count>—</strong>
                         </div>
                     </div>
 
@@ -286,6 +327,64 @@
                 <span class="d-none" id="psDtExistLocal"></span>
                 <span class="d-none" id="psDtGraphStorageSubtitle"></span>
 
+            </div>
+        </div>
+    </div>
+    </div>
+
+    <!-- Graph Structure Metrics Card -->
+    <div class="col-12">
+    <div class="card validation-detail-card h-100" id="graphStructureCard">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-bar-chart-line me-1"></i> Graph Structure</span>
+            <span id="graphStructureBadge" class="badge bg-secondary">Not computed</span>
+        </div>
+        <div class="card-body">
+            <div id="graphStructureSpinner" class="text-center py-3">
+                <div class="spinner-border spinner-border-sm text-secondary" role="status"></div>
+                <span class="small text-muted ms-2">Loading…</span>
+            </div>
+            <div id="graphStructureContent" class="d-none">
+                <div class="row row-cols-2 row-cols-md-3 g-2 mb-3">
+                    <div class="col">
+                        <div class="p-2 border rounded text-center">
+                            <div class="small text-muted">Nodes</div>
+                            <div class="fw-bold" id="gsNodeCount">—</div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 border rounded text-center">
+                            <div class="small text-muted">Edges</div>
+                            <div class="fw-bold" id="gsEdgeCount">—</div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 border rounded text-center">
+                            <div class="small text-muted">Components</div>
+                            <div class="fw-bold" id="gsComponents">—</div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 border rounded text-center">
+                            <div class="small text-muted">Avg Degree</div>
+                            <div class="fw-bold" id="gsAvgDegree">—</div>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="p-2 border rounded text-center">
+                            <div class="small text-muted">Density</div>
+                            <div class="fw-bold" id="gsDensity">—</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="small fw-semibold mb-1"><i class="bi bi-trophy text-warning"></i> Top PageRank nodes</div>
+                <div id="gsTopPagerank" class="small text-muted">—</div>
+            </div>
+            <div id="graphStructureEmpty" class="d-none">
+                <span class="text-muted small"><i class="bi bi-info-circle me-1"></i>No analysis yet — open <strong>Knowledge Graph &rarr; Analytics</strong> and click <strong>Run Analysis</strong> to compute metrics.</span>
+            </div>
+            <div id="graphStructureError" class="d-none">
+                <span class="text-muted small"><i class="bi bi-info-circle me-1"></i>Build the Knowledge Graph first to compute metrics.</span>
             </div>
         </div>
     </div>

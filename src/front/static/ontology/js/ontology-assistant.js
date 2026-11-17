@@ -125,22 +125,6 @@
     }
 
     // =====================================================
-    // Markdown rendering
-    // =====================================================
-
-    function renderMarkdown(text) {
-        if (typeof marked !== 'undefined' && marked.parse) {
-            try {
-                marked.setOptions({ breaks: true, gfm: true });
-                return marked.parse(text);
-            } catch (_) { /* fall through */ }
-        }
-        return text
-            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-            .replace(/\n/g, '<br>');
-    }
-
-    // =====================================================
     // Message rendering
     // =====================================================
 
@@ -395,38 +379,41 @@
     // =====================================================
 
     function initPanelOffsetWatcher() {
-        const mapContainer = document.getElementById('ontology-map-container');
+        const mapContainer = document.getElementById('ontology-map-wrapper');
         if (!mapContainer) return;
 
         const cardBody = mapContainer.closest('.card-body');
         if (!cardBody) return;
 
+        // The panel is a permanent part of the layout, so the offset tracks its
+        // measured width rather than an open/closed state.
         function updateOffset() {
             const panel = mapContainer.querySelector('.shared-detail-panel');
             const handle = mapContainer.querySelector('.detail-panel-resize-handle');
-            if (mapContainer.classList.contains('panel-open') && panel) {
-                const pw = panel.offsetWidth || 0;
-                const hw = (handle && handle.offsetWidth) || 0;
-                cardBody.style.setProperty('--ob-panel-offset', (pw + hw) + 'px');
-            } else {
-                cardBody.style.setProperty('--ob-panel-offset', '0px');
-            }
+            const pw = (panel && panel.offsetWidth) || 0;
+            const hw = (handle && handle.offsetWidth) || 0;
+            cardBody.style.setProperty('--ob-panel-offset', (pw + hw) + 'px');
         }
 
-        new MutationObserver(updateOffset).observe(mapContainer, {
-            attributes: true, attributeFilter: ['class']
-        });
-
-        new MutationObserver(() => {
+        // The panel now exists before this runs, and the section may still be
+        // hidden (width 0) at that point, so watch it from the start rather
+        // than only when it gets appended.
+        function watchPanel() {
             const panel = mapContainer.querySelector('.shared-detail-panel');
             if (panel && !panel._resizeObs) {
                 panel._resizeObs = new ResizeObserver(updateOffset);
                 panel._resizeObs.observe(panel);
             }
             updateOffset();
-        }).observe(mapContainer, { childList: true });
+        }
 
-        updateOffset();
+        new MutationObserver(updateOffset).observe(mapContainer, {
+            attributes: true, attributeFilter: ['class']
+        });
+
+        new MutationObserver(watchPanel).observe(mapContainer, { childList: true });
+
+        watchPanel();
     }
 
     document.addEventListener('DOMContentLoaded', () => {

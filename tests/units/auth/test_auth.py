@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from back.core.errors import ValidationError
+from shared.config.constants import HTTP_USER_AGENT
 from back.core.databricks import (
     DatabricksAuth,
     get_workspace_host,
@@ -22,6 +23,7 @@ def _clear_databricks_env(monkeypatch):
         "DATABRICKS_CLIENT_ID",
         "DATABRICKS_CLIENT_SECRET",
         "DATABRICKS_SQL_WAREHOUSE_ID",
+        "DATABRICKS_CONFIG_PROFILE",
         "DATABRICKS_DISABLE_CLOUD_FETCH",
         "DATABRICKS_FORCE_CLOUD_FETCH",
     ):
@@ -159,6 +161,7 @@ class TestGetAuthHeaders:
         assert headers == {
             "Authorization": "Bearer my-pat",
             "Content-Type": "application/json",
+            "User-Agent": HTTP_USER_AGENT,
         }
 
     @patch.object(DatabricksAuth, "get_oauth_token", return_value="oauth-header-token")
@@ -175,13 +178,14 @@ class TestGetAuthHeaders:
         assert headers == {
             "Authorization": "Bearer oauth-header-token",
             "Content-Type": "application/json",
+            "User-Agent": HTTP_USER_AGENT,
         }
         mock_oauth.assert_called()
 
     def test_no_auth_empty_dict(self, monkeypatch):
         _clear_databricks_env(monkeypatch)
         auth = DatabricksAuth(host="https://ws.databricks.com", token="")
-        assert auth.get_auth_headers() == {}
+        assert auth.get_auth_headers() == {"User-Agent": HTTP_USER_AGENT}
 
 
 class TestGetSqlConnectionParams:
@@ -214,9 +218,66 @@ class TestGetSqlConnectionParams:
             warehouse_id="wh-oauth",
         )
         params = auth.get_sql_connection_params()
-        assert params["access_token"] == "sql-oauth"
+        assert "access_token" not in params
+        headers = params["credentials_provider"]()
+        assert headers() == {"Authorization": "Bearer sql-oauth"}
         assert params["use_cloud_fetch"] is True
-        mock_oauth.assert_called()
+
+    @patch.object(DatabricksAuth, "can_use_cloud_fetch", return_value=False)
+    @patch("requests.post")
+    def test_app_mode_sql_auth_picks_up_a_refreshed_token(
+        self, mock_post, _mock_cf, monkeypatch
+    ):
+        """A statement that outlives its token must not keep sending it.
+
+        The connector asks for headers on every request, including the status
+        polls of a running statement. A static ``access_token`` expired one hour
+        into a long COUNT and the build lost the statement.
+        """
+        _clear_databricks_env(monkeypatch)
+        monkeypatch.setenv("DATABRICKS_APP_PORT", "8080")
+        monkeypatch.setenv("DATABRICKS_CLIENT_ID", "cid")
+        monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "csec")
+        first, second = MagicMock(), MagicMock()
+        first.json.return_value = {"access_token": "tok-1"}
+        second.json.return_value = {"access_token": "tok-2"}
+        mock_post.side_effect = [first, second]
+        auth = DatabricksAuth(
+            host="https://ws.databricks.com", token="", warehouse_id="wh-1"
+        )
+
+        headers = auth.get_sql_connection_params()["credentials_provider"]()
+        assert headers() == {"Authorization": "Bearer tok-1"}
+
+        auth._oauth_token_ts -= 55 * 60  # the statement has now run 55 minutes
+        assert headers() == {"Authorization": "Bearer tok-2"}
+
+    @patch.object(DatabricksAuth, "can_use_cloud_fetch", return_value=False)
+    def test_legacy_use_sea_flag_selects_kernel_backend(self, _mock_cf, monkeypatch):
+        _clear_databricks_env(monkeypatch)
+        auth = DatabricksAuth(
+            host="https://ws.databricks.com",
+            token="pat",
+            warehouse_id="wh-rt",
+            use_sea=True,
+        )
+        params = auth.get_sql_connection_params()
+        assert auth.use_kernel is True
+        assert params["use_kernel"] is True
+        assert "use_sea" not in params
+
+    @patch.object(DatabricksAuth, "can_use_cloud_fetch", return_value=False)
+    def test_params_omit_kernel_backend_by_default(self, _mock_cf, monkeypatch):
+        _clear_databricks_env(monkeypatch)
+        auth = DatabricksAuth(
+            host="https://ws.databricks.com",
+            token="pat",
+            warehouse_id="wh",
+        )
+        params = auth.get_sql_connection_params()
+        assert auth.use_kernel is False
+        assert "use_kernel" not in params
+        assert "use_sea" not in params
 
 
 class TestCloudFetchCapability:
@@ -265,6 +326,27 @@ class TestCloudFetchCapability:
         mock_connect.reset_mock()
         assert auth.can_use_cloud_fetch() is True
         mock_connect.assert_not_called()
+
+    @patch("databricks.sql.connect")
+    def test_probe_uses_kernel_for_lakehouse_rt(self, mock_connect, monkeypatch):
+        _clear_databricks_env(monkeypatch)
+        self._reset_cache()
+        auth = DatabricksAuth(
+            host="https://ws.cloud.databricks.com",
+            token="sql-pat",
+            warehouse_id="wh-rt",
+            use_sea=True,
+        )
+        conn = mock_connect.return_value.__enter__.return_value
+        cursor = conn.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = [(1,)]
+
+        ok, _ = auth.probe_cloud_fetch_capability()
+
+        assert ok is True
+        kwargs = mock_connect.call_args.kwargs
+        assert kwargs["use_kernel"] is True
+        assert "use_sea" not in kwargs
 
     @patch("databricks.sql.connect", side_effect=RuntimeError("blocked"))
     def test_probe_cloud_fetch_capability_failure(self, _mock_connect, monkeypatch):
@@ -379,3 +461,103 @@ class TestGetBearerToken:
         _clear_databricks_env(monkeypatch)
         auth = DatabricksAuth(host="https://ws.databricks.com", token="")
         assert auth.get_bearer_token() == ""
+
+
+class TestCliMode:
+    """Databricks CLI profile auth (~/.databrickscfg via SDK Config)."""
+
+    def _make_cli_auth(self, monkeypatch, profile=""):
+        """Build a DatabricksAuth with a stubbed CLI Config."""
+        _clear_databricks_env(monkeypatch)
+        if profile:
+            monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", profile)
+        fake_cfg = MagicMock()
+        fake_cfg.host = "https://cli.databricks.com"
+        fake_cfg.authenticate.return_value = {
+            "Authorization": "Bearer cli-token-xyz"
+        }
+        with patch.object(
+            DatabricksAuth, "_resolve_cli_config", return_value=fake_cfg
+        ):
+            auth = DatabricksAuth(warehouse_id="wh-cli")
+        auth._cli_config = fake_cfg
+        return auth, fake_cfg
+
+    def test_auth_mode_is_cli_when_only_profile_resolves(self, monkeypatch):
+        auth, _ = self._make_cli_auth(monkeypatch)
+        assert auth.auth_mode == "cli"
+        assert auth.is_app_mode is False
+        assert auth.token == ""
+
+    def test_host_falls_back_to_cli_config_host(self, monkeypatch):
+        auth, _ = self._make_cli_auth(monkeypatch)
+        assert auth.host == "https://cli.databricks.com"
+
+    def test_has_valid_auth_true_in_cli_mode(self, monkeypatch):
+        auth, _ = self._make_cli_auth(monkeypatch)
+        assert auth.has_valid_auth() is True
+
+    def test_get_auth_headers_uses_sdk_config(self, monkeypatch):
+        auth, fake_cfg = self._make_cli_auth(monkeypatch)
+        headers = auth.get_auth_headers()
+        assert headers["Authorization"] == "Bearer cli-token-xyz"
+        assert headers["Content-Type"] == "application/json"
+        assert headers["User-Agent"] == HTTP_USER_AGENT
+        fake_cfg.authenticate.assert_called()
+
+    def test_get_bearer_token_extracts_token_from_headers(self, monkeypatch):
+        auth, _ = self._make_cli_auth(monkeypatch)
+        assert auth.get_bearer_token() == "cli-token-xyz"
+
+    @patch.object(DatabricksAuth, "can_use_cloud_fetch", return_value=False)
+    def test_sql_params_use_credentials_provider(self, _cf, monkeypatch):
+        auth, fake_cfg = self._make_cli_auth(monkeypatch)
+        params = auth.get_sql_connection_params()
+        assert "access_token" not in params
+        assert "credentials_provider" in params
+        provider = params["credentials_provider"]
+        inner = provider()
+        assert inner is fake_cfg.authenticate
+        assert inner() == {"Authorization": "Bearer cli-token-xyz"}
+
+    def test_cli_profile_name_defaults_to_default(self, monkeypatch):
+        auth, _ = self._make_cli_auth(monkeypatch)
+        assert auth.cli_profile_name == "default"
+
+    def test_cli_profile_name_reflects_env_var(self, monkeypatch):
+        auth, _ = self._make_cli_auth(monkeypatch, profile="sandbox")
+        assert auth.cli_profile_name == "sandbox"
+
+    def test_pat_takes_precedence_over_cli(self, monkeypatch):
+        _clear_databricks_env(monkeypatch)
+        monkeypatch.setenv("DATABRICKS_TOKEN", "pat-wins")
+        with patch.object(
+            DatabricksAuth, "_resolve_cli_config", return_value=MagicMock()
+        ) as mock_resolve:
+            auth = DatabricksAuth(host="https://ws.databricks.com")
+        mock_resolve.assert_not_called()
+        assert auth.auth_mode == "pat"
+        assert auth._cli_config is None
+
+    def test_app_mode_takes_precedence_over_cli(self, monkeypatch):
+        _clear_databricks_env(monkeypatch)
+        monkeypatch.setenv("DATABRICKS_APP_PORT", "8080")
+        monkeypatch.setenv("DATABRICKS_CLIENT_ID", "cid")
+        monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "csec")
+        with patch.object(
+            DatabricksAuth, "_resolve_cli_config", return_value=MagicMock()
+        ) as mock_resolve:
+            auth = DatabricksAuth(host="https://ws.databricks.com", token="")
+        mock_resolve.assert_not_called()
+        assert auth.auth_mode == "app"
+        assert auth._cli_config is None
+
+    @pytest.mark.allow_cli_resolve
+    def test_resolve_cli_config_returns_none_when_sdk_raises(self, monkeypatch):
+        _clear_databricks_env(monkeypatch)
+        with patch(
+            "databricks.sdk.core.Config",
+            side_effect=ValueError("no creds"),
+        ):
+            cfg = DatabricksAuth._resolve_cli_config("", "")
+        assert cfg is None

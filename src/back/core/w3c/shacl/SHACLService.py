@@ -6,22 +6,59 @@ are internal implementation details.
 """
 
 import hashlib
+import operator
 import re
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from back.core.errors import InfrastructureError
+from back.core.helpers import sql_escape
 from back.core.logging import get_logger
 from back.core.w3c.rdf_utils import uri_local_name
-from back.core.triplestore.constants import RDF_TYPE
+from back.core.graphdb.constants import RDF_TYPE
 from back.core.w3c.shacl.constants import (
     QUALITY_CATEGORIES,
     RDFS_LABEL,
     XSD_TO_SPARK_TYPE,
 )
+from back.core.w3c.shacl import ShapeConditions
 from back.core.w3c.shacl.SHACLGenerator import SHACLGenerator
 from back.core.w3c.shacl.SHACLParser import SHACLParser
 
 logger = get_logger(__name__)
+
+#: Value-range constraints, mapped to the comparison a conforming value passes.
+RANGE_OPS = {
+    "sh:minInclusive": ">=",
+    "sh:maxInclusive": "<=",
+    "sh:minExclusive": ">",
+    "sh:maxExclusive": "<",
+}
+
+#: String-length constraints, same convention.
+LENGTH_OPS = {"sh:minLength": ">=", "sh:maxLength": "<="}
+
+BOUND_COMPARATORS = {
+    ">=": operator.ge,
+    "<=": operator.le,
+    ">": operator.gt,
+    "<": operator.lt,
+}
+
+#: Constraint kinds :meth:`SHACLService.evaluate_shape_in_memory` can check.
+#: A shape outside this set is reported as not evaluated rather than passing —
+#: an engine that cannot run a rule must not vouch for the data.
+IN_MEMORY_TYPES = frozenset(
+    {"sh:minCount", "sh:maxCount", "sh:pattern", "sh:hasValue", "sh:class"}
+    | set(RANGE_OPS)
+    | set(LENGTH_OPS)
+)
+
+#: Parameters that select an in-memory check on their own, for shapes whose
+#: ``shacl_type`` names only the first of several constraints.
+IN_MEMORY_PARAMS = frozenset(
+    {"sh:minCount", "sh:maxCount"} | set(RANGE_OPS) | set(LENGTH_OPS)
+)
 
 
 class SHACLService:
@@ -54,6 +91,8 @@ class SHACLService:
         label: str = "",
         enabled: bool = True,
         shape_id: Optional[str] = None,
+        conditions: Optional[List[Dict]] = None,
+        condition_logic: str = "and",
     ) -> Dict:
         """Build a new shape dict (not yet persisted).
 
@@ -61,6 +100,9 @@ class SHACLService:
         which is correct for user-created shapes.  Callers that need a
         **deterministic** ID (e.g. legacy-constraint migration) should
         pass an explicit *shape_id*.
+
+        *conditions* guards the constraint: the shape then only applies to the
+        instances matching them.  See :mod:`back.core.w3c.shacl.ShapeConditions`.
         """
         cat = category if category in QUALITY_CATEGORIES else "conformance"
         safe_cls = re.sub(r"[^a-zA-Z0-9_]", "", target_class or "global")
@@ -84,6 +126,10 @@ class SHACLService:
             "severity": severity,
             "message": message,
             "enabled": enabled,
+            "conditions": conditions or [],
+            "condition_logic": (
+                condition_logic if condition_logic in ("and", "or") else "and"
+            ),
         }
 
     @staticmethod
@@ -148,6 +194,16 @@ class SHACLService:
     def import_shapes(self, turtle_content: str, fmt: str = "turtle") -> List[Dict]:
         """Parse SHACL Turtle and return shape dicts."""
         return self._parser.parse(turtle_content, format=fmt)
+
+    def import_shapes_with_report(
+        self, turtle_content: str, fmt: str = "turtle"
+    ) -> tuple:
+        """Parse SHACL Turtle, returning ``(shapes, report)``.
+
+        The report's ``conditions_dropped`` counts shapes whose guard could not
+        be reconstructed; see :meth:`SHACLParser.parse_with_report`.
+        """
+        return self._parser.parse_with_report(turtle_content, format=fmt)
 
     # ------------------------------------------------------------------
     # SHACL-AF Rule Inference (sh:rule)
@@ -365,7 +421,7 @@ class SHACLService:
 
     @staticmethod
     def _extract_violations(report_turtle: str) -> List[Dict]:
-        """Parse the PySHACL validation report into violation dicts."""
+        """Parse the PySHACL report into violation dicts (unparseable → InfrastructureError)."""
         from rdflib import Graph as RG, URIRef
         from rdflib.namespace import Namespace as NS
 
@@ -373,8 +429,8 @@ class SHACLService:
         g = RG()
         try:
             g.parse(data=report_turtle, format="turtle")
-        except Exception:
-            return []
+        except Exception as exc:
+            raise InfrastructureError("SHACL report is unparseable", detail=str(exc)) from exc
 
         rdf_type_ref = URIRef(RDF_TYPE)
         violations = []
@@ -725,7 +781,354 @@ class SHACLService:
     }
 
     # ------------------------------------------------------------------
-    # SHACL-to-SQL translation (for Digital Twin execution)
+    # Auto-suggest rules from OWL ontology introspection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _suggest_prop_matches(prop: Dict, constraint: Dict) -> bool:
+        """Match a property to an OWL constraint, preferring ``propertyUri``."""
+        constraint_uri = constraint.get("propertyUri") or ""
+        constraint_name = constraint.get("property") or ""
+        prop_uri = prop.get("uri") or ""
+        prop_name = prop.get("name") or ""
+        if constraint_uri:
+            if prop_uri:
+                return prop_uri == constraint_uri
+            local = uri_local_name(constraint_uri)
+            return bool(prop_name) and prop_name == local
+        if not constraint_name:
+            return False
+        if prop_name and prop_name == constraint_name:
+            return True
+        return bool(prop_uri) and uri_local_name(prop_uri) == uri_local_name(
+            constraint_name
+        )
+
+    @staticmethod
+    def suggest_from_ontology(
+        classes: List[Dict],
+        properties: List[Dict],
+        base_uri: str = "",
+        constraints: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
+        """Suggest SHACL shapes derived from OWL class/property declarations.
+
+        Structural categories (no extra argument):
+        - **Completeness** (``sh:minCount 1``): data properties listed on a class
+        - **Consistency / datatype** (``sh:datatype``): data properties with an XSD range
+        - **Consistency / relationship** (``sh:class``): object properties with domain+range
+
+        When ``constraints`` is the list stored on ``DomainSession.constraints``
+        (from ``OntologyParser.get_constraints()``), additional OWL-only tiers:
+        - **Completeness**: ``owl:minCardinality`` / ``owl:cardinality`` (>= 1)
+          and ``owl:someValuesFrom`` — including object properties
+        - **Cardinality** (``sh:maxCount``): ``owl:FunctionalProperty``,
+          ``owl:maxCardinality``, ``owl:cardinality``
+        - **Uniqueness** (``sh:sparql``): ``owl:InverseFunctionalProperty``
+
+        Completeness is **not** invented for every declared property. Requiredness
+        comes from class ``dataProperties[]`` (existing) or an explicit OWL
+        restriction / characteristic.
+
+        Returns a list of shape dicts (not persisted).  Each dict carries an extra
+        ``"source": "auto"`` field so the UI can distinguish suggestions from manual rules.
+        Shape IDs are deterministic so calling this method multiple times is idempotent.
+        """
+        import hashlib as _hashlib
+        import re as _re
+
+        sep = "" if base_uri.endswith("#") or base_uri.endswith("/") else "#"
+
+        def _cls_uri(name: str) -> str:
+            for c in classes:
+                if (c.get("name") or "").lower() == name.lower():
+                    return c.get("uri") or (base_uri + sep + name)
+            return (base_uri + sep + name) if base_uri else name
+
+        def _prop_uri_fallback(name: str) -> str:
+            return (base_uri.rstrip("#/") + "/" + name) if base_uri else name
+
+        def _stable_id(*parts: str) -> str:
+            key = "|".join(p for p in parts if p)
+            digest = _hashlib.sha256(key.encode()).hexdigest()[:8]
+            safe = _re.sub(r"[^a-zA-Z0-9_]", "_", key)[:40]
+            return f"auto_{safe}_{digest}"
+
+        def _lookup_prop(constraint: Dict) -> Optional[Dict]:
+            for prop in properties:
+                if SHACLService._suggest_prop_matches(prop, constraint):
+                    return prop
+            return None
+
+        def _resolve_target(constraint: Dict, prop: Optional[Dict]) -> Tuple[str, str, str, str]:
+            matched = prop if prop is not None else _lookup_prop(constraint)
+            prop_name = (matched or {}).get("name") or constraint.get("property") or ""
+            prop_uri = (
+                (matched or {}).get("uri")
+                or constraint.get("propertyUri")
+                or _prop_uri_fallback(prop_name)
+            )
+            cls_name = constraint.get("className") or (matched or {}).get("domain") or ""
+            cls_uri = constraint.get("classUri") or (_cls_uri(cls_name) if cls_name else "")
+            return cls_name, cls_uri, prop_name, prop_uri
+
+        _XSD_TYPES = {
+            "xsd:string", "xsd:integer", "xsd:int", "xsd:long", "xsd:short",
+            "xsd:decimal", "xsd:float", "xsd:double", "xsd:boolean",
+            "xsd:date", "xsd:dateTime", "xsd:duration", "xsd:anyURI",
+        }
+        _XSD_REMAP = {
+            "xsd:int": "xsd:integer",
+            "xsd:long": "xsd:integer",
+            "xsd:short": "xsd:integer",
+        }
+
+        suggestions: List[Dict] = []
+        seen_ids: set = set()
+
+        def _add(shape: Dict) -> None:
+            sid = shape.get("id", "")
+            if sid in seen_ids:
+                return
+            seen_ids.add(sid)
+            shape["source"] = "auto"
+            suggestions.append(shape)
+
+        def _add_min_count(
+            cls_name: str,
+            cls_uri: str,
+            prop_name: str,
+            prop_uri: str,
+            min_val: int = 1,
+        ) -> None:
+            if not cls_name or not prop_name or min_val < 1:
+                return
+            extra = str(min_val) if min_val != 1 else ""
+            sid = _stable_id("completeness", cls_name, prop_name, extra)
+            _add(
+                SHACLService.create_shape(
+                    category="completeness",
+                    target_class=cls_name,
+                    target_class_uri=cls_uri,
+                    property_path=prop_name,
+                    property_uri=prop_uri,
+                    shacl_type="sh:minCount",
+                    parameters={"sh:minCount": min_val},
+                    message=f"{cls_name}.{prop_name} must not be empty"
+                    if min_val == 1
+                    else f"{cls_name}.{prop_name} must have at least {min_val} value(s)",
+                    shape_id=sid,
+                )
+            )
+
+        def _add_max_count(
+            cls_name: str,
+            cls_uri: str,
+            prop_name: str,
+            prop_uri: str,
+            max_val: int,
+        ) -> None:
+            if not prop_name or max_val < 1:
+                return
+            sid = _stable_id("cardinality", cls_name, prop_name, str(max_val))
+            _add(
+                SHACLService.create_shape(
+                    category="cardinality",
+                    target_class=cls_name,
+                    target_class_uri=cls_uri,
+                    property_path=prop_name,
+                    property_uri=prop_uri,
+                    shacl_type="sh:maxCount",
+                    parameters={"sh:maxCount": max_val},
+                    message=(
+                        f"{cls_name}.{prop_name} must have at most {max_val} value(s)"
+                        if cls_name
+                        else f"{prop_name} must have at most {max_val} value(s)"
+                    ),
+                    shape_id=sid,
+                )
+            )
+
+        # ── 1. Completeness: data properties listed directly on each class ──
+        for cls in classes:
+            cls_name = cls.get("name", "")
+            cls_uri = cls.get("uri") or (_cls_uri(cls_name) if cls_name else "")
+            for dp in cls.get("dataProperties", []):
+                prop_name = dp.get("name") or dp.get("localName", "")
+                prop_uri = dp.get("uri") or _prop_uri_fallback(prop_name)
+                _add_min_count(cls_name, cls_uri, prop_name, prop_uri)
+
+        # ── 2. Datatype: DatatypeProperty with XSD range ──
+        for prop in properties:
+            ptype = prop.get("type", "")
+            if ptype == "ObjectProperty" or ptype == "owl:ObjectProperty":
+                continue
+            range_val = (prop.get("range") or "").strip()
+            range_val = _XSD_REMAP.get(range_val, range_val)
+            if range_val not in _XSD_TYPES:
+                continue
+            prop_name = prop.get("name", "")
+            prop_uri = prop.get("uri") or _prop_uri_fallback(prop_name)
+            domain_name = prop.get("domain", "")
+            if not prop_name or not domain_name:
+                continue
+            cls_uri = _cls_uri(domain_name)
+            sid = _stable_id("datatype", domain_name, prop_name, range_val)
+            prefix = f"{domain_name}." if domain_name else ""
+            _add(
+                SHACLService.create_shape(
+                    category="consistency",
+                    target_class=domain_name,
+                    target_class_uri=cls_uri,
+                    property_path=prop_name,
+                    property_uri=prop_uri,
+                    shacl_type="sh:datatype",
+                    parameters={"sh:datatype": range_val},
+                    message=f"{prefix}{prop_name} must be {range_val}",
+                    shape_id=sid,
+                )
+            )
+
+        # ── 3. Relationship: ObjectProperty with domain + range ──
+        for prop in properties:
+            ptype = prop.get("type", "")
+            if ptype not in ("ObjectProperty", "owl:ObjectProperty"):
+                continue
+            prop_name = prop.get("name", "")
+            prop_uri = prop.get("uri") or _prop_uri_fallback(prop_name)
+            domain_name = prop.get("domain", "")
+            range_name = prop.get("range", "")
+            if not domain_name or not range_name or not prop_name:
+                continue
+            cls_uri = _cls_uri(domain_name)
+            range_uri = _cls_uri(range_name)
+            sid = _stable_id("relationship", domain_name, prop_name, range_name)
+            _add(
+                SHACLService.create_shape(
+                    category="consistency",
+                    target_class=domain_name,
+                    target_class_uri=cls_uri,
+                    property_path=prop_name,
+                    property_uri=prop_uri,
+                    shacl_type="sh:class",
+                    parameters={"sh:class": range_uri},
+                    message=f"{domain_name}.{prop_name} values must be of type {range_name}",
+                    shape_id=sid,
+                )
+            )
+
+        # ── 4–6. OWL constraints: completeness / cardinality / uniqueness ──
+        for constraint in constraints or []:
+            ctype = constraint.get("type", "")
+            matched = _lookup_prop(constraint)
+
+            min_val: Optional[int] = None
+            if ctype == "minCardinality":
+                min_val = int(constraint.get("cardinalityValue") or 0)
+            elif ctype == "exactCardinality":
+                min_val = int(constraint.get("cardinalityValue") or 0)
+            elif ctype == "someValuesFrom":
+                min_val = 1
+            if min_val:
+                cls_name, cls_uri, prop_name, prop_uri = _resolve_target(
+                    constraint, matched
+                )
+                _add_min_count(cls_name, cls_uri, prop_name, prop_uri, min_val)
+
+            max_val: Optional[int] = None
+            if ctype == "functional":
+                max_val = 1
+            elif ctype == "maxCardinality":
+                max_val = int(constraint.get("cardinalityValue") or 0)
+            elif ctype == "exactCardinality":
+                max_val = int(constraint.get("cardinalityValue") or 0)
+            if max_val:
+                if ctype == "functional" and not constraint.get("className"):
+                    targets = [
+                        p
+                        for p in properties
+                        if SHACLService._suggest_prop_matches(p, constraint)
+                    ]
+                    if not targets and matched is None:
+                        cls_name, cls_uri, prop_name, prop_uri = _resolve_target(
+                            constraint, None
+                        )
+                        _add_max_count(cls_name, cls_uri, prop_name, prop_uri, max_val)
+                    for prop in targets or ([matched] if matched else []):
+                        domain_name = prop.get("domain") or ""
+                        prop_name = prop.get("name") or constraint.get("property") or ""
+                        prop_uri = (
+                            prop.get("uri")
+                            or constraint.get("propertyUri")
+                            or _prop_uri_fallback(prop_name)
+                        )
+                        _add_max_count(
+                            domain_name,
+                            _cls_uri(domain_name) if domain_name else "",
+                            prop_name,
+                            prop_uri,
+                            max_val,
+                        )
+                else:
+                    cls_name, cls_uri, prop_name, prop_uri = _resolve_target(
+                        constraint, matched
+                    )
+                    _add_max_count(cls_name, cls_uri, prop_name, prop_uri, max_val)
+
+            if ctype != "inverseFunctional":
+                continue
+            ifp_targets = [
+                p
+                for p in properties
+                if SHACLService._suggest_prop_matches(p, constraint)
+            ]
+            if not ifp_targets:
+                cls_name, cls_uri, prop_name, prop_uri = _resolve_target(constraint, None)
+                ifp_targets = [
+                    {
+                        "name": prop_name,
+                        "uri": prop_uri,
+                        "domain": cls_name,
+                    }
+                ]
+            for prop in ifp_targets:
+                prop_name = prop.get("name") or ""
+                domain_name = prop.get("domain") or constraint.get("className") or ""
+                if not prop_name:
+                    continue
+                prop_uri = prop.get("uri") or constraint.get("propertyUri") or _prop_uri_fallback(
+                    prop_name
+                )
+                safe_uri = prop_uri.replace("\\", "").replace(">", "")
+                sid = _stable_id("uniqueness", domain_name, prop_name)
+                select = (
+                    "SELECT $this WHERE { "
+                    f"$this <{safe_uri}> ?v . "
+                    f"?other <{safe_uri}> ?v . "
+                    "FILTER($this != ?other) }"
+                )
+                _add(
+                    SHACLService.create_shape(
+                        category="uniqueness",
+                        target_class=domain_name,
+                        target_class_uri=_cls_uri(domain_name) if domain_name else "",
+                        property_path=prop_name,
+                        property_uri=prop_uri,
+                        shacl_type="sh:sparql",
+                        parameters={"sh:select": select},
+                        message=(
+                            f"{domain_name}.{prop_name} must be unique"
+                            if domain_name
+                            else f"{prop_name} must be unique"
+                        ),
+                        shape_id=sid,
+                    )
+                )
+
+        return suggestions
+
+    # ------------------------------------------------------------------
+    # SHACL-to-SQL translation (for Knowledge Graph execution)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -886,6 +1289,90 @@ class SHACLService:
         )
 
     @staticmethod
+    def _numeric_bounds(params: Dict) -> List[Tuple[str, float]]:
+        """The ``(operator, limit)`` pairs a value must satisfy, in a stable order."""
+        bounds: List[Tuple[str, float]] = []
+        for key, op in RANGE_OPS.items():
+            raw = params.get(key)
+            if raw is None or raw == "":
+                continue
+            try:
+                bounds.append((op, float(raw)))
+            except (TypeError, ValueError):
+                continue
+        return bounds
+
+    @staticmethod
+    def _length_bounds(params: Dict) -> List[Tuple[str, int]]:
+        bounds: List[Tuple[str, int]] = []
+        for key, op in LENGTH_OPS.items():
+            raw = params.get(key)
+            if raw is None or raw == "":
+                continue
+            try:
+                bounds.append((op, int(raw)))
+            except (TypeError, ValueError):
+                continue
+        return bounds
+
+    @staticmethod
+    def _sql_bounded(
+        table: str,
+        cls_uri: str,
+        prop_uri: str,
+        bounds: Sequence[Tuple[str, float]],
+        measure: str,
+        rdf_type: str,
+        esc,
+    ) -> Optional[str]:
+        """Find values whose *measure* falls outside *bounds*.
+
+        A value that cannot be measured — an unparseable number for a range
+        check — violates the constraint, which is what SHACL reports for a
+        non-comparable value node.
+        """
+        if not bounds or not cls_uri or not prop_uri:
+            return None
+        satisfied = " AND ".join(f"{measure} {op} {limit}" for op, limit in bounds)
+        return (
+            f"SELECT t1.subject AS s, t2.object AS val\n"
+            f"FROM {table} t1\n"
+            f"JOIN {table} t2 ON t1.subject = t2.subject AND t2.predicate = '{esc(prop_uri)}'\n"
+            f"WHERE t1.predicate = '{rdf_type}' AND t1.object = '{esc(cls_uri)}'\n"
+            f"  AND NOT ({measure} IS NOT NULL AND {satisfied})"
+        )
+
+    @staticmethod
+    def _mem_bounded(
+        cls_uri: str,
+        prop_uri: str,
+        bounds: Sequence[Tuple[str, float]],
+        measure: Callable[[str], Optional[float]],
+        _class_instances,
+        subj_by_pred: Dict[str, Dict[str, List[str]]],
+    ) -> List[Dict[str, str]]:
+        """In-memory counterpart of :meth:`_sql_bounded`."""
+        if not bounds or not cls_uri or not prop_uri:
+            return []
+        prop_vals = subj_by_pred.get(prop_uri, {})
+        violations = []
+        for s in _class_instances(cls_uri):
+            for val in prop_vals.get(s, []):
+                measured = measure(val)
+                if measured is None or not all(
+                    BOUND_COMPARATORS[op](measured, limit) for op, limit in bounds
+                ):
+                    violations.append({"s": s, "val": val})
+        return violations
+
+    @staticmethod
+    def _as_number(value: str) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _sql_datatype(
         table: str,
         cls_uri: str,
@@ -976,16 +1463,40 @@ class SHACLService:
         The SQL checks against a triple store table with columns
         ``(subject, predicate, object)``.
 
+        A shape carrying conditions keeps its constraint query unchanged and
+        has it restricted to the subjects matching the guard.
+
         Returns:
             SQL string, or ``None`` if the shape cannot be translated.
         """
+        base_sql = SHACLService._base_shape_sql(shape, table)
+        if not base_sql:
+            return None
+
+        conditions = ShapeConditions.get_conditions(shape)
+        if not conditions:
+            return base_sql
+
+        condition_sql = ShapeConditions.subject_sql(
+            conditions,
+            ShapeConditions.get_logic(shape),
+            shape.get("target_class_uri", ""),
+            table,
+            sql_escape,
+            SHACLService._normalize_prop_uri,
+        )
+        if not condition_sql:
+            return base_sql
+        return ShapeConditions.wrap_sql(base_sql, condition_sql)
+
+    @staticmethod
+    def _base_shape_sql(shape: Dict, table: str) -> Optional[str]:
+        """Translate the constraint half of a shape, ignoring its conditions."""
         shacl_type = shape.get("shacl_type", "")
         params = shape.get("parameters", {})
         cls_uri = shape.get("target_class_uri", "")
         prop_uri = SHACLService._normalize_prop_uri(shape.get("property_uri", ""))
-
-        def esc(v: str) -> str:
-            return v.replace("'", "''")
+        esc = sql_escape
 
         if shacl_type in ("sh:minCount", "sh:maxCount") or (
             "sh:minCount" in params or "sh:maxCount" in params
@@ -1004,6 +1515,28 @@ class SHACLService:
                 f"JOIN {table} t2 ON t1.subject = t2.subject AND t2.predicate = '{esc(prop_uri)}'\n"
                 f"WHERE t1.predicate = '{RDF_TYPE}' AND t1.object = '{esc(cls_uri)}'\n"
                 f"  AND NOT t2.object RLIKE '{esc(pattern)}'"
+            )
+
+        if shacl_type in RANGE_OPS or any(k in params for k in RANGE_OPS):
+            return SHACLService._sql_bounded(
+                table,
+                cls_uri,
+                prop_uri,
+                SHACLService._numeric_bounds(params),
+                "TRY_CAST(t2.object AS DOUBLE)",
+                RDF_TYPE,
+                esc,
+            )
+
+        if shacl_type in LENGTH_OPS or any(k in params for k in LENGTH_OPS):
+            return SHACLService._sql_bounded(
+                table,
+                cls_uri,
+                prop_uri,
+                SHACLService._length_bounds(params),
+                "LENGTH(t2.object)",
+                RDF_TYPE,
+                esc,
             )
 
         if shacl_type == "sh:hasValue":
@@ -1047,6 +1580,19 @@ class SHACLService:
         return None
 
     @staticmethod
+    def supports_in_memory(shape: Dict) -> bool:
+        """Whether :meth:`evaluate_shape_in_memory` can check *shape*.
+
+        An unsupported shape yields no violations, which is indistinguishable
+        from a clean result — callers must ask first and report the check as
+        not run.
+        """
+        if shape.get("shacl_type", "") in IN_MEMORY_TYPES:
+            return True
+        params = shape.get("parameters", {}) or {}
+        return any(key in params for key in IN_MEMORY_PARAMS)
+
+    @staticmethod
     def evaluate_shape_in_memory(
         shape: Dict,
         triples: List[Dict[str, str]],
@@ -1055,12 +1601,10 @@ class SHACLService:
 
         Each triple is ``{"subject": ..., "predicate": ..., "object": ...}``.
         Returns a list of violation dicts (empty if no violations).
-        """
-        shacl_type = shape.get("shacl_type", "")
-        params = shape.get("parameters", {})
-        cls_uri = shape.get("target_class_uri", "")
-        prop_uri = shape.get("property_uri", "")
 
+        A shape carrying conditions is evaluated exactly as an unconditional
+        one, then its violations are filtered down to the guarded subjects.
+        """
         subj_by_pred: Dict[str, Dict[str, List[str]]] = {}
         type_map: Dict[str, set] = {}
         for t in triples:
@@ -1071,12 +1615,43 @@ class SHACLService:
             if p == RDF_TYPE:
                 type_map.setdefault(s, set()).add(o)
 
-        # Resolve property URI against actual predicates in the graph
-        # (handles #/slash mismatch between ontology and triplestore)
-        prop_uri = SHACLService.resolve_prop_uri(prop_uri, set(subj_by_pred.keys()))
-
         def _class_instances(c_uri: str) -> set:
             return {s for s, types in type_map.items() if c_uri in types}
+
+        violations = SHACLService._base_shape_violations(
+            shape, subj_by_pred, _class_instances
+        )
+
+        conditions = ShapeConditions.get_conditions(shape)
+        if not violations or not conditions:
+            return violations
+
+        predicates = set(subj_by_pred.keys())
+        guarded = ShapeConditions.matching_subjects(
+            conditions,
+            ShapeConditions.get_logic(shape),
+            {v.get("s", "") for v in violations},
+            subj_by_pred,
+            lambda u: SHACLService.resolve_prop_uri(u, predicates),
+        )
+        return [v for v in violations if v.get("s") in guarded]
+
+    @staticmethod
+    def _base_shape_violations(
+        shape: Dict,
+        subj_by_pred: Dict[str, Dict[str, List[str]]],
+        _class_instances,
+    ) -> List[Dict[str, str]]:
+        """Evaluate the constraint half of a shape against indexed triples."""
+        shacl_type = shape.get("shacl_type", "")
+        params = shape.get("parameters", {})
+        cls_uri = shape.get("target_class_uri", "")
+
+        # Resolve property URI against actual predicates in the graph
+        # (handles #/slash mismatch between ontology and triplestore)
+        prop_uri = SHACLService.resolve_prop_uri(
+            shape.get("property_uri", ""), set(subj_by_pred.keys())
+        )
 
         if shacl_type in ("sh:minCount", "sh:maxCount") or (
             "sh:minCount" in params or "sh:maxCount" in params
@@ -1105,6 +1680,26 @@ class SHACLService:
                     if not regex.search(val):
                         violations.append({"s": s, "val": val})
             return violations
+
+        if shacl_type in RANGE_OPS or any(k in params for k in RANGE_OPS):
+            return SHACLService._mem_bounded(
+                cls_uri,
+                prop_uri,
+                SHACLService._numeric_bounds(params),
+                SHACLService._as_number,
+                _class_instances,
+                subj_by_pred,
+            )
+
+        if shacl_type in LENGTH_OPS or any(k in params for k in LENGTH_OPS):
+            return SHACLService._mem_bounded(
+                cls_uri,
+                prop_uri,
+                SHACLService._length_bounds(params),
+                len,
+                _class_instances,
+                subj_by_pred,
+            )
 
         if shacl_type == "sh:hasValue":
             expected = str(params.get("sh:hasValue", ""))

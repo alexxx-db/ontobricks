@@ -8,109 +8,52 @@
         {
             "id": "registry",
             "label": "Registry",
-            "icon": "bi-archive",
-            "route": "/registry/",
+            "icon": "bi-boxes",
+            "route": "/?open=registry",
             "requires_domain_saved": false,
+            "navbar_hidden": false,
+            "navbar_modal": true,
             "status_indicator": null,
-            "navbar_actions": [
-                {
-                    "label": "New Domain",
-                    "icon": "bi-file-earmark-plus",
-                    "action": "domainNew",
-                    "element_id": null
-                },
-                {
-                    "label": "Load Domain",
-                    "icon": "bi-cloud-download",
-                    "action": "domainLoad",
-                    "element_id": null
-                }
-            ],
-            "groups": [
-                {
-                    "id": "registry-domains",
-                    "title": "Domains",
-                    "icon": "bi-folder2-open",
-                    "items": [
-                        {
-                            "id": "domains",
-                            "label": "Browse",
-                            "icon": "bi-search",
-                            "default": true,
-                            "requires": null
-                        },
-                        {
-                            "id": "bridges",
-                            "label": "Bridges",
-                            "icon": "bi-signpost-split",
-                            "default": false,
-                            "requires": null
-                        },
-                        {
-                            "id": "teams",
-                            "label": "Teams",
-                            "icon": "bi-people",
-                            "default": false,
-                            "requires": null,
-                            "admin_only": true
-                        }
-                    ]
-                },
-                {
-                    "id": "registry-automation",
-                    "title": "Automation",
-                    "icon": "bi-clock-history",
-                    "items": [
-                        {
-                            "id": "schedule",
-                            "label": "Scheduler",
-                            "icon": "bi-clock-history",
-                            "default": false,
-                            "requires": null
-                        }
-                    ]
-                },
-                {
-                    "id": "registry-developer",
-                    "title": "Developer",
-                    "icon": "bi-code-square",
-                    "items": [
-                        {
-                            "id": "api",
-                            "label": "API",
-                            "icon": "bi-braces",
-                            "default": false,
-                            "requires": null
-                        }
-                    ]
-                }
-            ]
+            "navbar_actions": [],
+            "groups": []
         },
 
         {
             "id": "domain",
             "label": "Domain",
-            "icon": "bi-folder2",
+            "icon": "bi-box",
             "route": "/domain/",
             "requires_domain_saved": false,
             "status_indicator": null,
             "navbar_actions": [
                 {
-                    "label": "Save Domain",
+                    "label": "Save",
                     "icon": "bi-cloud-upload",
                     "action": "domainSave",
                     "element_id": "menuSaveDomain"
+                },
+                {
+                    "label": "Versions",
+                    "icon": "bi-123",
+                    "action": "domainSwitch",
+                    "element_id": "menuSwitchDomain"
+                },
+                {
+                    "label": "Close",
+                    "icon": "bi-x-circle",
+                    "action": "domainClose",
+                    "element_id": "menuCloseDomain"
                 }
             ],
             "groups": [
                 {
                     "id": "domain-main",
-                    "title": "Domain details",
-                    "icon": "bi-folder2-open",
+                    "title": "",
+                    "icon": "bi-box",
                     "items": [
                         {
                             "id": "information",
-                            "label": "Information",
+                            "label": "General",
                             "icon": "bi-info-circle",
                             "default": true,
                             "requires": null
@@ -118,27 +61,34 @@
                         {
                             "id": "versions",
                             "label": "Versions",
-                            "icon": "bi-clock-history",
+                            "icon": "bi-123",
                             "default": false,
                             "requires": "domain_saved"
                         },
                         {
-                            "id": "validation",
-                            "label": "Cockpit",
-                            "icon": "bi-speedometer2",
+                            "id": "review",
+                            "label": "Publication",
+                            "icon": "bi-patch-check",
                             "default": false,
                             "requires": "domain_saved"
-                        },
+                        }
+                    ]
+                },
+                {
+                    "id": "domain-metadata",
+                    "title": "Metadata",
+                    "icon": "bi-database",
+                    "items": [
                         {
                             "id": "metadata",
-                            "label": "Data Sources",
+                            "label": "Data Assets",
                             "icon": "bi-database",
                             "default": false,
                             "requires": "domain_saved"
                         },
                         {
                             "id": "documents",
-                            "label": "Documents",
+                            "label": "Knowledge Store",
                             "icon": "bi-file-earmark-text",
                             "default": false,
                             "requires": "domain_saved"
@@ -146,22 +96,22 @@
                     ]
                 },
                 {
-                    "id": "domain-design",
-                    "title": "Design",
-                    "icon": "bi-pencil-square",
+                    "id": "domain-collaboration",
+                    "title": "Collaboration",
+                    "icon": "bi-chat-left-text",
                     "items": [
                         {
-                            "id": "ontology-link",
-                            "label": "Ontology",
-                            "icon": "bi-bezier2",
-                            "route": "/ontology/",
+                            "id": "mytasks",
+                            "label": "My Tasks",
+                            "icon": "bi-inbox",
+                            "default": false,
                             "requires": "domain_saved"
                         },
                         {
-                            "id": "mapping-link",
-                            "label": "Mapping",
-                            "icon": "bi-shuffle",
-                            "route": "/mapping/",
+                            "id": "discussions",
+                            "label": "Discussions",
+                            "icon": "bi-chat-left-text",
+                            "default": false,
                             "requires": "domain_saved"
                         }
                     ]
@@ -172,9 +122,16 @@
                     "icon": "bi-gear",
                     "items": [
                         {
-                            "id": "sync",
-                            "label": "Build",
-                            "icon": "bi-arrow-repeat",
+                            "id": "validation",
+                            "label": "Cockpit",
+                            "icon": "bi-speedometer2",
+                            "default": false,
+                            "requires": "domain_saved"
+                        },
+                        {
+                            "id": "audit",
+                            "label": "Audit trail",
+                            "icon": "bi-journal-text",
                             "default": false,
                             "requires": "domain_saved"
                         }
@@ -222,7 +179,7 @@
                     "items": [
                         {
                             "id": "information",
-                            "label": "Information",
+                            "label": "General",
                             "icon": "bi-info-circle",
                             "default": true,
                             "requires": null
@@ -245,8 +202,8 @@
                         },
                         {
                             "id": "map",
-                            "label": "Designer",
-                            "icon": "bi-diagram-3",
+                            "label": "Studio",
+                            "icon": "bi-pencil",
                             "default": false,
                             "requires": null
                         },
@@ -260,14 +217,14 @@
                         {
                             "id": "design",
                             "label": "Business Views",
-                            "icon": "bi-pencil-square",
+                            "icon": "bi-yelp",
                             "default": false,
                             "requires": null
                         },
                         {
                             "id": "entities",
                             "label": "Entities",
-                            "icon": "bi-box",
+                            "icon": "bi-list-nested",
                             "default": false,
                             "requires": null
                         },
@@ -321,20 +278,6 @@
                             "requires": "domain_saved"
                         }
                     ]
-                },
-                {
-                    "id": "ontology-w3c",
-                    "title": "W3C Standards",
-                    "icon": "bi-filetype-xml",
-                    "items": [
-                        {
-                            "id": "owl",
-                            "label": "OWL",
-                            "icon": "bi-file-earmark-code",
-                            "default": false,
-                            "requires": null
-                        }
-                    ]
                 }
             ]
         },
@@ -356,7 +299,7 @@
                     "items": [
                         {
                             "id": "information",
-                            "label": "Information",
+                            "label": "General",
                             "icon": "bi-info-circle",
                             "default": true,
                             "requires": null,
@@ -372,8 +315,8 @@
                         },
                         {
                             "id": "design",
-                            "label": "Designer",
-                            "icon": "bi-diagram-3",
+                            "label": "Studio",
+                            "icon": "bi-pencil",
                             "default": false,
                             "requires": null,
                             "disabled_during": "autoassign"
@@ -408,14 +351,6 @@
                     "icon": "bi-filetype-xml",
                     "items": [
                         {
-                            "id": "r2rml",
-                            "label": "R2RML",
-                            "icon": "bi-link-45deg",
-                            "default": false,
-                            "requires": null,
-                            "disabled_during": "autoassign"
-                        },
-                        {
                             "id": "sparksql",
                             "label": "Spark SQL",
                             "icon": "bi-file-earmark-code",
@@ -429,14 +364,196 @@
         },
 
         {
-            "id": "digitaltwin",
-            "label": "Digital Twin",
-            "icon": "bi-box-fill",
-            "route": "/dtwin/",
-            "requires_domain_saved": true,
+            "id": "settings",
+            "label": "Settings",
+            "icon": "bi-gear",
+            "route": "/settings",
+            "requires_domain_saved": false,
+            "navbar_hidden": true,
             "status_indicator": null,
             "navbar_actions": [],
             "groups": [
+                {
+                    "id": "settings-config",
+                    "title": "Configuration",
+                    "icon": "bi-sliders",
+                    "items": [
+                        {
+                            "id": "databricks",
+                            "label": "Databricks",
+                            "icon": "ob-brand-icon ob-icon-databricks",
+                            "default": true,
+                            "requires": null
+                        },
+                        {
+                            "id": "registry",
+                            "label": "Registry",
+                            "icon": "bi-archive",
+                            "default": false,
+                            "requires": null,
+                            "admin_only": true
+                        },
+                        {
+                            "id": "github",
+                            "label": "GitHub",
+                            "icon": "bi-github",
+                            "default": false,
+                            "requires": null,
+                            "admin_only": true
+                        },
+                        {
+                            "id": "global",
+                            "label": "Global",
+                            "icon": "bi-sliders",
+                            "default": false,
+                            "requires": null
+                        },
+                        {
+                            "id": "ui",
+                            "label": "UI",
+                            "icon": "bi-palette",
+                            "default": false,
+                            "requires": null
+                        }
+                    ]
+                },
+                {
+                    "id": "settings-triplestore",
+                    "title": "Back end",
+                    "icon": "bi-diagram-3",
+                    "items": [
+                        {
+                            "id": "lakebase",
+                            "label": "Lakebase",
+                            "icon": "ob-brand-icon ob-icon-postgresql",
+                            "default": false,
+                            "requires": null
+                        },
+                        {
+                            "id": "delta",
+                            "label": "Lakehouse",
+                            "icon": "ob-brand-icon ob-icon-lakehouse",
+                            "default": false,
+                            "requires": null
+                        },
+                        {
+                            "id": "neo4j",
+                            "label": "Neo4j",
+                            "icon": "ob-brand-icon ob-icon-neo4j",
+                            "default": false,
+                            "requires": null
+                        }
+                    ]
+                },
+                {
+                    "id": "settings-admin",
+                    "title": "Admin",
+                    "icon": "bi-shield-lock",
+                    "items": [
+                        {
+                            "id": "teams",
+                            "label": "Teams",
+                            "icon": "bi-people",
+                            "default": false,
+                            "requires": null,
+                            "admin_only": true
+                        },
+                        {
+                            "id": "locks",
+                            "label": "Locks",
+                            "icon": "bi-lock",
+                            "default": false,
+                            "requires": null,
+                            "admin_only": true
+                        },
+                        {
+                            "id": "health",
+                            "label": "Health",
+                            "icon": "bi-heart-pulse",
+                            "default": false,
+                            "requires": null,
+                            "admin_only": true
+                        },
+                        {
+                            "id": "logs",
+                            "label": "Logs",
+                            "icon": "bi-terminal",
+                            "default": false,
+                            "requires": null,
+                            "admin_only": true
+                        }
+                    ]
+                },
+                {
+                    "id": "settings-automation",
+                    "title": "Automation",
+                    "icon": "bi-clock-history",
+                    "items": [
+                        {
+                            "id": "schedule",
+                            "label": "Scheduler",
+                            "icon": "bi-clock-history",
+                            "default": false,
+                            "requires": null
+                        },
+                        {
+                            "id": "runs",
+                            "label": "Runs",
+                            "icon": "bi-list-check",
+                            "default": false,
+                            "requires": null,
+                            "admin_only": true
+                        }
+                    ]
+                },
+                {
+                    "id": "settings-developer",
+                    "title": "Developer",
+                    "icon": "bi-code-square",
+                    "items": [
+                        {
+                            "id": "api",
+                            "label": "API",
+                            "icon": "bi-braces",
+                            "default": false,
+                            "requires": null
+                        }
+                    ]
+                }
+            ]
+        },
+
+        {
+            "id": "digitaltwin",
+            "label": "Knowledge Graph",
+            "icon": "bi-radar",
+            "route": "/dtwin/",
+            "requires_domain_saved": true,
+            "navbar_hidden": true,
+            "status_indicator": null,
+            "navbar_actions": [],
+            "groups": [
+                {
+                    "id": "digitaltwin-management",
+                    "title": "Management",
+                    "icon": "bi-gear",
+                    "items": [
+                        {
+                            "id": "sync",
+                            "label": "Build",
+                            "icon": "bi-fast-forward",
+                            "default": false,
+                            "requires": null
+                        },
+                        {
+                            "id": "runs",
+                            "label": "Runs",
+                            "icon": "bi-list-check",
+                            "default": false,
+                            "requires": null
+                        }
+                    ]
+                },
                 {
                     "id": "digitaltwin-insight",
                     "title": "Insight",
@@ -446,6 +563,13 @@
                             "id": "insight",
                             "label": "Overview",
                             "icon": "bi-bar-chart-line",
+                            "default": false,
+                            "requires": null
+                        },
+                        {
+                            "id": "analytics",
+                            "label": "Analytics",
+                            "icon": "bi-graph-up-arrow",
                             "default": false,
                             "requires": null
                         }
@@ -458,21 +582,21 @@
                     "items": [
                         {
                             "id": "sigmagraph",
-                            "label": "Knowledge Graph",
-                            "icon": "bi-layers-half",
+                            "label": "Explorer",
+                            "icon": "bi-share",
                             "default": true,
                             "requires": null
                         },
                         {
                             "id": "graphql",
-                            "label": "GraphQL",
+                            "label": "Query",
                             "icon": "bi-braces-asterisk",
                             "default": false,
                             "requires": null
                         },
                         {
                             "id": "chat",
-                            "label": "Graph Chat",
+                            "label": "Chat",
                             "icon": "bi-chat-dots",
                             "default": false,
                             "requires": null

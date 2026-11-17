@@ -11,19 +11,25 @@ This repository uses modular Cursor rules with scoped `.mdc` files (YAML frontma
 9. 09-package-management.mdc
 10. 10-entity-panel-matrix.mdc
 11. 11-frontend-design.mdc
+12. 12-ai-feature-lifecycle.mdc
 
 After ANY code change (feature, fix, refactoring, review, etc.):
 * Update the changelog in /changelogs/:
     - Use the version (vX.X.X) as the first level for storing the logs. 
         - Get and Use the version specified in the pyproject.toml file for each entry
         - Each application update must be affected to the right version/folder.
-    - Use today's date as filename: YYYY-MM-DD.log (for example if i make an update on the version 0.2.1 the 2026 May 20th i should have the file /changelogs/v0.2.1/2026-05-20.log)
+    - For the filename:
+        - Use the user (github) as prefix: [user]
+        - Then Use today's date as filename: YYYY-MM-DD.log 
+        For example if use benoitcayladbx make an update on the version 0.2.1 the 2026 May 20th i should have the file /changelogs/v0.2.1/benoitcayladbx_2026-05-20.log)
     - If the file already exists, append a new section (one file per day).
     - If the file does not exist, create it.
     - Each section must include: a title, context, numbered list of changes
       with file paths and a short description, the list of modified files,
       and the test result.
-* Run all tests and report results.
+    - Write the entire changelog section in **English**, even if the user
+      wrote in another language (see `.cursor/05 §English-only artifacts`).
+* Run the tests and report results — use `uv run --frozen pytest -q -m "not scenario"` (the `--frozen` flag is mandatory: a bare `uv run` poisons `uv.lock` and breaks the next deploy). The `tests/e2e/scenarios/` suites are opt-in; run them only when explicitly asked (see `.cursor/08-testing-and-deployment`).
 
 When asking for a code review, do all these tasks (in this order):
 * Review all application code, and check that the rules defined in src/.coding_rules.md are respected
@@ -32,8 +38,18 @@ When asking for a code review, do all these tasks (in this order):
 * Check all the session_data items to see if they are used and/or if they could be calculated as well
     - If they are useless, remove them.
     - If they can be calculated, optimize the code or propose a plan.
-* Run all tests (after all changes made)
+* Run the tests (after all changes made) — `uv run --frozen pytest -q -m "not scenario"` (scenarios are opt-in; see `.cursor/08-testing-and-deployment`)
 * Update the documentation (in /docs, the sphinx documentation and the README.md)
+
+When working on an AI / LLM agent feature (any change under `src/agents/**`,
+`src/back/core/agents/**`, `src/mcp-server/**`, a new MLflow-traced LLM call, or
+an MCP tool wrapping an agent):
+* Follow the gate in `.cursor/12-ai-feature-lifecycle.mdc` (CNS §3.5) — the
+  companion path of least resistance is `.claude/skills/ai-feature/SKILL.md`.
+* No new agent ships without a `.planning/<slug>/SPEC.md`; no prompt/tool change
+  ships without an eval delta + linked MLflow eval run. The SPEC.md + dataset is
+  the entry ticket, and MLflow tracing must be present on every Foundation Model
+  API code path.
 
 When asking to deploy:
 * Always synchronize the files with the server.

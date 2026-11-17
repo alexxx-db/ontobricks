@@ -5,21 +5,33 @@ Moved from app/frontend/ontology/routes.py during the front/back split.
 """
 
 import asyncio
+import json
+import re
 
 from fastapi import APIRouter, Request, Depends
 
 from api.routers.internal._helpers import map_route_errors
-from back.core.errors import InfrastructureError, NotFoundError, ValidationError
+from back.core.errors import (
+    GoneError,
+    InfrastructureError,
+    NotFoundError,
+    OntoBricksError,
+    ValidationError,
+)
 from back.objects.session import SessionManager, get_session_manager
 from shared.config.settings import get_settings, Settings
-from back.objects.ontology import Ontology
+from back.objects.ontology import Ontology, Rules
+from back.objects.ontology.generate import GenerateWorkflow
 from back.objects.session import get_domain
 from back.core.task_manager import get_task_manager
 from back.core.helpers import (
     get_databricks_host_and_token,
     make_volume_file_service,
-    require_serving_llm,
+    require_domain_llm,
+    resolve_warehouse_id,
 )
+import time
+
 from agents.serialization import serialize_agent_steps
 from back.core.industry import (
     get_fibo_catalog,
@@ -30,6 +42,13 @@ from back.core.industry import (
 from back.core.industry.fhir import get_fhir_versions
 from back.core.logging import get_logger
 from back.core.w3c import SHACLService
+from back.core.w3c.shacl.constants import (
+    AGGREGATE_ID_PREFIX,
+    DECISION_TABLE_ID_PREFIX,
+    RULE_FAMILY_CATEGORIES,
+    SWRL_ID_PREFIX,
+    rule_check_id,
+)
 from shared.config.constants import DEFAULT_BASE_URI, DEFAULT_GRAPH_NAME
 
 router = APIRouter(prefix="/ontology", tags=["Ontology"])
@@ -181,6 +200,10 @@ async def generate_owl_endpoint(
 
     with map_route_errors("OWL generation failed", logger):
         domain = get_domain(session_mgr)
+        ontology_data = dict(data)
+        for key in ("rdf_extras", "label_lang"):
+            if key not in ontology_data and key in domain.ontology:
+                ontology_data[key] = domain.ontology[key]
         constraints = data.get("constraints") or domain.constraints
         swrl_rules = data.get("swrl_rules") or domain.swrl_rules
         axioms = data.get("axioms") or domain.axioms
@@ -188,7 +211,7 @@ async def generate_owl_endpoint(
         groups = data.get("groups") or domain.groups
 
         owl_content = Ontology.generate_owl(
-            data, constraints, swrl_rules, axioms, expressions, groups
+            ontology_data, constraints, swrl_rules, axioms, expressions, groups
         )
         domain.generated["owl"] = owl_content
         domain.save()
@@ -276,6 +299,80 @@ async def parse_rdfs_content(
         )
 
 
+@router.post("/analyze-import")
+async def analyze_import(
+    request: Request, session_mgr: SessionManager = Depends(get_session_manager)
+):
+    """Analyse OWL/RDFS content for conflicts against the current session ontology.
+
+    Read-only — the session is never mutated.  Returns a
+    :class:`~back.core.w3c.owl.ConflictReport` dict describing every
+    incoming entity as ``new``, ``duplicate``, ``uri_conflict``, or
+    ``name_conflict``.
+
+    Body: ``{ "content": "...", "format": "owl" | "rdfs" }``
+    """
+    data = await request.json()
+    content = data.get("content", "")
+    fmt = (data.get("format") or "owl").lower()
+    if not content:
+        raise ValidationError("No content provided")
+    logger.info("/ontology/analyze-import: format=%s content_len=%d", fmt, len(content))
+    with map_route_errors("Import analysis failed", logger):
+        result = Ontology(get_domain(session_mgr)).analyze_import(content, format=fmt)
+        s = result.get("report", {}).get("summary", {})
+        logger.info(
+            "/ontology/analyze-import: done — new=%s duplicates=%s conflicts=%s",
+            s.get("new"), s.get("duplicates"), s.get("conflicts"),
+        )
+        return result
+
+
+@router.post("/merge-import")
+async def merge_import(
+    request: Request, session_mgr: SessionManager = Depends(get_session_manager)
+):
+    """Append parsed OWL/RDFS content to the current session ontology.
+
+    New entities are added; duplicates are silently skipped; conflicting
+    entities are handled according to the user-supplied *resolutions* map.
+
+    Body::
+
+        {
+            "content": "...",
+            "format": "owl" | "rdfs",
+            "resolutions": {
+                "<uri_or_name>": "skip" | "overwrite" | "rename:<new_name>"
+            }
+        }
+    """
+    data = await request.json()
+    content = data.get("content", "")
+    fmt = (data.get("format") or "owl").lower()
+    resolutions = data.get("resolutions") or {}
+    if not content:
+        raise ValidationError("No content provided")
+    logger.info(
+        "/ontology/merge-import: format=%s content_len=%d resolutions=%d",
+        fmt, len(content), len(resolutions),
+    )
+    with map_route_errors("Import merge failed", logger):
+        result = Ontology(get_domain(session_mgr)).merge_parsed_owl_to_domain(
+            content,
+            resolutions,
+            format=fmt,
+        )
+        stats = result.get("stats", {})
+        logger.info(
+            "/ontology/merge-import: done — classes=%s properties=%s new=%s "
+            "duplicates_skipped=%s conflicts_resolved=%s",
+            stats.get("classes"), stats.get("properties"), stats.get("new"),
+            stats.get("duplicates_skipped"), stats.get("conflicts_resolved"),
+        )
+        return result
+
+
 # ===========================================
 # Industry Ontology Import (FIBO, CDISC, IOF)
 # ===========================================
@@ -340,18 +437,59 @@ async def list_constraints(session_mgr: SessionManager = Depends(get_session_man
 # ===========================================
 
 
+def _selectable_rule_families(domain) -> list:
+    """List the non-SHACL rules a data quality run executes, as selectables.
+
+    Each entry mirrors a shape closely enough for the run page to render and
+    select it: the ``id`` is the same check id the run reports, so ticking one
+    here is what the run filters on.
+    """
+    ontology_dict = getattr(domain, "ontology", None)
+    if not isinstance(ontology_dict, dict):
+        ontology_dict = domain._data.get("ontology", {}) if hasattr(domain, "_data") else {}
+
+    families = (
+        (SWRL_ID_PREFIX, domain.swrl_rules or [], "SWRL Rule"),
+        (DECISION_TABLE_ID_PREFIX, ontology_dict.get("decision_tables", []), "Decision Table"),
+        (AGGREGATE_ID_PREFIX, ontology_dict.get("aggregate_rules", []), "Aggregate Rule"),
+    )
+    rules = []
+    for prefix, family, fallback in families:
+        for index, rule in enumerate(family or []):
+            if not rule.get("enabled", True):
+                continue
+            rules.append(
+                {
+                    "id": rule_check_id(prefix, rule, index),
+                    "label": rule.get("name") or f"{fallback} {index + 1}",
+                    "category": RULE_FAMILY_CATEGORIES[prefix],
+                    "family": prefix,
+                    "enabled": True,
+                }
+            )
+    return rules
+
+
 @router.get("/dataquality/list")
 async def list_shapes(
     session_mgr: SessionManager = Depends(get_session_manager),
     category: str = "",
 ):
-    """List all SHACL data-quality shapes, optionally filtered by category."""
+    """List all SHACL data-quality shapes, optionally filtered by category.
+
+    ``rules`` carries the non-SHACL families a data quality run also executes
+    (SWRL rules, decision tables, aggregate rules) so they can be selected one
+    by one like a shape. They are kept out of ``shapes`` because the ontology
+    editor manages actual shapes only.
+    """
     domain = get_domain(session_mgr)
     domain.deduplicate_shacl_shapes()
     shapes = domain.shacl_shapes
+    rules = _selectable_rule_families(domain)
     if category:
         shapes = [s for s in shapes if s.get("category") == category]
-    return {"success": True, "shapes": shapes}
+        rules = [r for r in rules if r.get("category") == category]
+    return {"success": True, "shapes": shapes, "rules": rules}
 
 
 @router.post("/dataquality/save")
@@ -371,8 +509,11 @@ async def save_shape(
         domain = get_domain(session_mgr)
         shapes = list(domain.shacl_shapes)
 
-        if shape_id and any(s["id"] == shape_id for s in shapes):
+        is_update = bool(shape_id and any(s["id"] == shape_id for s in shapes))
+        old = next((dict(s) for s in shapes if s.get("id") == shape_id), {})
+        if is_update:
             shapes = SHACLService.update_shape(shapes, shape_id, shape_data)
+            saved = next((s for s in shapes if s.get("id") == shape_id), shape_data)
         else:
             new_shape = SHACLService.create_shape(
                 category=shape_data.get("category", "conformance"),
@@ -386,10 +527,20 @@ async def save_shape(
                 message=shape_data.get("message", ""),
                 label=shape_data.get("label", ""),
                 enabled=shape_data.get("enabled", True),
+                conditions=shape_data.get("conditions", []),
+                condition_logic=shape_data.get("condition_logic", "and"),
             )
             shapes.append(new_shape)
+            saved = new_shape
 
         domain.shacl_shapes = shapes
+        _ref = shape_id or saved.get("label", "") or saved.get("target_class", "")
+        domain.record_change(
+            "shacl_updated" if is_update else "shacl_added",
+            entity_type="shacl", entity_ref=_ref,
+            summary=saved.get("label", "") or _ref,
+            meta=domain.diff_meta(old if is_update else {}, saved),
+        )
         domain.save()
         return {"success": True, "message": "Shape saved", "shapes": shapes}
 
@@ -406,8 +557,15 @@ async def delete_shape(
             raise ValidationError("Shape id is required")
 
         domain = get_domain(session_mgr)
+        shapes = list(domain.shacl_shapes)
+        old = next((dict(s) for s in shapes if s.get("id") == shape_id), {})
         shapes = SHACLService.delete_shape(domain.shacl_shapes, shape_id)
         domain.shacl_shapes = shapes
+        domain.record_change(
+            "shacl_removed", entity_type="shacl",
+            entity_ref=shape_id, summary=old.get("label") or shape_id,
+            meta=domain.diff_meta(old, {}),
+        )
         domain.save()
         return {"success": True, "message": "Shape deleted", "shapes": shapes}
 
@@ -436,7 +594,7 @@ async def import_shacl(
             raise ValidationError("No Turtle content provided")
 
         svc = SHACLService()
-        imported = svc.import_shapes(turtle_content)
+        imported, report = svc.import_shapes_with_report(turtle_content)
         if not imported:
             raise ValidationError("No valid shapes found in the provided Turtle")
 
@@ -445,11 +603,16 @@ async def import_shacl(
         shapes.extend(imported)
         domain.shacl_shapes = shapes
         domain.save()
+        dropped = report.get("conditions_dropped", 0)
+        message = f"Imported {len(imported)} shapes"
+        if dropped:
+            message += f" — {dropped} lost their conditions and now apply to every instance"
         return {
             "success": True,
-            "message": f"Imported {len(imported)} shapes",
+            "message": message,
             "shapes": shapes,
             "imported_count": len(imported),
+            "conditions_dropped": dropped,
         }
 
 
@@ -464,9 +627,7 @@ async def export_shacl(session_mgr: SessionManager = Depends(get_session_manager
         domain.ontology.get("base_uri", ""),
     )
     export_name = (
-        domain._data.get("domain", domain._data.get("project", {}))
-        .get("info", {})
-        .get("name", DEFAULT_GRAPH_NAME)
+        domain._data["domain"].get("info", {}).get("name", DEFAULT_GRAPH_NAME)
     )
     filename = f"{export_name}_shacl_shapes.ttl"
     return Response(
@@ -508,6 +669,194 @@ async def migrate_constraints(
         }
 
 
+@router.post("/dataquality/cleanup")
+async def cleanup_shapes(session_mgr: SessionManager = Depends(get_session_manager)):
+    """Remove SHACL shapes that are stale or reference excluded mapping entries.
+
+    A shape is considered stale when any of the following is true:
+
+    - Its ``target_class_uri`` is set but matches no current ontology class (by URI or name).
+    - Its ``property_uri`` is set, is not a W3C standard URI, and matches no current
+      ontology property or data-property (by URI or name).
+    - Its ``target_class_uri`` corresponds to an entity mapping entry marked ``excluded``.
+    - Its ``property_uri`` corresponds to a relationship mapping entry marked ``excluded``.
+
+    Global / structural shapes (empty ``target_class_uri``) are always kept.
+    """
+    with map_route_errors("SHACL cleanup failed", logger):
+        domain = get_domain(session_mgr)
+        classes = domain.get_classes()
+        properties = domain.get_properties()
+
+        class_uris = {c.get("uri") for c in classes if c.get("uri")}
+        class_names = {c.get("name") for c in classes if c.get("name")}
+        prop_uris = {p.get("uri") for p in properties if p.get("uri")}
+        prop_names = {p.get("name") for p in properties if p.get("name")}
+
+        for cls in classes:
+            for dp in cls.get("dataProperties", []):
+                if dp.get("uri"):
+                    prop_uris.add(dp["uri"])
+                if dp.get("name"):
+                    prop_names.add(dp["name"])
+
+        def _local_name(uri: str) -> str:
+            if not uri:
+                return ""
+            idx = max(uri.rfind("#"), uri.rfind("/"))
+            return uri[idx + 1:] if idx >= 0 else uri
+
+        # Excluded mapping URIs — index by full URI *and* local name for robust matching
+        excluded_class_uris: set = set()
+        excluded_class_locals: set = set()
+        for m in domain.get_entity_mappings():
+            if m.get("excluded") and m.get("ontology_class"):
+                oc = m["ontology_class"]
+                excluded_class_uris.add(oc)
+                excluded_class_locals.add(_local_name(oc).lower())
+
+        excluded_prop_uris: set = set()
+        excluded_prop_locals: set = set()
+        for m in domain.get_relationship_mappings():
+            if m.get("excluded") and m.get("property"):
+                p = m["property"]
+                excluded_prop_uris.add(p)
+                excluded_prop_locals.add(_local_name(p).lower())
+
+        def _is_stale(shape: dict) -> bool:
+            cls_uri = shape.get("target_class_uri", "")
+            cls_name = shape.get("target_class", "")
+            prop_uri = shape.get("property_uri", "")
+            prop_name = shape.get("property_path", "")
+
+            # Global/structural shapes — always keep
+            if not cls_uri and not cls_name:
+                return False
+
+            # Check excluded mapping entries (URI, local-name, or plain name)
+            cls_key = cls_uri or cls_name
+            if (
+                cls_key in excluded_class_uris
+                or _local_name(cls_key).lower() in excluded_class_locals
+                or cls_name.lower() in excluded_class_locals
+            ):
+                return True
+
+            if prop_uri or prop_name:
+                prop_key = prop_uri or prop_name
+                if (
+                    prop_key in excluded_prop_uris
+                    or _local_name(prop_key).lower() in excluded_prop_locals
+                    or prop_name.lower() in excluded_prop_locals
+                ):
+                    return True
+
+            # Check parameter values that reference classes (sh:class, sh:node)
+            params = shape.get("parameters", {})
+            for param_key in ("sh:class", "sh:node"):
+                ref = params.get(param_key, "")
+                if ref and (
+                    ref in excluded_class_uris
+                    or _local_name(ref).lower() in excluded_class_locals
+                ):
+                    return True
+
+            # Class no longer in ontology
+            if cls_uri not in class_uris and cls_uri not in class_names:
+                if _local_name(cls_uri) not in class_names:
+                    return True
+
+            # Property no longer in ontology (skip W3C standard URIs)
+            if prop_uri and "w3.org" not in prop_uri:
+                if (
+                    prop_uri not in prop_uris
+                    and prop_uri not in prop_names
+                    and _local_name(prop_uri) not in prop_names
+                ):
+                    return True
+
+            return False
+
+        existing = list(domain.shacl_shapes)
+        kept = [s for s in existing if not _is_stale(s)]
+        removed = len(existing) - len(kept)
+
+        domain.shacl_shapes = kept
+        domain.save()
+        return {
+            "success": True,
+            "message": f"Removed {removed} stale rule(s)",
+            "shapes": kept,
+            "removed": removed,
+        }
+
+
+@router.get("/dataquality/suggest")
+async def suggest_shapes(session_mgr: SessionManager = Depends(get_session_manager)):
+    """Auto-suggest SHACL shapes from current ontology (read-only, not persisted).
+
+    Introspects OWL classes, properties and ``domain.constraints`` to produce:
+    - completeness (sh:minCount) for class-listed data properties and OWL
+      minCardinality / cardinality / someValuesFrom restrictions
+    - cardinality (sh:maxCount) from owl:FunctionalProperty and max/exact cardinality
+    - uniqueness (sh:sparql) from owl:InverseFunctionalProperty
+    - datatype (sh:datatype) and relationship (sh:class) from property ranges
+
+    Filters out any suggestion whose id already exists in domain.shacl_shapes.
+    """
+    with map_route_errors("SHACL suggestion failed", logger):
+        domain = get_domain(session_mgr)
+        classes = domain.get_classes()
+        properties = domain.get_properties()
+        constraints = domain.constraints
+        base_uri = domain.ontology.get("base_uri", "")
+        existing_ids = {s.get("id") for s in domain.shacl_shapes}
+        all_suggestions = SHACLService.suggest_from_ontology(
+            classes, properties, base_uri, constraints=constraints
+        )
+        new_suggestions = [s for s in all_suggestions if s.get("id") not in existing_ids]
+        return {
+            "success": True,
+            "suggestions": new_suggestions,
+            "total": len(new_suggestions),
+        }
+
+
+@router.post("/dataquality/accept-suggestions")
+async def accept_suggested_shapes(
+    request: Request, session_mgr: SessionManager = Depends(get_session_manager)
+):
+    """Save selected auto-generated SHACL shapes to domain.shacl_shapes.
+
+    Only shapes whose id is not already present are added (no overwrites).
+    """
+    with map_route_errors("Accepting SHACL suggestions failed", logger):
+        data = await request.json()
+        accepted_shapes = data.get("shapes", [])
+        if not accepted_shapes:
+            raise ValidationError("No shapes provided")
+
+        domain = get_domain(session_mgr)
+        existing = list(domain.shacl_shapes)
+        existing_ids = {s.get("id") for s in existing}
+        added = 0
+        for shape in accepted_shapes:
+            if shape.get("id") in existing_ids:
+                continue
+            existing.append(shape)
+            existing_ids.add(shape.get("id"))
+            added += 1
+
+        domain.shacl_shapes = existing
+        domain.save()
+        return {
+            "success": True,
+            "message": f"Added {added} rule(s)",
+            "shapes": existing,
+            "added": added,
+        }
+
+
 # ===========================================
 # SWRL Rules Management
 # ===========================================
@@ -538,12 +887,24 @@ async def save_swrl_rule(
         domain = get_domain(session_mgr)
         rules = domain.swrl_rules
 
-        if 0 <= index < len(rules):
+        is_update = 0 <= index < len(rules)
+        old = dict(rules[index]) if is_update else {}
+        if is_update:
             rules[index] = rule
         else:
             rules.append(rule)
 
         domain.swrl_rules = rules
+        if is_update:
+            Rules.rename_business_rule_refs(
+                domain.get_classes(), old.get("name", ""), rule.get("name", "")
+            )
+        domain.record_change(
+            "swrl_updated" if is_update else "swrl_added",
+            entity_type="swrl", entity_ref=rule.get("name", ""),
+            summary=rule.get("name", ""),
+            meta=domain.diff_meta(old, rule),
+        )
         domain.save()
         return {
             "success": True,
@@ -566,8 +927,19 @@ async def delete_swrl_rule(
         if not (0 <= index < len(rules)):
             raise ValidationError("Invalid rule index")
 
+        removed = dict(rules[index]) if isinstance(rules[index], dict) else {}
+        removed_name = removed.get("name", "")
         rules.pop(index)
         domain.swrl_rules = rules
+        if removed_name and not any(
+            isinstance(r, dict) and r.get("name") == removed_name for r in rules
+        ):
+            Rules.drop_business_rule_refs(domain.get_classes(), removed_name)
+        domain.record_change(
+            "swrl_removed", entity_type="swrl",
+            entity_ref=removed_name, summary=removed_name,
+            meta=domain.diff_meta(removed, {}),
+        )
         domain.save()
         return {"success": True, "message": "SWRL rule deleted", "rules": rules}
 
@@ -580,6 +952,79 @@ async def validate_swrl_rule(request: Request):
     if errors:
         raise ValidationError("SWRL rule is invalid", detail="; ".join(str(e) for e in errors))
     return {"success": True, "valid": True, "message": "Rule syntax is valid"}
+
+
+@router.get("/swrl/text")
+async def get_swrl_text(session_mgr: SessionManager = Depends(get_session_manager)):
+    """Serialize all SWRL rules as OntoBricks SWRL text."""
+    from back.core.reasoning.swrl.SWRLTextCodec import serialize_rules
+
+    domain = get_domain(session_mgr)
+    return {"success": True, "text": serialize_rules(domain.swrl_rules)}
+
+
+@router.get("/swrl/export")
+async def export_swrl(session_mgr: SessionManager = Depends(get_session_manager)):
+    """Download SWRL rules as an OntoBricks SWRL text file."""
+    from fastapi.responses import Response
+    from back.core.reasoning.swrl.SWRLTextCodec import serialize_rules
+
+    domain = get_domain(session_mgr)
+    text = serialize_rules(domain.swrl_rules)
+    export_name = (
+        domain._data["domain"].get("info", {}).get("name", DEFAULT_GRAPH_NAME)
+    )
+    filename = f"{export_name}_swrl_rules.swrl"
+    return Response(
+        content=text,
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/swrl/import")
+async def import_swrl(
+    request: Request, session_mgr: SessionManager = Depends(get_session_manager)
+):
+    """Import SWRL rules from OntoBricks SWRL text (always append)."""
+    from back.core.reasoning.swrl.SWRLTextCodec import parse_rules
+
+    with map_route_errors("SWRL import failed", logger):
+        data = await request.json()
+        text = data.get("text", "")
+        if not text or not str(text).strip():
+            raise ValidationError("No SWRL text provided")
+        try:
+            imported = parse_rules(text)
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
+        if not imported:
+            raise ValidationError("No valid SWRL rules found in the provided text")
+        for rule in imported:
+            errors = Ontology.validate_swrl_rule(rule)
+            if errors:
+                raise ValidationError(
+                    f"Invalid rule '{rule.get('name', '')}': {'; '.join(errors)}"
+                )
+        domain = get_domain(session_mgr)
+        rules = list(domain.swrl_rules)
+        rules.extend(imported)
+        domain.swrl_rules = rules
+        names = [r.get("name", "") for r in imported if isinstance(r, dict)]
+        domain.record_change(
+            "swrl_added",
+            entity_type="swrl",
+            entity_ref=f"{len(imported)} imported",
+            summary=f"Imported {len(imported)} SWRL rule(s)",
+            meta=domain.diff_meta({}, {"name": ", ".join(n for n in names if n)}),
+        )
+        domain.save()
+        return {
+            "success": True,
+            "message": f"Imported {len(imported)} rules",
+            "rules": rules,
+            "imported_count": len(imported),
+        }
 
 
 # ===========================================
@@ -629,12 +1074,20 @@ async def save_rule(
         domain = get_domain(session_mgr)
         rules = list((domain.ontology or {}).get(key, []))
 
-        if 0 <= index < len(rules):
+        is_update = 0 <= index < len(rules)
+        old = dict(rules[index]) if is_update else {}
+        if is_update:
             rules[index] = rule
         else:
             rules.append(rule)
 
         domain._data["ontology"][key] = rules
+        domain.record_change(
+            f"{key}_updated" if is_update else f"{key}_added",
+            entity_type=key, entity_ref=rule.get("name", ""),
+            summary=rule.get("name", ""),
+            meta=domain.diff_meta(old, rule),
+        )
         domain.save()
         return {"success": True, "message": "Rule saved", "rules": rules}
 
@@ -659,8 +1112,15 @@ async def delete_rule(
         if not (0 <= index < len(rules)):
             raise ValidationError("Invalid rule index")
 
+        removed = dict(rules[index]) if isinstance(rules[index], dict) else {}
         rules.pop(index)
         domain._data["ontology"][key] = rules
+        domain.record_change(
+            f"{key}_removed",
+            entity_type=key, entity_ref=removed.get("name", ""),
+            summary=removed.get("name", ""),
+            meta=domain.diff_meta(removed, {}),
+        )
         domain.save()
         return {"success": True, "message": "Rule deleted", "rules": rules}
 
@@ -699,6 +1159,293 @@ async def validate_rule(rule_type: str, request: Request):
 
 
 # ===========================================
+# Business Rules — Auto-generate via Agent
+# ===========================================
+
+# Maps each rule list to its engine validator. SWRL is validated via Ontology.
+_RULE_VALIDATORS_KEYS = ("swrl_rules", "decision_tables", "sparql_rules", "aggregate_rules")
+
+
+def _ontology_name_sets(domain) -> tuple:
+    """Return (class_names, property_names) as lowercased local-name sets.
+
+    Used to verify that generated rules only reference entities/relationships
+    that actually exist in the ontology. Property names include both object
+    properties (relationships) and datatype properties (class attributes).
+    """
+    class_names: set = set()
+    property_names: set = set()
+    for cls in domain.get_classes():
+        name = cls.get("name") or cls.get("localName")
+        if name:
+            class_names.add(name.lower())
+        for dp in cls.get("dataProperties", []) or []:
+            dp_name = dp.get("name") or dp.get("localName")
+            if dp_name:
+                property_names.add(dp_name.lower())
+    for prop in domain.get_properties():
+        name = prop.get("name") or prop.get("localName")
+        if name:
+            property_names.add(name.lower())
+    return class_names, property_names
+
+
+def _validate_business_rule(
+    key: str, rule: dict, class_names: set = None, property_names: set = None
+) -> list:
+    """Return validation errors for *rule* of the given list *key* (empty = valid).
+
+    When ``class_names`` / ``property_names`` are supplied, the rule is also
+    checked so it only references entities/relationships present in the ontology
+    (derived consequent subtypes / result classes / output columns excepted).
+    """
+    if key == "swrl_rules":
+        errors = Ontology.validate_swrl_rule(rule)
+    elif key == "decision_tables":
+        from back.core.reasoning import DecisionTableEngine
+
+        errors = DecisionTableEngine.validate_table(rule)
+    elif key == "sparql_rules":
+        from back.core.reasoning import SPARQLRuleEngine
+
+        errors = SPARQLRuleEngine.validate_rule(rule)
+    elif key == "aggregate_rules":
+        from back.core.reasoning import AggregateRuleEngine
+
+        errors = AggregateRuleEngine.validate_rule(rule)
+    else:
+        return [f"Unknown rule type: {key}"]
+
+    if class_names is not None and property_names is not None:
+        errors = errors + Ontology.rule_reference_errors(
+            key, rule, class_names, property_names
+        )
+    return errors
+
+
+def _norm_ws(value) -> str:
+    """Canonicalise a rule string for duplicate detection.
+
+    Collapses whitespace, normalises the SWRL conjunction glyph, and removes
+    spacing around commas so cosmetic formatting differences don't defeat the
+    duplicate check.
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip().lower().replace("\u2227", "^")
+    return re.sub(r"\s*,\s*", ",", text)
+
+
+def _rule_signature(key: str, rule: dict) -> tuple:
+    """Content identity for a rule, used to skip duplicates on accept.
+
+    Two rules with the same logical content collide even if named
+    differently, so re-accepting an already-stored suggestion is a no-op.
+    """
+    if key == "swrl_rules":
+        return ("swrl", _norm_ws(rule.get("antecedent")), _norm_ws(rule.get("consequent")))
+    if key == "sparql_rules":
+        return ("sparql", _norm_ws(rule.get("query")))
+    if key == "decision_tables":
+        cols = tuple(
+            str((c or {}).get("property", "")).lower()
+            for c in rule.get("input_columns") or []
+        )
+        out = str((rule.get("output_column") or {}).get("property", "")).lower()
+        rows = json.dumps(rule.get("rows") or [], sort_keys=True, default=str)
+        return ("dt", str(rule.get("target_class", "")).lower(), cols, out, rows)
+    if key == "aggregate_rules":
+        fields = (
+            "target_class",
+            "group_by_property",
+            "aggregate_property",
+            "aggregate_function",
+            "operator",
+            "threshold",
+            "result_class",
+        )
+        return ("agg",) + tuple(str(rule.get(f, "")).lower() for f in fields)
+    return ("raw", json.dumps(rule, sort_keys=True, default=str))
+
+
+@router.post("/business-rules/generate-async")
+async def generate_business_rules_async(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Start business-rules generation via ``agent_business_rules_generator``.
+
+    Proposes SWRL, decision-table, SPARQL, and aggregate rules from the live
+    ontology design and the domain's uploaded documents. Poll
+    ``GET /tasks/{task_id}`` for ``result`` containing the four candidate
+    rule lists; the user reviews and accepts them via
+    ``POST /ontology/business-rules/accept-suggestions``.
+    """
+    import threading
+
+    data = await request.json()
+    guidelines = data.get("guidelines", "")
+    options = data.get("options", {})
+    documents = data.get("documents", [])
+
+    domain = get_domain(session_mgr)
+    host, token, llm_endpoint, llm_endpoint_kind = require_domain_llm(
+        domain, settings
+    )
+    warehouse_id = resolve_warehouse_id(domain, settings)
+
+    tm = get_task_manager()
+    task = tm.create_task(
+        name="Generate Business Rules",
+        task_type="business_rules_generation",
+        steps=[
+            {"name": "init", "description": "Initializing agent"},
+            {"name": "gather", "description": "Gathering ontology design & documents"},
+            {"name": "generate", "description": "Proposing business rules with AI"},
+            {"name": "finalize", "description": "Finalizing"},
+        ],
+    )
+
+    def run_generation():
+        try:
+            tm.start_task(task.id, "Starting agent…")
+
+            def on_step(msg: str):
+                tm.update_progress(task.id, task.progress, msg)
+
+            agent_result = Ontology(domain).generate_rules_with_agent(
+                host=host,
+                token=token,
+                endpoint_name=llm_endpoint,
+                options=options,
+                guidelines=guidelines,
+                selected_docs=documents,
+                warehouse_id=warehouse_id,
+                on_step=on_step,
+            )
+
+            if not agent_result.success:
+                tm.fail_task(
+                    task.id, agent_result.error or "Agent did not produce output"
+                )
+                return
+
+            tm.advance_step(task.id, "Finalizing…")
+            tm.complete_task(
+                task.id,
+                result={
+                    "swrl_rules": agent_result.swrl_rules,
+                    "decision_tables": agent_result.decision_tables,
+                    "sparql_rules": agent_result.sparql_rules,
+                    "aggregate_rules": agent_result.aggregate_rules,
+                    "agent_steps": serialize_agent_steps(agent_result.steps),
+                    "agent_iterations": agent_result.iterations,
+                    "agent_usage": agent_result.usage,
+                },
+                message=(
+                    f"Proposed {agent_result.total_rules()} rule(s): "
+                    f"{len(agent_result.swrl_rules)} SWRL, "
+                    f"{len(agent_result.decision_tables)} decision table(s), "
+                    f"{len(agent_result.sparql_rules)} SPARQL, "
+                    f"{len(agent_result.aggregate_rules)} aggregate"
+                ),
+            )
+        except Exception as e:
+            logger.exception("Business rules async generation failed: %s", e)
+            tm.fail_task(task.id, "Business rules generation failed unexpectedly")
+
+    thread = threading.Thread(target=run_generation, daemon=True)
+    thread.start()
+
+    return {"success": True, "task_id": task.id, "message": "Agent task started"}
+
+
+@router.post("/business-rules/accept-suggestions")
+async def accept_business_rules_suggestions(
+    request: Request, session_mgr: SessionManager = Depends(get_session_manager)
+):
+    """Validate and persist the rules the user selected from the suggestions.
+
+    Body: ``{ swrl_rules: [...], decision_tables: [...], sparql_rules: [...],
+    aggregate_rules: [...] }``. Each rule is validated with its engine
+    validator; valid rules are appended to the session and saved. Invalid
+    rules are reported back (with reasons) and skipped.
+    """
+    with map_route_errors("Accepting business rule suggestions failed", logger):
+        data = await request.json()
+        domain = get_domain(session_mgr)
+
+        added: dict[str, int] = {}
+        rejected: list = []
+        duplicates: list = []
+        dirty = False
+        class_names, property_names = _ontology_name_sets(domain)
+
+        for key in _RULE_VALIDATORS_KEYS:
+            candidates = data.get(key, [])
+            if not isinstance(candidates, list) or not candidates:
+                continue
+
+            if key == "swrl_rules":
+                existing = domain.swrl_rules
+            else:
+                existing = list((domain.ontology or {}).get(key, []))
+
+            # Identity of rules already stored, so we never persist a duplicate.
+            seen = {_rule_signature(key, r) for r in existing if isinstance(r, dict)}
+
+            count = 0
+            for rule in candidates:
+                if not isinstance(rule, dict):
+                    continue
+                errors = _validate_business_rule(
+                    key, rule, class_names, property_names
+                )
+                if errors:
+                    rejected.append(
+                        {
+                            "type": key,
+                            "name": rule.get("name", "(unnamed)"),
+                            "errors": [str(e) for e in errors],
+                        }
+                    )
+                    continue
+                sig = _rule_signature(key, rule)
+                if sig in seen:
+                    duplicates.append(
+                        {"type": key, "name": rule.get("name", "(unnamed)")}
+                    )
+                    continue
+                rule.setdefault("enabled", True)
+                existing.append(rule)
+                seen.add(sig)
+                count += 1
+
+            if count:
+                dirty = True
+                added[key] = count
+                if key == "swrl_rules":
+                    domain.swrl_rules = existing
+                else:
+                    domain._data["ontology"][key] = existing
+
+        if dirty:
+            domain.save()
+
+        return {
+            "success": True,
+            "added": added,
+            "added_total": sum(added.values()),
+            "rejected": rejected,
+            "duplicates": duplicates,
+            "duplicates_total": len(duplicates),
+            "swrl_rules": domain.swrl_rules,
+            "decision_tables": (domain.ontology or {}).get("decision_tables", []),
+            "sparql_rules": (domain.ontology or {}).get("sparql_rules", []),
+            "aggregate_rules": (domain.ontology or {}).get("aggregate_rules", []),
+        }
+
+
+# ===========================================
 # Axioms Management
 # ===========================================
 
@@ -733,7 +1480,10 @@ async def save_axiom(
         else:
             items = domain.axioms
 
-        if 0 <= index < len(items):
+        kind = "expression" if collection == "expressions" else "axiom"
+        is_update = 0 <= index < len(items)
+        old = dict(items[index]) if is_update else {}
+        if is_update:
             items[index] = axiom
         else:
             items.append(axiom)
@@ -742,6 +1492,12 @@ async def save_axiom(
             domain.expressions = items
         else:
             domain.axioms = items
+        _ref = axiom.get("subject") or axiom.get("type") or kind
+        domain.record_change(
+            f"{kind}_updated" if is_update else f"{kind}_added",
+            entity_type=kind, entity_ref=_ref, summary=_ref,
+            meta=domain.diff_meta(old, axiom),
+        )
         domain.save()
         return {
             "success": True,
@@ -773,11 +1529,19 @@ async def delete_axiom(
         if not (0 <= index < len(items)):
             raise ValidationError("Invalid axiom index")
 
+        kind = "expression" if collection == "expressions" else "axiom"
+        removed = dict(items[index]) if isinstance(items[index], dict) else {}
         items.pop(index)
         if collection == "expressions":
             domain.expressions = items
         else:
             domain.axioms = items
+        _ref = removed.get("subject") or removed.get("type") or kind
+        domain.record_change(
+            f"{kind}_removed",
+            entity_type=kind, entity_ref=_ref, summary=_ref,
+            meta=domain.diff_meta(removed, {}),
+        )
         domain.save()
         return {
             "success": True,
@@ -1014,6 +1778,69 @@ async def list_bridge_domain_classes(
 
 
 # ===========================================
+# Entity import (Studio "Import entity")
+# ===========================================
+
+
+async def _load_source_ontology(domain, settings, domain_name: str):
+    """Latest-version ontology of *domain_name*; refuses the current domain."""
+    from back.objects.registry import RegistryService
+    from back.core.helpers import run_blocking
+
+    current = {
+        (domain.info.get("name") or "").strip().lower(),
+        (domain.domain_folder or "").strip().lower(),
+    }
+    if domain_name.strip().lower() in current:
+        raise ValidationError("Cannot import entities from the current domain")
+    svc = RegistryService.from_context(domain, settings)
+    ok, data, version, msg = await run_blocking(svc.load_latest_domain_data, domain_name)
+    if not ok:
+        raise InfrastructureError("Loading source domain ontology failed", detail=msg)
+    return svc._extract_latest_ontology(data), version
+
+
+@router.get("/entity-import/domains/{domain_name}/catalog")
+async def entity_import_catalog(
+    domain_name: str,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Entities and relationships of another domain, flagged against the current one."""
+    with map_route_errors("Loading entity import catalog failed", logger):
+        from back.objects.ontology import EntityImport
+
+        domain = get_domain(session_mgr)
+        source, version = await _load_source_ontology(domain, settings, domain_name)
+        catalog = EntityImport.build_catalog(source, domain.ontology)
+        return {"success": True, "domain": domain_name, "version": version, **catalog}
+
+
+@router.post("/entity-import")
+async def entity_import(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Copy selected entities (and their relationships) from another domain."""
+    with map_route_errors("Entity import failed", logger):
+        data = await request.json()
+        domain_name = (data.get("domain") or "").strip()
+        names = [n for n in data.get("entities") or [] if isinstance(n, str) and n]
+        if not domain_name or not names:
+            raise ValidationError("A source domain and at least one entity are required")
+        domain = get_domain(session_mgr)
+        source, version = await _load_source_ontology(domain, settings, domain_name)
+        return Ontology(domain).import_entities_from_domain(
+            source,
+            names,
+            data.get("renames") or {},
+            source_domain=domain_name,
+            source_version=version,
+        )
+
+
+# ===========================================
 # OWL File Operations (Unity Catalog)
 # ===========================================
 
@@ -1125,15 +1952,54 @@ async def get_wizard_templates():
 
 
 @router.post("/wizard/generate-async")
-async def generate_ontology_async(
+async def generate_ontology_async():
+    """Removed: legacy one-shot ontology generation.
+
+    This route used to drive ``agent_owl_generator``'s deprecated
+    ``run_agent`` bridge in one unattended call, including a post-generation
+    pitfall-rewrite loop. Per the three-stage Generate design
+    (``docs/superpowers/specs/2026-09-20-three-stage-ontology-generate-design.md``),
+    there is no one-shot Generate path anymore — this route always returns
+    ``410 Gone`` and never runs generation. Use the staged workflow instead:
+
+    * ``POST /ontology/wizard/generate/detect`` — Stage 1 (detect candidates)
+    * ``GET /ontology/wizard/generate/draft`` — Stage 2 (read the draft)
+    * ``POST /ontology/wizard/generate/draft/update`` — Stage 2 (edit/include/exclude)
+    * ``POST /ontology/wizard/generate/draft/discard`` — Stage 2 (discard)
+    * ``POST /ontology/wizard/generate/complete`` — Stage 3 (complete + merge)
+    """
+    raise GoneError(
+        "This one-shot Generate route has been removed. Use the staged "
+        "workflow: POST /ontology/wizard/generate/detect, "
+        "GET/POST /ontology/wizard/generate/draft(/update|/discard), "
+        "POST /ontology/wizard/generate/complete."
+    )
+
+
+# ===========================================
+# Wizard — staged Generate (three-stage workflow: detect -> review -> complete)
+# ===========================================
+
+
+# Pause between publishing each detected label on the running task so the
+# Generate overlay can render entities one by one before the task completes
+# (unit tests set this to 0).
+_DETECT_ENTITY_REVEAL_PAUSE_S = 0.3
+
+
+@router.post("/wizard/generate/detect")
+async def start_generate_detection(
     request: Request,
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    """Start ontology generation via ``agent_owl_generator`` (background task).
+    """Stage 1: detect candidate entities (background task).
 
-    Poll ``GET /tasks/{task_id}`` for ``owl_content``, ``stats``, and agent trace fields.
-    There is no synchronous generate endpoint; this is the only LLM wizard entry point.
+    Discards any prior Generate draft and persists a fresh one, paused for
+    review — ``included=true`` by default for every new candidate, existing
+    ontology entities carried over as locked anchors. Poll
+    ``GET /tasks/{task_id}`` for the ``draft`` result, or read it directly via
+    ``GET /wizard/generate/draft`` once the task completes.
     """
     import threading
 
@@ -1142,86 +2008,239 @@ async def generate_ontology_async(
     guidelines = data.get("guidelines", "")
     options = data.get("options", {})
     documents = data.get("documents", [])
+    tables = data.get("tables", [])
 
     tables_count = len(metadata.get("tables", []))
 
     domain = get_domain(session_mgr)
-    host, token, llm_endpoint = require_serving_llm(domain, settings)
+    host, token, llm_endpoint, _llm_endpoint_kind = require_domain_llm(
+        domain, settings
+    )
+    warehouse_id = resolve_warehouse_id(domain, settings)
 
     tm = get_task_manager()
     task = tm.create_task(
         name=(
-            f"Generate Ontology ({tables_count} tables)"
+            f"Detect Ontology Entities ({tables_count} tables)"
             if tables_count
-            else "Generate Ontology (guidelines only)"
+            else "Detect Ontology Entities (guidelines only)"
         ),
-        task_type="ontology_generation",
+        task_type="ontology_generate_detect",
         steps=[
             {"name": "init", "description": "Initializing agent"},
-            {
-                "name": "gather",
-                "description": "Gathering context (metadata & documents)",
-            },
-            {"name": "generate", "description": "Generating ontology with AI"},
-            {"name": "process", "description": "Processing results"},
-            {"name": "finalize", "description": "Finalizing"},
+            {"name": "detect", "description": "Detecting candidate entities"},
         ],
     )
 
-    def run_generation():
+    def run_detection_task():
         try:
-            tm.start_task(task.id, "Starting agent…")
+            tm.start_task(task.id, "Detecting candidate entities…")
 
             def on_step(msg: str):
                 tm.update_progress(task.id, task.progress, msg)
 
-            agent_result = Ontology(domain).generate_with_agent(
+            draft = GenerateWorkflow.run_detection(
+                domain,
+                settings,
                 host=host,
                 token=token,
                 endpoint_name=llm_endpoint,
                 metadata=metadata,
                 guidelines=guidelines,
                 options=options,
+                selected_tables=tables,
                 selected_docs=documents,
+                warehouse_id=warehouse_id,
                 on_step=on_step,
             )
-
-            if not agent_result.success:
-                tm.fail_task(
-                    task.id, agent_result.error or "Agent did not produce output"
-                )
-                return
-
-            tm.advance_step(task.id, "Processing results…")
-            owl_content, stats = Ontology.postprocess_generated_owl(
-                agent_result.owl_content
-            )
-
-            tm.advance_step(task.id, "Finalizing…")
+            found: list[str] = []
+            candidates = draft.candidate_entities or []
+            total = len(candidates)
+            for index, entity in enumerate(candidates):
+                label = entity.canonical_label
+                found.append(label)
+                tm.merge_result(task.id, {"detected_entities": list(found)})
+                progress = 40 + int(50 * ((index + 1) / total)) if total else 90
+                tm.update_progress(task.id, progress, f"Found {label}")
+                if _DETECT_ENTITY_REVEAL_PAUSE_S:
+                    time.sleep(_DETECT_ENTITY_REVEAL_PAUSE_S)
             tm.complete_task(
                 task.id,
                 result={
-                    "owl_content": owl_content,
-                    "stats": stats,
-                    "agent_steps": serialize_agent_steps(agent_result.steps),
-                    "agent_iterations": agent_result.iterations,
-                    "agent_usage": agent_result.usage,
+                    "draft": draft.to_dict(),
+                    "detected_entities": found,
                 },
-                message=(
-                    f"Generated {stats.get('classes', 0)} classes, "
-                    f"{stats.get('properties', 0)} properties "
-                    f"({agent_result.iterations} agent iterations)"
-                ),
+                message=f"Detected {len(draft.candidate_entities)} candidate entity(ies)",
             )
-
+        except OntoBricksError as exc:
+            tm.fail_task(task.id, exc.message)
         except Exception as e:
-            logger.exception("Wizard async: Ontology generation failed: %s", e)
-            tm.fail_task(task.id, "Ontology generation failed unexpectedly")
+            logger.exception("Generate detect task failed: %s", e)
+            tm.fail_task(task.id, "Entity detection failed unexpectedly")
 
-    thread = threading.Thread(target=run_generation, daemon=True)
+    thread = threading.Thread(target=run_detection_task, daemon=True)
     thread.start()
 
-    return {"success": True, "task_id": task.id, "message": "Agent task started"}
+    return {"success": True, "task_id": task.id, "message": "Detection task started"}
+
+
+@router.get("/wizard/generate/draft")
+async def get_generate_draft(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Stage 2: read the persisted Generate draft (synchronous, no LLM call).
+
+    Returns ``{"success": True, "draft": None}`` when no draft is persisted.
+    The draft payload includes a ``stale`` flag (recomputed source
+    fingerprint vs. the one captured at detection time).
+    """
+    domain = get_domain(session_mgr)
+    with map_route_errors("Loading Generate draft failed", logger):
+        view = GenerateWorkflow.get_draft_view(domain, settings)
+    return {"success": True, "draft": view}
+
+
+@router.post("/wizard/generate/draft/update")
+async def update_generate_draft(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+):
+    """Stage 2: apply one review mutation (synchronous, no LLM call).
+
+    Body: ``{"revision": int, "op": "add"|"remove"|"update"|"include"|"exclude",
+    "entity_id"?: str, "entity"?: dict, "updates"?: dict}``. ``revision`` must
+    match the currently-persisted draft revision (optimistic concurrency) —
+    a stale revision raises a 409 conflict. Existing (locked) anchors are
+    never editable through this route.
+    """
+    data = await request.json()
+    revision = data.get("revision")
+    op = data.get("op")
+    if revision is None or not op:
+        raise ValidationError("Both 'revision' and 'op' are required")
+
+    # Validate payload *shapes* at the route boundary — a malformed
+    # revision/entity/updates/entity_id must surface as a user-facing 400,
+    # never a raw TypeError/ValueError leaking through as a 500 (task 4
+    # review finding #7). Unknown *fields* inside an otherwise well-shaped
+    # ``updates``/``entity`` object are a separate concern already handled
+    # by ``GenerateWorkflow.update_draft`` (filtered, not rejected).
+    try:
+        revision = int(revision)
+    except (TypeError, ValueError):
+        raise ValidationError(f"'revision' must be an integer, got {revision!r}")
+
+    entity = data.get("entity")
+    if entity is not None and not isinstance(entity, dict):
+        raise ValidationError("'entity' must be a JSON object")
+    updates = data.get("updates")
+    if updates is not None and not isinstance(updates, dict):
+        raise ValidationError("'updates' must be a JSON object")
+    entity_id = data.get("entity_id")
+    if entity_id is not None and not isinstance(entity_id, str):
+        raise ValidationError("'entity_id' must be a string")
+
+    domain = get_domain(session_mgr)
+    with map_route_errors("Updating Generate draft failed", logger):
+        draft = GenerateWorkflow.update_draft(
+            domain,
+            revision=revision,
+            op=op,
+            entity=entity,
+            entity_id=entity_id,
+            updates=updates,
+        )
+    return {"success": True, "draft": draft.to_dict()}
+
+
+@router.post("/wizard/generate/draft/discard")
+async def discard_generate_draft(
+    session_mgr: SessionManager = Depends(get_session_manager),
+):
+    """Stage 2: discard the persisted Generate draft entirely."""
+    domain = get_domain(session_mgr)
+    with map_route_errors("Discarding Generate draft failed", logger):
+        GenerateWorkflow.discard_draft(domain)
+    return {"success": True, "message": "Draft discarded"}
+
+
+@router.post("/wizard/generate/complete")
+async def start_generate_completion(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Stage 3: complete (relations -> attributes -> axioms) and merge (background task).
+
+    Re-validates the draft's source fingerprint and rejects a stale draft.
+    Runs the three completion substages in strict order, persisting a
+    running/done/failed checkpoint around each; a retry after a partial
+    failure resumes at the first incomplete substage rather than re-running
+    already-``done`` ones. On success, appends the validated new entities to
+    the live ontology (append-only — existing entities/content are never
+    deleted or renamed). Poll ``GET /tasks/{task_id}`` for the final
+    ``draft`` + ``merge`` stats result.
+    """
+    import threading
+
+    data = await request.json()
+    options = data.get("options", {})
+
+    domain = get_domain(session_mgr)
+    host, token, llm_endpoint, _llm_endpoint_kind = require_domain_llm(
+        domain, settings
+    )
+
+    tm = get_task_manager()
+    task = tm.create_task(
+        name="Complete Ontology Generate",
+        task_type="ontology_generate_complete",
+        steps=[
+            {"name": "relations", "description": "Inferring relations"},
+            {"name": "attributes", "description": "Inferring attributes"},
+            {"name": "axioms", "description": "Inferring axioms"},
+            {"name": "merge", "description": "Merging into ontology"},
+        ],
+    )
+
+    def run_completion_task():
+        try:
+            tm.start_task(task.id, "Completing ontology Generate…")
+
+            def on_step(msg: str):
+                tm.update_progress(task.id, task.progress, msg)
+
+            outcome = GenerateWorkflow.run_completion(
+                domain,
+                settings,
+                host=host,
+                token=token,
+                endpoint_name=llm_endpoint,
+                options=options,
+                on_step=on_step,
+            )
+            merge_stats = outcome["merge"]
+            tm.complete_task(
+                task.id,
+                result=outcome,
+                message=(
+                    f"Merged {merge_stats['classes_added']} classes, "
+                    f"{merge_stats['relations_added']} relations, "
+                    f"{merge_stats['attributes_added']} attributes, "
+                    f"{merge_stats['axioms_added']} axioms"
+                ),
+            )
+        except OntoBricksError as exc:
+            tm.fail_task(task.id, exc.message)
+        except Exception as e:
+            logger.exception("Generate completion task failed: %s", e)
+            tm.fail_task(task.id, "Ontology completion failed unexpectedly")
+
+    thread = threading.Thread(target=run_completion_task, daemon=True)
+    thread.start()
+
+    return {"success": True, "task_id": task.id, "message": "Completion task started"}
 
 
 # ===========================================
@@ -1251,7 +2270,9 @@ async def auto_assign_icons(
         raise ValidationError("No entity names provided")
 
     domain = get_domain(session_mgr)
-    host, token, llm_endpoint = require_serving_llm(domain, settings)
+    host, token, llm_endpoint, _llm_endpoint_kind = require_domain_llm(
+        domain, settings
+    )
 
     tm = get_task_manager()
     task = tm.create_task(
@@ -1352,13 +2373,15 @@ async def ontology_assistant_chat(
 ):
     """Process a single chat turn with the ontology assistant agent.
 
-    Expects JSON body:
+    Expects a JSON body::
+
         {
             "message": "Remove the entity Customer",
             "history": [...]   // optional prior conversation messages
         }
 
-    Returns:
+    and responds with::
+
         {
             "success": true/false,
             "reply": "...",
@@ -1376,7 +2399,9 @@ async def ontology_assistant_chat(
         raise ValidationError("No message provided")
 
     domain = get_domain(session_mgr)
-    host, token, llm_endpoint = require_serving_llm(domain, settings)
+    host, token, llm_endpoint, llm_endpoint_kind = require_domain_llm(
+        domain, settings
+    )
 
     classes = list(domain.get_classes())
     properties = list(domain.get_properties())
@@ -1395,6 +2420,7 @@ async def ontology_assistant_chat(
             host=host,
             token=token,
             endpoint_name=llm_endpoint,
+            endpoint_kind=llm_endpoint_kind,
             classes=classes,
             properties=properties,
             base_uri=base_uri,
@@ -1444,8 +2470,8 @@ async def ontology_assistant_invoke(
     """Invoke the Ontology Assistant via the MLflow ResponsesAgent interface.
 
     Accepts the OpenAI Responses-compatible schema used by the Databricks
-    Agent Framework.  The caller can either supply Databricks credentials in
-    ``custom_inputs`` or let the route fill them from the active session.
+    Agent Framework. The route injects the saved domain LLM target and fills
+    authoritative Databricks credentials from the active session.
 
     Expects JSON body (ResponsesAgentRequest)::
 
@@ -1453,11 +2479,7 @@ async def ontology_assistant_invoke(
             "input": [
                 {"role": "user", "content": "Add an entity called Vehicle"}
             ],
-            "custom_inputs": {          // optional overrides
-                "host": "...",
-                "token": "...",
-                "endpoint_name": "..."
-            }
+            "custom_inputs": {}         // optional non-credential context
         }
 
     Returns a ``ResponsesAgentResponse`` with ``custom_outputs`` containing
@@ -1469,23 +2491,20 @@ async def ontology_assistant_invoke(
     data = await request.json()
 
     domain = get_domain(session_mgr)
-    host, token = get_databricks_host_and_token(domain, settings)
-    llm_endpoint = domain.info.get("llm_endpoint", "")
+    host, token, llm_endpoint, llm_endpoint_kind = require_domain_llm(
+        domain, settings
+    )
     base_uri = domain.ontology.get("base_uri") or DEFAULT_BASE_URI
 
     custom_inputs = data.get("custom_inputs", {})
-    custom_inputs.setdefault("host", host)
-    custom_inputs.setdefault("token", token)
-    custom_inputs.setdefault("endpoint_name", llm_endpoint)
+    custom_inputs["host"] = host
+    custom_inputs["token"] = token
+    custom_inputs["endpoint_name"] = llm_endpoint
+    custom_inputs["endpoint_kind"] = llm_endpoint_kind
     custom_inputs.setdefault("base_uri", base_uri)
     custom_inputs.setdefault("classes", list(domain.get_classes()))
     custom_inputs.setdefault("properties", list(domain.get_properties()))
     data["custom_inputs"] = custom_inputs
-
-    if not custom_inputs.get("host") or not custom_inputs.get("token"):
-        raise ValidationError("Databricks credentials not configured")
-    if not custom_inputs.get("endpoint_name"):
-        raise ValidationError("No LLM serving endpoint configured.")
 
     with map_route_errors("Ontology assistant invoke failed", logger):
         agent = OntologyAssistantResponsesAgent()
@@ -1516,12 +2535,10 @@ async def get_pitfalls_taxonomy():
     svc = PitfallsService()
     taxonomy = svc.get_taxonomy()
     if not taxonomy:
-        return {
-            "success": False,
-            "error": "Pitfall detection dependencies not installed. Run: pip install .[pitfalls]",
-            "taxonomy": [],
-            "available_patterns": [],
-        }
+        raise InfrastructureError(
+            "Pitfall detection unavailable",
+            detail="Pitfall detection dependencies not installed. Run: pip install .[pitfalls]",
+        )
     return {
         "success": True,
         "taxonomy": taxonomy,
@@ -1588,10 +2605,17 @@ async def analyze_pitfalls(
                 for r in result["results"].values()
                 if isinstance(r.get("count"), int)
             )
+
+            # Persist precision score to session so the domain home panel can display it.
+            precision_score = result.get("precision_score")
+            if precision_score is not None:
+                domain.precision_score = precision_score
+                domain.save()
+
             tm.complete_task(
                 task.id,
                 result=result,
-                message=f"Analysis complete — {total_issues} issues found across {len(result['selected_pitfalls'])} pitfalls",
+                message=f"Analysis complete — {total_issues} warning{'' if total_issues == 1 else 's'} found across {len(result['selected_pitfalls'])} pitfalls",
             )
 
         except ImportError as exc:
@@ -1618,8 +2642,7 @@ async def get_pitfalls_results(task_id: str):
     tm = get_task_manager()
     task = tm.get_task(task_id)
     if not task:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        raise NotFoundError(f"Task {task_id!r} not found")
 
     return {
         "task_id": task_id,

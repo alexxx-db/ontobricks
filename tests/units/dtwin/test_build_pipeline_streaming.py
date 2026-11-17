@@ -11,8 +11,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from back.core.triplestore.TripleStoreFactory import TripleStoreFactory
-from back.objects.digitaltwin._build_pipeline import _BuildPipeline
+from back.core.errors import InfrastructureError
+from back.core.graphdb.GraphDBFactory import GraphDBFactory
+from back.objects.digitaltwin.build._build_pipeline import (
+    _BuildPipeline,
+    collect_domain_stats,
+    step_times_from_task,
+)
 
 
 def _bare_pipeline(**overrides):
@@ -21,6 +26,7 @@ def _bare_pipeline(**overrides):
     pipe.task_id = "t-test"
     pipe.graph_name = "G_V1"
     pipe.view_table = "cat.sch.v_g"
+    pipe.parts = pipe.view_table.split(".")
     pipe.source_client = MagicMock()
     pipe.store = MagicMock()
     pipe.tm = MagicMock()
@@ -131,6 +137,32 @@ class TestFullRebuildProgressMessage:
         assert any("Written 15000/15000 triples" in m for m in msgs), msgs
         assert not any("Written 4500/4500" in m for m in msgs), msgs
 
+    def test_full_rebuild_rebuilds_adjacency_for_postgres_store(self):
+        pipe = self._full_pipe(view_total=10)
+        pipe.store.supports_adjacency = True
+        pipe.store.sql_flavor.return_value = "postgres"
+        pipe.store.rebuild_adjacency = MagicMock()
+        pipe.store.optimize_table = MagicMock()
+
+        ok = pipe._apply_full_rebuild()
+
+        assert ok is True
+        pipe.store.optimize_table.assert_called_once_with(pipe.graph_name)
+        pipe.store.rebuild_adjacency.assert_called_once_with(pipe.graph_name)
+
+    def test_full_rebuild_skips_adjacency_for_non_postgres_flavor(self):
+        pipe = self._full_pipe(view_total=10)
+        pipe.store.supports_adjacency = True
+        pipe.store.sql_flavor.return_value = "spark"
+        pipe.store.rebuild_adjacency = MagicMock()
+        pipe.store.optimize_table = MagicMock()
+
+        ok = pipe._apply_full_rebuild()
+
+        assert ok is True
+        pipe.store.optimize_table.assert_called_once_with(pipe.graph_name)
+        pipe.store.rebuild_adjacency.assert_not_called()
+
 
 # ---------------------------------------------------------------
 # Lakebase managed-synced apply path
@@ -161,11 +193,31 @@ class TestApplyViaSyncedPipeline:
         pipe.store.ensure_synced_union_view = MagicMock()
         pipe.store.truncate_companion = MagicMock()
         pipe._count_view_triples = MagicMock(return_value=1234)
+        pipe.spark_sql = "SELECT 's' AS subject, 'p' AS predicate, 'o' AS object"
+        pipe.source_client.create_or_replace_view.return_value = (True, "ok")
         pipe._mgr = mgr
         # _raise_if_cancelled calls tm.is_cancelled(); return False so cancel
         # checks don't abort the pipeline in unit tests.
         pipe.tm.is_cancelled.return_value = False
         return pipe
+
+    def test_a_failed_post_sync_count_does_not_fail_the_sync(self):
+        """The count after a successful sync only feeds the progress message."""
+        pipe = self._synced_pipe()
+        pipe._count_view_triples = MagicMock(
+            side_effect=InfrastructureError(
+                "Could not count the triples in cat.sch.v_g: "
+                "Error during request to server"
+            )
+        )
+
+        ok = pipe._apply_via_synced_pipeline()
+
+        assert ok is True
+        assert any(
+            "count unavailable" in str(call)
+            for call in pipe.tm.update_progress.call_args_list
+        )
 
     def test_synced_calls_ensure_trigger_and_truncate_companion(self):
         pipe = self._synced_pipe()
@@ -179,7 +231,7 @@ class TestApplyViaSyncedPipeline:
         assert ensure_kwargs["primary_key_columns"] == [
             "subject",
             "predicate",
-            "object",
+            "object_hash",
         ]
         assert ensure_kwargs["sync_mode"] == "snapshot"
         pipe.store.ensure_synced_companion.assert_called_once_with(pipe.graph_name)
@@ -205,6 +257,42 @@ class TestApplyViaSyncedPipeline:
         m.assert_called_once_with()
         pipe.source_client.iter_rows.assert_not_called()
 
+    def test_synced_pipeline_rebuilds_adjacency_for_postgres_store(self):
+        pipe = self._synced_pipe()
+        pipe.store.supports_adjacency = True
+        pipe.store.sql_flavor.return_value = "postgres"
+        pipe.store.rebuild_adjacency = MagicMock()
+
+        ok = pipe._apply_via_synced_pipeline()
+
+        assert ok is True
+        pipe.store.rebuild_adjacency.assert_called_once_with(pipe.graph_name)
+
+    def test_synced_pipeline_fails_when_adjacency_rebuild_fails(self):
+        pipe = self._synced_pipe()
+        pipe.store.supports_adjacency = True
+        pipe.store.sql_flavor.return_value = "postgres"
+        pipe.store.rebuild_adjacency.side_effect = RuntimeError("adj stale")
+
+        ok = pipe._apply_via_synced_pipeline()
+
+        assert ok is False
+        pipe.store.truncate_companion.assert_called_once_with(pipe.graph_name)
+        pipe.tm.fail_task.assert_called_once()
+        assert "adjacency" in pipe.tm.fail_task.call_args.args[1].lower()
+
+    def test_synced_pipeline_attempts_adjacency_even_when_truncate_fails(self):
+        pipe = self._synced_pipe()
+        pipe.store.supports_adjacency = True
+        pipe.store.sql_flavor.return_value = "postgres"
+        pipe.store.truncate_companion.side_effect = RuntimeError("truncate failed")
+        pipe.store.rebuild_adjacency = MagicMock()
+
+        ok = pipe._apply_via_synced_pipeline()
+
+        assert ok is True
+        pipe.store.rebuild_adjacency.assert_called_once_with(pipe.graph_name)
+
 
 class TestResolveLakebaseMode:
     """Mode resolution must run before the store is opened."""
@@ -213,8 +301,8 @@ class TestResolveLakebaseMode:
         pipe = _bare_pipeline()
 
         with (
-            patch.object(TripleStoreFactory, "_resolve_graph_engine", return_value="lakebase"),
-            patch.object(TripleStoreFactory, "_resolve_graph_engine_config", return_value={"sync_mode": "managed_synced"}),
+            patch.object(GraphDBFactory, "_resolve_graph_engine", return_value="lakebase"),
+            patch.object(GraphDBFactory, "_resolve_graph_engine_config", return_value={"sync_mode": "managed_synced"}),
         ):
             pipe._resolve_lakebase_mode()
 
@@ -225,8 +313,8 @@ class TestResolveLakebaseMode:
         pipe = _bare_pipeline()
 
         with (
-            patch.object(TripleStoreFactory, "_resolve_graph_engine", return_value="lakebase"),
-            patch.object(TripleStoreFactory, "_resolve_graph_engine_config", return_value={}),
+            patch.object(GraphDBFactory, "_resolve_graph_engine", return_value="lakebase"),
+            patch.object(GraphDBFactory, "_resolve_graph_engine_config", return_value={}),
         ):
             pipe._resolve_lakebase_mode()
 
@@ -237,9 +325,132 @@ class TestResolveLakebaseMode:
         pipe = _bare_pipeline()
 
         with (
-            patch.object(TripleStoreFactory, "_resolve_graph_engine", return_value="other"),
-            patch.object(TripleStoreFactory, "_resolve_graph_engine_config", return_value={"sync_mode": "managed_synced"}),
+            patch.object(GraphDBFactory, "_resolve_graph_engine", return_value="other"),
+            patch.object(GraphDBFactory, "_resolve_graph_engine_config", return_value={"sync_mode": "managed_synced"}),
         ):
             pipe._resolve_lakebase_mode()
 
         assert pipe._is_lakebase_synced is False
+
+
+class TestLakeflowViewWrap:
+    """VIEW DDL must expose object_hash whenever the graph store is managed_synced."""
+
+    def test_wrap_follows_opened_store_when_mode_resolution_missed(self):
+        pipe = _bare_pipeline(_is_lakebase_synced=False)
+        pipe.spark_sql = "SELECT 's' AS subject, 'p' AS predicate, 'o' AS object"
+        pipe.store.is_synced = True
+
+        pipe._sync_flags_from_store()
+
+        assert pipe._is_lakebase_synced is True
+        assert pipe._wrap_view_sql_for_lakeflow() is True
+        wrapped = pipe._view_sql_for_build()
+        assert "object_hash" in wrapped
+
+    def test_ensure_lakeflow_source_view_refreshes_view(self):
+        pipe = _bare_pipeline(_is_lakebase_synced=True)
+        pipe.spark_sql = "SELECT 's' AS subject, 'p' AS predicate, 'o' AS object"
+        pipe.parts = ("cat", "sch", "v_g")
+        pipe.store.is_synced = True
+        pipe.source_client.create_or_replace_view.return_value = (True, "ok")
+
+        assert pipe._ensure_lakeflow_source_view() is True
+
+        args = pipe.source_client.create_or_replace_view.call_args.args
+        assert args[:3] == ("cat", "sch", "v_g")
+        assert "object_hash" in args[3]
+
+
+class TestCollectDomainStats:
+    """Ontology + mapping stat block recorded with a build run."""
+
+    def test_counts_ontology_and_mapping(self):
+        ontology = {
+            "classes": [{"uri": "C1"}, {"uri": "C2"}],
+            "properties": [
+                {"type": "ObjectProperty"},
+                {"type": "ObjectProperty"},
+                {"type": "DatatypeProperty"},
+            ],
+            "constraints": [{"x": 1}],
+        }
+        assignment = {
+            "entities": [{"excluded": False}, {"excluded": True}],
+            "relationships": [{"excluded": False}],
+        }
+        stats = collect_domain_stats(
+            ontology, assignment, swrl_rules=[{"r": 1}], axioms=[], shacl_shapes=[{}]
+        )
+
+        assert stats["ontology"] == {
+            "classes": 2,
+            "properties": 3,
+            "object_properties": 2,
+            "attributes": 1,
+            "constraints": 1,
+            "swrl_rules": 1,
+            "axioms": 0,
+            "shacl_shapes": 1,
+        }
+        assert stats["mapping"]["entity_mappings"] == 2
+        assert stats["mapping"]["excluded_entities"] == 1
+        assert stats["mapping"]["active_entity_mappings"] == 1
+        assert stats["mapping"]["relationship_mappings"] == 1
+        assert stats["mapping"]["active_relationship_mappings"] == 1
+
+    def test_empty_inputs_yield_zeros(self):
+        stats = collect_domain_stats(None, None)
+        assert stats["ontology"]["classes"] == 0
+        assert stats["mapping"]["entity_mappings"] == 0
+
+    def test_legacy_assignment_keys(self):
+        assignment = {
+            "data_source_mappings": [{"excluded": False}],
+            "relationship_mappings": [{"excluded": False}, {"excluded": False}],
+        }
+        stats = collect_domain_stats({}, assignment)
+        assert stats["mapping"]["entity_mappings"] == 1
+        assert stats["mapping"]["relationship_mappings"] == 2
+
+
+class TestStepTimesFromTask:
+    """phase_times mirrors the UI build log (step description -> duration)."""
+
+    def test_computes_per_step_durations(self):
+        steps = [
+            SimpleNamespace(
+                name="prepare",
+                description="Generating SQL",
+                status="completed",
+                started_at="2026-06-03T08:00:00+00:00",
+                completed_at="2026-06-03T08:00:02+00:00",
+            ),
+            SimpleNamespace(
+                name="graph",
+                description="Populating graph",
+                status="completed",
+                started_at="2026-06-03T08:00:02+00:00",
+                completed_at="2026-06-03T08:00:07.5+00:00",
+            ),
+        ]
+        task = SimpleNamespace(steps=steps)
+        out = step_times_from_task(task)
+        assert out == {"Generating SQL": 2.0, "Populating graph": 5.5}
+
+    def test_skips_steps_without_start(self):
+        steps = [
+            SimpleNamespace(
+                name="pending",
+                description="Not started",
+                status="pending",
+                started_at=None,
+                completed_at=None,
+            ),
+        ]
+        out = step_times_from_task(SimpleNamespace(steps=steps))
+        assert out == {}
+
+    def test_no_steps_returns_empty(self):
+        assert step_times_from_task(SimpleNamespace(steps=[])) == {}
+        assert step_times_from_task(None) == {}

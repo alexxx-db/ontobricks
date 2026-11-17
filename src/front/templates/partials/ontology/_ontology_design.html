@@ -1,8 +1,8 @@
 <!-- Ontology Visual Designer using OntoViz -->
 <div class="content-section">
     <div class="section-header d-flex justify-content-between align-items-center mb-4">
-        <div>
-            <h4 class="mb-1"><i class="bi bi-diagram-3 me-2"></i>Visual Ontology Designer - Business Views</h4>
+        <div class="me-auto">
+            <h4 class="mb-1"><i class="bi bi-yelp me-2"></i>Visual Ontology Designer - Business Views</h4>
             <p class="text-muted mb-0 small" id="designModeDescription">View your ontology visually. Click "Edit" to modify entities and relationships.</p>
         </div>
             <!-- View Selector and Mode Toggle -->
@@ -10,13 +10,12 @@
                 <!-- Edit/View Mode Toggle -->
                 <div class="btn-group btn-group-sm me-2" id="designModeToggle">
                     <button type="button" class="btn btn-outline-primary active" id="viewModeBtn" title="View Only - layout changes allowed">
-                        <i class="bi bi-eye me-1"></i>View
+                        <i class="bi bi-eye"></i>
                     </button>
                     <button type="button" class="btn btn-outline-primary" id="editModeBtn" title="Edit Mode - full editing">
-                        <i class="bi bi-pencil me-1"></i>Edit
+                        <i class="bi bi-pencil"></i>
                     </button>
                 </div>
-                <span class="text-muted">|</span>
                 <label class="text-muted small mb-0"><i class="bi bi-layers me-1"></i>Business View(s):</label>
                 <select id="designViewSelector" class="form-select form-select-sm ob-design-view-select">
                     <option value="default">default</option>
@@ -32,12 +31,27 @@
                         <i class="bi bi-trash"></i>
                     </button>
                 </div>
-                <span class="text-muted">|</span>
-                <button type="button" class="btn btn-sm btn-outline-warning" id="createGroupFromViewBtn"
-                        onclick="createGroupFromView()" title="Create a Knowledge Graph group from this view's entities">
+                <div class="btn-group btn-group-sm">
+                    <button type="button" class="btn btn-outline-secondary" id="newAssistantBtn"
+                            aria-label="New Assistant"
+                            title="New Assistant — build a Business View from selected entities and their ontology neighbours">
+                        <i class="bi bi-magic"></i>
+                    </button>
+                    <button type="button" class="btn btn-outline-secondary" id="toggleCollapseAllBtn"
+                            aria-label="Collapse all entities"
+                            title="Collapse all entities in this view">
+                        <i class="bi bi-arrows-collapse"></i>
+                    </button>
+                </div>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="createGroupFromViewBtn"
+                        onclick="createGroupFromView()" title="Create a Graph Viewer group from this view's entities">
                     <i class="bi bi-collection me-1"></i>Create Group
                 </button>
             </div>
+            <button type="button" class="btn btn-sm btn-outline-primary onto-discuss-btn ms-2"
+                    title="Open the ontology discussion" onclick="openOntologyDiscussion()">
+                <i class="bi bi-chat-dots"></i>
+            </button>
     </div>
     
     <!-- OntoViz Canvas Container - Full Height -->

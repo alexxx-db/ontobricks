@@ -7,7 +7,17 @@ let autoSaveTimeout = null;
 let isLoadingData = false;  // Flag to prevent auto-save during data loading
 let isViewOnlyMode = true;  // Default to view-only mode
 let layoutDirty = false;    // Track unsaved layout changes
+let ontologyDirty = false;  // Track ontology edits (attributes, relationships…) not yet in the session
+let registryDirty = false;  // Track changes not yet persisted to the registry
+let unloadOntologyFlushed = false;  // The ontology beacon owns the session write on this unload
 let ontologyVersionAtLoad = null;  // Track ontology version when design was last loaded
+// True only when the canvas was built with the ontology as the authoritative
+// content source (merge / from-OntologyState branches). False when it was built
+// from a saved design-layout view alone (ontology not yet loaded): in that case
+// the canvas is a stale visual and MUST NOT be serialised back to the session,
+// or it resurrects removed attributes/relationships/parents. See
+// loadOntologyIntoDesigner and syncDesignToOntology.
+let designerContentAuthoritative = false;
 
 /**
  * Resolve an entity name (from a property's domain/range) to an ID in the entity map.
@@ -53,7 +63,7 @@ function setDesignerViewMode(viewOnly) {
         if (viewOnly) {
             descEl.textContent = 'View your ontology visually. Click "Edit" to modify entities and relationships.';
         } else {
-            descEl.textContent = 'Design your ontology by creating entities (classes) and relationships (properties) visually. Changes are saved automatically.';
+            descEl.textContent = 'Design your ontology by creating entities and relationships visually. Changes are saved automatically.';
         }
     }
     
@@ -97,6 +107,10 @@ function showOntologyDesignerLoading(show) {
     const loadingEl = document.getElementById('ontologyDesignerLoading');
     if (loadingEl) {
         loadingEl.style.display = show ? 'flex' : 'none';
+    }
+    // Refresh the collapse-all toggle label once a load settles.
+    if (!show && typeof _syncCollapseAllButton === 'function') {
+        _syncCollapseAllButton();
     }
 }
 
@@ -177,7 +191,7 @@ function _getOntologyVersion() {
         classes.length,
         classes.map(c => c.name + ':' + (c.dataProperties || []).length + ':' + (c.parent || '')).join(','),
         props.length,
-        props.map(p => p.name + ':' + p.type + ':' + (p.domain || '') + ':' + (p.range || '')).join(',')
+        props.map(p => p.name + ':' + p.type + ':' + (p.domain || '') + ':' + (p.range || '') + ':' + (p.direction || 'forward')).join(',')
     ];
     return parts.join('|');
 }
@@ -302,11 +316,18 @@ function scheduleAutoSave() {
     }
     
     layoutDirty = true;
-    
+    ontologyDirty = true;
+    registryDirty = true;
+    // A user edit on the canvas makes it the current source of truth (this only
+    // runs for user-driven changes; loads are guarded by isLoadingData). Promote
+    // it so the pending sync is allowed to persist, including on a fresh canvas.
+    designerContentAuthoritative = true;
+
     if (autoSaveTimeout) {
         clearTimeout(autoSaveTimeout);
     }
     autoSaveTimeout = setTimeout(async () => {
+        autoSaveTimeout = null;
         // Double-check flag in case loading started during the timeout
         if (isLoadingData) {
             console.log('[AUTO-SAVE] Skipped - data loading in progress');
@@ -314,6 +335,7 @@ function scheduleAutoSave() {
         }
         await syncDesignToOntology(false);
         layoutDirty = false;
+        ontologyDirty = false;
     }, 500); // Save 500ms after last change
 }
 
@@ -329,7 +351,16 @@ async function flushDesignLayout() {
     
     if (!ontologyDesigner || isLoadingData) return;
     
-    if (layoutDirty) {
+    if (ontologyDirty) {
+        // A debounced ontology sync (attribute add/remove, rename, relationship
+        // edit …) was pending. Persist it fully now — syncDesignToOntology also
+        // saves the layout — otherwise the edit is lost when leaving the section
+        // and reappears on return because the session was never updated.
+        console.log('[FLUSH] Persisting pending ontology changes');
+        await syncDesignToOntology(false);
+        ontologyDirty = false;
+        layoutDirty = false;
+    } else if (layoutDirty) {
         console.log('[FLUSH] Saving pending layout changes');
         await saveDesignLayoutOnly();
         layoutDirty = false;
@@ -348,11 +379,17 @@ async function saveDesignLayoutOnly() {
 }
 
 /**
- * Beacon-based layout save for page unload.
- * navigator.sendBeacon guarantees delivery even during page teardown.
+ * Layout save for page unload.
+ * fetch with keepalive survives page teardown and, unlike
+ * navigator.sendBeacon, carries the X-CSRF-Token header the server requires.
  */
 function saveDesignLayoutBeacon() {
     if (!ontologyDesigner || !layoutDirty || isLoadingData) return;
+    // The ontology beacon already wrote the whole session (classes, properties
+    // AND positions) this unload. /design-views/save-current does its own
+    // read-modify-write of the session, so letting it run concurrently would
+    // clobber the ontology beacon's edit with a stale snapshot.
+    if (unloadOntologyFlushed) return;
     
     try {
         const design = ontologyDesigner.toJSON();
@@ -370,27 +407,199 @@ function saveDesignLayoutBeacon() {
             visibility: design.visibility
         };
         
-        const blob = new Blob(
-            [JSON.stringify(cleanedDesign)],
-            { type: 'application/json' }
-        );
-        navigator.sendBeacon('/domain/design-views/save-current', blob);
+        fetch('/domain/design-views/save-current', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(cleanedDesign),
+            credentials: 'same-origin',
+            keepalive: true
+        });
         layoutDirty = false;
-        console.log('[BEACON] Layout saved via sendBeacon');
     } catch (error) {
         console.warn('[BEACON] Failed to save layout:', error);
     }
 }
 
+/**
+ * Persist pending ontology edits (attribute add/remove, rename, relationship
+ * changes …) on page teardown. The 500 ms debounced syncDesignToOntology is
+ * dropped when the page unloads, so a full navigation (e.g. Designer → KG
+ * Explorer) would otherwise leave the session with the pre-edit ontology and
+ * the change would reappear on return. We rebuild the state from the canvas and
+ * fire a keepalive /ontology/save so the browser completes it during teardown.
+ * Registered before the layout beacon so the session is refreshed first.
+ */
+function saveOntologyBeacon() {
+    if (!ontologyDesigner || isLoadingData || !ontologyDirty) return;
+    // Never serialise a stale-fallback canvas back over the session ontology.
+    if (!designerContentAuthoritative) {
+        return;
+    }
+    try {
+        commitDesignToOntologyState();
+        if (typeof window.saveConfigToSession === 'function') {
+            window.saveConfigToSession({ keepalive: true });
+        }
+        ontologyDirty = false;
+        // Claim the session write for this unload: the layout and registry
+        // beacons each read-modify-write the whole session, so they must NOT
+        // race this keepalive /ontology/save or they overwrite the edit with a
+        // pre-edit snapshot (the bug where a removed attribute reappears).
+        unloadOntologyFlushed = true;
+    } catch (error) {
+        console.warn('[BEACON] Failed to save ontology:', error);
+    }
+}
+
+window.addEventListener('beforeunload', saveOntologyBeacon);
+window.addEventListener('pagehide', saveOntologyBeacon);
+
 window.addEventListener('beforeunload', saveDesignLayoutBeacon);
 window.addEventListener('pagehide', saveDesignLayoutBeacon);
+
+/**
+ * Auto-save design changes to the registry (silent, no confirmation).
+ * Called when the user leaves the design section or navigates away.
+ */
+async function autoSaveToRegistry() {
+    if (!registryDirty) return;
+    try {
+        console.log('[AUTO-SAVE] Saving design changes to registry...');
+        if (typeof showNotification === 'function') {
+            showNotification('Auto-saving to registry…', 'info', 3000);
+        }
+        const response = await fetch('/domain/save-to-uc', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+            credentials: 'same-origin'
+        });
+        const data = await response.json();
+        if (data.success) {
+            registryDirty = false;
+            console.log('[AUTO-SAVE] Registry save successful');
+            if (typeof showNotification === 'function') {
+                showNotification('Design auto-saved to registry', 'success', 2500);
+            }
+        } else {
+            console.warn('[AUTO-SAVE] Registry save failed:', data.message);
+        }
+    } catch (e) {
+        console.warn('[AUTO-SAVE] Registry save error:', e);
+    }
+}
+
+/**
+ * Reset the registry-dirty flag (called after an explicit manual save).
+ */
+function clearRegistryDirty() {
+    registryDirty = false;
+}
+
+/**
+ * Fire-and-forget registry save on page unload using fetch keepalive.
+ * Runs after saveDesignLayoutBeacon so the layout is already committed to the
+ * session before the server processes the save-to-uc request.
+ */
+function saveRegistryOnUnload() {
+    // Same ordering requirement as the layout beacon, and the reason it is
+    // called from here rather than left to its own listener: the detail panel
+    // module is loaded after this one, so its unload handler would run second
+    // and the registry would be written from a session that never saw the
+    // pending edit. The flush is a no-op once the panel is clean.
+    if (typeof flushSharedPanelOnUnload === 'function') flushSharedPanelOnUnload();
+    if (!registryDirty) return;
+    // save-to-uc also read-modify-writes the whole session (Domain.save_domain_to_uc
+    // ends with session.save()). If the ontology beacon just fired a keepalive
+    // /ontology/save, running this concurrently would persist a pre-edit
+    // snapshot back into the session and revert the edit. Skip it: the session
+    // now holds the change and the registry is re-synced on the next section
+    // switch / explicit save (both of which run sequentially, not racing).
+    if (unloadOntologyFlushed) return;
+    try {
+        fetch('/domain/save-to-uc', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+            credentials: 'same-origin',
+            keepalive: true
+        });
+        console.log('[UNLOAD] Registry save request sent (keepalive)');
+    } catch (e) {
+        console.warn('[UNLOAD] Registry save on unload failed:', e);
+    }
+}
+
+window.addEventListener('beforeunload', saveRegistryOnUnload);
+window.addEventListener('pagehide', saveRegistryOnUnload);
+window.autoSaveToRegistry = autoSaveToRegistry;
+window.clearRegistryDirty = clearRegistryDirty;
+
+/**
+ * Targeted in-place update of a single relationship's direction in the canvas.
+ * Avoids a full loadOntologyIntoDesigner reload — updates only the relevant SVG
+ * element, then persists the new layout to the session.
+ * @param {string} name - Relationship name
+ * @param {string} direction - 'forward' | 'reverse'
+ */
+function refreshRelationshipInDesigner(name, direction) {
+    if (!ontologyDesigner) return;
+    ontologyDesigner.relationships.forEach(rel => {
+        if (rel.name === name) {
+            rel.direction = direction;
+            ontologyDesigner._renderRelationship(rel);
+        }
+    });
+    // Persist the updated layout (direction is stored in the design views snapshot)
+    saveDesignLayoutOnly();
+}
+window.refreshRelationshipInDesigner = refreshRelationshipInDesigner;
 
 /**
  * Sync design to OntologyState and optionally save to session
  */
 async function syncDesignToOntology(showFeedback = false) {
-    if (!ontologyDesigner) return;
-    
+    // Guard against clobber: if the canvas was built from a stale saved-layout
+    // view (ontology not authoritative) and the user has not edited it, do NOT
+    // rebuild the ontology from it — that resurrects removed attributes/
+    // relationships/parents. Persist only the visual layout instead.
+    if (!designerContentAuthoritative) {
+        await saveDesignLayoutOnly();
+        return;
+    }
+
+    const design = commitDesignToOntologyState();
+    if (!design) return;
+
+    if (typeof OntologyState !== 'undefined' && OntologyState.config) {
+        // Save to session (await to ensure it completes)
+        await saveOntologyToSession(showFeedback);
+
+        // Also save the design layout for domain persistence
+        await saveDesignLayout(design);
+
+        // Regenerate OWL content to reflect changes
+        if (typeof autoGenerateOwl === 'function') {
+            autoGenerateOwl();
+        }
+
+        const inheritanceCount = design.inheritances ? design.inheritances.length : 0;
+        console.log('Design synced:', (OntologyState.config.classes || []).length + ' classes, ' + inheritanceCount + ' inheritances');
+    }
+}
+
+/**
+ * Rebuild OntologyState.config.classes/properties from the current canvas.
+ *
+ * Pure and synchronous (no network): the derivation used to live inside
+ * syncDesignToOntology, but it is split out so an unload handler can refresh
+ * the in-memory state and immediately fire a keepalive /ontology/save. Returns
+ * the raw design JSON (for layout persistence) or null when the designer is
+ * not ready.
+ */
+function commitDesignToOntologyState() {
+    if (!ontologyDesigner) return null;
+
     const design = ontologyDesigner.toJSON();
     
     // Build a map of entity ID to entity name for inheritance lookup
@@ -460,6 +669,11 @@ async function syncDesignToOntology(showFeedback = false) {
             description: entity.description || existing.comment || '',
             dashboard: existing.dashboard || '',
             dashboardParams: existing.dashboardParams || {},
+            bridges: existing.bridges || [],
+            dataset: existing.dataset || null,
+            actions: existing.actions || [],
+            business_rules: existing.business_rules || [],
+            virtualAttributes: existing.virtualAttributes || [],
             dataProperties: [...ownProperties, ...inheritedProperties]
         };
         
@@ -497,21 +711,9 @@ async function syncDesignToOntology(showFeedback = false) {
         
         OntologyState.config.classes = classes;
         OntologyState.config.properties = [...existingDataProperties, ...objectProperties];
-        
-        // Save to session (await to ensure it completes)
-        await saveOntologyToSession(showFeedback);
-        
-        // Also save the design layout for domain persistence
-        await saveDesignLayout(design);
-        
-        // Regenerate OWL content to reflect changes
-        if (typeof autoGenerateOwl === 'function') {
-            autoGenerateOwl();
-        }
-        
-        const inheritanceCount = design.inheritances ? design.inheritances.length : 0;
-        console.log('Design synced:', classes.length + ' classes, ' + objectProperties.length + ' relationships, ' + inheritanceCount + ' inheritances');
     }
+
+    return design;
 }
 
 /**
@@ -578,6 +780,42 @@ async function initViewManagement() {
     
     // Bind delete view button
     document.getElementById('deleteViewBtn')?.addEventListener('click', showDeleteViewDialog);
+
+    // Bind "New Assistant" button (guided view creation from selected entities)
+    document.getElementById('newAssistantBtn')?.addEventListener('click', showNewAssistantDialog);
+
+    // Bind "Collapse all / Expand all" toggle
+    document.getElementById('toggleCollapseAllBtn')?.addEventListener('click', toggleCollapseAllEntities);
+}
+
+/**
+ * Update the "Collapse all / Expand all" button label to reflect canvas state.
+ */
+function _syncCollapseAllButton() {
+    const btn = document.getElementById('toggleCollapseAllBtn');
+    if (!btn || !ontologyDesigner) return;
+    const anyCollapsed = ontologyDesigner.hasCollapsedEntities();
+    btn.innerHTML = anyCollapsed
+        ? '<i class="bi bi-arrows-expand"></i>'
+        : '<i class="bi bi-arrows-collapse"></i>';
+    btn.title = anyCollapsed
+        ? 'Expand all entities in this view'
+        : 'Collapse all entities in this view';
+}
+
+/**
+ * Collapse every entity when all are expanded, otherwise expand them all.
+ * Collapse state is persisted with the view layout (visibility.collapsedEntities).
+ */
+function toggleCollapseAllEntities() {
+    if (!ontologyDesigner) return;
+    if (ontologyDesigner.hasCollapsedEntities()) {
+        ontologyDesigner.expandAll();
+    } else {
+        ontologyDesigner.collapseAll();
+    }
+    _syncCollapseAllButton();
+    scheduleAutoSave();
 }
 
 /**
@@ -599,7 +837,8 @@ async function refreshViewList() {
                     ).join('');
                     selector.disabled = false;
                 } else {
-                    selector.innerHTML = '<option value="">-- No views --</option>';
+                    // No views: empty the dropdown and disable it.
+                    selector.innerHTML = '';
                     selector.disabled = true;
                 }
             }
@@ -610,15 +849,30 @@ async function refreshViewList() {
             const renameBtn = document.getElementById('renameViewBtn');
             const createBtn = document.getElementById('createViewBtn');
             const createGroupBtn = document.getElementById('createGroupFromViewBtn');
+            const assistantBtn = document.getElementById('newAssistantBtn');
             if (window.isActiveVersion === false) {
                 if (deleteBtn) deleteBtn.disabled = true;
                 if (renameBtn) renameBtn.disabled = true;
                 if (createBtn) createBtn.disabled = true;
                 if (createGroupBtn) createGroupBtn.disabled = true;
+                if (assistantBtn) assistantBtn.disabled = true;
             } else {
-                if (deleteBtn) deleteBtn.disabled = !hasViews || data.views.length <= 1;
+                // The last view can be deleted too — the UI falls back to the
+                // empty state afterwards. Rename/Delete/Create-Group act on the
+                // current view, so they're disabled when no view is open.
+                if (deleteBtn) deleteBtn.disabled = !hasViews;
                 if (renameBtn) renameBtn.disabled = !hasViews;
+                if (createGroupBtn) createGroupBtn.disabled = !hasViews;
             }
+
+            // The View/Edit mode toggle and Collapse-all act on the open view's
+            // canvas, so they're disabled whenever no view is selected.
+            const viewModeBtn = document.getElementById('viewModeBtn');
+            const editModeBtn = document.getElementById('editModeBtn');
+            const collapseAllBtn = document.getElementById('toggleCollapseAllBtn');
+            if (viewModeBtn) viewModeBtn.disabled = !hasViews;
+            if (editModeBtn) editModeBtn.disabled = !hasViews;
+            if (collapseAllBtn) collapseAllBtn.disabled = !hasViews;
             
             // Show/hide empty state
             showOntologyDesignerEmptyState(!hasViews);
@@ -675,28 +929,20 @@ async function switchToView(viewName) {
 }
 
 /**
- * Load fresh from ontology (for new/empty views)
- * All entities are hidden by default - user selects which ones to show via palette
+ * Build a fresh design layout from the current OntologyState.
+ *
+ * @param {Set<string>|null} visibleNames - Entity names to keep visible. When
+ *        null (the default), every entity / relationship / inheritance is
+ *        hidden — the behaviour expected for brand-new empty views where the
+ *        curator reveals items from the palette.
+ * @returns {Object|null} An OntoViz layout object ready for `fromJSON`, or
+ *          null when the ontology has no classes.
  */
-async function loadFromOntologyFresh() {
-    if (!ontologyDesigner || typeof OntologyState === 'undefined') return;
-    
-    // Set flag to prevent auto-save during loading
-    isLoadingData = true;
-    console.log('[LOAD FRESH] Starting fresh data load - auto-save disabled');
-    
-    // Always clear the canvas first for new views
-    ontologyDesigner.clear();
-    
+function _buildFreshDesignLayout(visibleNames = null) {
     const classes = OntologyState.config?.classes || [];
     const properties = OntologyState.config?.properties || [];
-    
-    // If no classes, just show empty canvas
-    if (classes.length === 0) {
-        isLoadingData = false;
-        return;
-    }
-    
+    if (classes.length === 0) return null;
+
     const entityIdMap = new Map();
     const entityNameLower = new Map();
 
@@ -727,7 +973,7 @@ async function loadFromOntologyFresh() {
             y: Math.round(circleCY + circleRadius * Math.sin(angle))
         };
     });
-    
+
     let freshSkipped = 0;
     const relationships = [];
     properties.forEach((prop, idx) => {
@@ -753,14 +999,14 @@ async function loadFromOntologyFresh() {
     if (freshSkipped > 0) {
         console.warn(`[DESIGN-FRESH] ${freshSkipped}/${properties.length} relationship(s) skipped — entity names: [${Array.from(entityIdMap.keys()).join(', ')}]`);
     }
-    
+
     // Build inheritances from ontology parent-child relationships
     const inheritances = [];
     classes.forEach((cls, idx) => {
         const parentName = cls.parent || cls.parentClass;
         if (parentName) {
-            const childId = entityIdMap.get(cls.name);
-            const parentId = entityIdMap.get(parentName);
+            const childId = _resolveEntityId(entityIdMap, entityNameLower, cls.name || cls.localName);
+            const parentId = _resolveEntityId(entityIdMap, entityNameLower, parentName);
             if (childId && parentId) {
                 inheritances.push({
                     id: `inh_${Date.now()}_${idx}`,
@@ -773,33 +1019,73 @@ async function loadFromOntologyFresh() {
             }
         }
     });
-    
-    // Hide ALL entities and relationships by default for new views
-    const hiddenEntities = entities.map(e => e.name);
-    const hiddenRelationships = relationships.map(r => {
-        const srcEntity = entities.find(e => e.id === r.sourceEntityId);
-        const tgtEntity = entities.find(e => e.id === r.targetEntityId);
-        return { name: r.name, source: srcEntity?.name || '', target: tgtEntity?.name || '' };
-    });
-    
-    const layout = { 
-        entities, 
-        relationships, 
+
+    // Visibility — when no subset is requested every item is hidden (legacy
+    // fresh-view behaviour); otherwise hide everything outside the subset.
+    const idToName = new Map(entities.map(e => [e.id, e.name]));
+    const isVisible = (name) => (visibleNames ? visibleNames.has(name) : false);
+
+    const hiddenEntities = entities
+        .filter(e => !isVisible(e.name))
+        .map(e => e.name);
+
+    const hiddenRelationships = relationships
+        .filter(r => !(isVisible(idToName.get(r.sourceEntityId)) && isVisible(idToName.get(r.targetEntityId))))
+        .map(r => ({
+            name: r.name,
+            source: idToName.get(r.sourceEntityId) || '',
+            target: idToName.get(r.targetEntityId) || ''
+        }));
+
+    // Brand-new views keep the legacy empty list so palette reveals are
+    // unchanged; curated views hide inheritances outside the subset.
+    const hiddenInheritances = visibleNames
+        ? inheritances
+            .filter(inh => !(isVisible(idToName.get(inh.sourceEntityId)) && isVisible(idToName.get(inh.targetEntityId))))
+            .map(inh => ({
+                source: idToName.get(inh.sourceEntityId) || '',
+                target: idToName.get(inh.targetEntityId) || ''
+            }))
+        : [];
+
+    return {
+        entities,
+        relationships,
         inheritances,
-        visibility: {
-            hiddenEntities: hiddenEntities,
-            hiddenRelationships: hiddenRelationships,
-            hiddenInheritances: []
-        }
+        visibility: { hiddenEntities, hiddenRelationships, hiddenInheritances }
     };
-    
+}
+
+/**
+ * Load fresh from ontology (for new/empty views)
+ * All entities are hidden by default - user selects which ones to show via palette
+ */
+async function loadFromOntologyFresh() {
+    if (!ontologyDesigner || typeof OntologyState === 'undefined') return;
+
+    // Set flag to prevent auto-save during loading
+    isLoadingData = true;
+    console.log('[LOAD FRESH] Starting fresh data load - auto-save disabled');
+
+    // Always clear the canvas first for new views
+    ontologyDesigner.clear();
+
+    const layout = _buildFreshDesignLayout(null);
+
+    // If no classes, just show empty canvas
+    if (!layout) {
+        isLoadingData = false;
+        return;
+    }
+
     // Load with all entities hidden (OntoViz now hides during render)
     ontologyDesigner.fromJSON(layout, { autoLayout: false, center: false, animate: false });
-    
+
     // Re-enable auto-save after loading completes
     setTimeout(() => {
         isLoadingData = false;
         layoutDirty = false;
+        ontologyDirty = false;
         ontologyVersionAtLoad = _getOntologyVersion();
         console.log('[LOAD FRESH] Data load complete - auto-save re-enabled');
     }, 600);
@@ -898,6 +1184,309 @@ function showCreateViewDialog() {
 }
 
 /**
+ * Compute the set of entity names reachable from `seedNames` within `depth`
+ * ontology hops. Edges are object properties (domain ↔ range) and inheritance
+ * links (child ↔ parent), treated as undirected so neighbours on either side
+ * are pulled in.
+ *
+ * @param {string[]} seedNames - Initially selected entity names.
+ * @param {number} depth - Number of hops to expand (1-3).
+ * @returns {Set<string>} Selected entities plus their neighbours.
+ */
+function _computeOntologyNeighborhood(seedNames, depth) {
+    const classes = OntologyState.config?.classes || [];
+    const properties = OntologyState.config?.properties || [];
+    const validNames = new Set(classes.map(c => c.name || c.localName));
+
+    // Resolve a domain/range value (may be a bare name or a URI) to a class name.
+    const resolve = (raw) => {
+        if (!raw) return null;
+        if (validNames.has(raw)) return raw;
+        const local = raw.split('#').pop().split('/').pop();
+        return validNames.has(local) ? local : null;
+    };
+
+    const adjacency = new Map();
+    const link = (a, b) => {
+        if (!a || !b || a === b) return;
+        if (!adjacency.has(a)) adjacency.set(a, new Set());
+        if (!adjacency.has(b)) adjacency.set(b, new Set());
+        adjacency.get(a).add(b);
+        adjacency.get(b).add(a);
+    };
+
+    properties.forEach(prop => {
+        if (prop.type === 'ObjectProperty' || (prop.domain && prop.range)) {
+            link(resolve(prop.domain), resolve(prop.range));
+        }
+    });
+    classes.forEach(cls => {
+        const child = cls.name || cls.localName;
+        const parent = resolve(cls.parent || cls.parentClass);
+        if (parent) link(child, parent);
+    });
+
+    const visible = new Set();
+    let frontier = [];
+    seedNames.forEach(name => {
+        if (validNames.has(name)) {
+            visible.add(name);
+            frontier.push(name);
+        }
+    });
+
+    for (let hop = 0; hop < depth && frontier.length > 0; hop++) {
+        const next = [];
+        frontier.forEach(name => {
+            (adjacency.get(name) || []).forEach(neighbour => {
+                if (!visible.has(neighbour)) {
+                    visible.add(neighbour);
+                    next.push(neighbour);
+                }
+            });
+        });
+        frontier = next;
+    }
+
+    return visible;
+}
+
+/**
+ * Given a built layout and the visible-name set, return the subset of visible
+ * names that actually participate in at least one rendered edge (relationship
+ * or inheritance) where both endpoints are visible. Used to drop neighbour
+ * entities that would otherwise show up disconnected ("orphans").
+ */
+function _layoutConnectedNames(layout, visibleSet) {
+    const idToName = new Map((layout.entities || []).map(e => [e.id, e.name]));
+    const connected = new Set();
+    const consider = (aId, bId) => {
+        const a = idToName.get(aId);
+        const b = idToName.get(bId);
+        if (a && b && visibleSet.has(a) && visibleSet.has(b)) {
+            connected.add(a);
+            connected.add(b);
+        }
+    };
+    (layout.relationships || []).forEach(r => consider(r.sourceEntityId, r.targetEntityId));
+    (layout.inheritances || []).forEach(i => consider(i.sourceEntityId, i.targetEntityId));
+    return connected;
+}
+
+/**
+ * Show the "New Assistant" dialog: the curator picks seed entities and a
+ * neighbour depth, then a new Business View is created pre-populated with the
+ * selected entities and their ontology neighbours within that many hops.
+ */
+function showNewAssistantDialog() {
+    if (window.isActiveVersion === false) return;
+
+    const classes = (typeof OntologyState !== 'undefined' && OntologyState.config?.classes) || [];
+    if (classes.length === 0) {
+        showNotification('No entities available in the ontology yet', 'warning');
+        return;
+    }
+
+    const existingModal = document.getElementById('assistantViewModal');
+    if (existingModal) existingModal.remove();
+
+    const sortedClasses = [...classes].sort((a, b) =>
+        (a.name || a.localName || '').localeCompare(b.name || b.localName || ''));
+
+    const entityRows = sortedClasses.map((cls, idx) => {
+        const name = cls.name || cls.localName || '';
+        const emoji = cls.emoji || '📦';
+        const safeName = name.replace(/"/g, '&quot;');
+        const labelSuffix = (cls.label && cls.label !== name)
+            ? ` <span class="text-muted small">(${cls.label})</span>` : '';
+        return `
+            <label class="list-group-item d-flex align-items-center gap-2 py-1 assistant-entity-row" data-name="${safeName.toLowerCase()}">
+                <input class="form-check-input m-0 assistant-entity-check" type="checkbox" value="${safeName}" id="assistEntity_${idx}">
+                <span>${emoji}</span>
+                <span class="text-truncate">${name}${labelSuffix}</span>
+            </label>`;
+    }).join('');
+
+    const modalHtml = `
+        <div class="modal fade" id="assistantViewModal" tabindex="-1">
+            <div class="modal-dialog modal-dialog-centered modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="bi bi-magic me-2"></i>New Assistant — Build a Business View</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="mb-3">
+                            <label class="form-label">View Name</label>
+                            <input type="text" class="form-control" id="assistantViewName" placeholder="Enter a name for the new business view">
+                        </div>
+                        <div class="row g-3">
+                            <div class="col-md-8">
+                                <label class="form-label d-flex justify-content-between align-items-center mb-1">
+                                    <span>Entities</span>
+                                    <span class="small">
+                                        <a href="#" id="assistantSelectAll">Select all</a> ·
+                                        <a href="#" id="assistantSelectNone">None</a>
+                                    </span>
+                                </label>
+                                <input type="text" class="form-control form-control-sm mb-2" id="assistantEntitySearch" placeholder="Filter entities…">
+                                <div class="list-group ob-assistant-entity-list">
+                                    ${entityRows}
+                                </div>
+                                <div class="form-text"><span id="assistantSelectedCount">0</span> selected</div>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label">Neighbour depth</label>
+                                <select class="form-select" id="assistantDepth">
+                                    <option value="1">1 hop</option>
+                                    <option value="2" selected>2 hops</option>
+                                    <option value="3">3 hops</option>
+                                </select>
+                                <p class="form-text mb-0">
+                                    The view will include the selected entities plus
+                                    every ontology neighbour reachable within the chosen
+                                    number of hops.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="button" class="btn btn-primary" id="confirmAssistantView">
+                            <i class="bi bi-magic me-1"></i>Create View
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+    const modalEl = document.getElementById('assistantViewModal');
+    const modal = new bootstrap.Modal(modalEl);
+
+    const getChecks = () => Array.from(modalEl.querySelectorAll('.assistant-entity-check'));
+    const updateCount = () => {
+        const count = getChecks().filter(c => c.checked).length;
+        document.getElementById('assistantSelectedCount').textContent = String(count);
+    };
+
+    modalEl.addEventListener('change', (e) => {
+        if (e.target.classList.contains('assistant-entity-check')) updateCount();
+    });
+
+    document.getElementById('assistantEntitySearch').addEventListener('input', function () {
+        const query = this.value.trim().toLowerCase();
+        modalEl.querySelectorAll('.assistant-entity-row').forEach(row => {
+            row.style.display = (!query || row.dataset.name.includes(query)) ? '' : 'none';
+        });
+    });
+
+    document.getElementById('assistantSelectAll').addEventListener('click', (e) => {
+        e.preventDefault();
+        getChecks().forEach(c => {
+            if (c.closest('.assistant-entity-row').style.display !== 'none') c.checked = true;
+        });
+        updateCount();
+    });
+    document.getElementById('assistantSelectNone').addEventListener('click', (e) => {
+        e.preventDefault();
+        getChecks().forEach(c => { c.checked = false; });
+        updateCount();
+    });
+
+    document.getElementById('confirmAssistantView').addEventListener('click', async () => {
+        const name = document.getElementById('assistantViewName').value.trim();
+        const depth = parseInt(document.getElementById('assistantDepth').value, 10) || 1;
+        const selected = getChecks().filter(c => c.checked).map(c => c.value);
+
+        if (!name) {
+            showNotification('Please enter a view name', 'warning');
+            return;
+        }
+        if (selected.length === 0) {
+            showNotification('Please select at least one entity', 'warning');
+            return;
+        }
+
+        const confirmBtn = document.getElementById('confirmAssistantView');
+        confirmBtn.disabled = true;
+
+        try {
+            const seeds = new Set(selected);
+            let visible = _computeOntologyNeighborhood(selected, depth);
+
+            // Drop neighbours that would render with no connection at all
+            // (keep the user's seeds even if isolated).
+            const probeLayout = _buildFreshDesignLayout(visible);
+            if (probeLayout) {
+                const connected = _layoutConnectedNames(probeLayout, visible);
+                visible = new Set([...visible].filter(n => seeds.has(n) || connected.has(n)));
+            }
+
+            const response = await fetch('/domain/design-views/create', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, copy_from: null }),
+                credentials: 'same-origin'
+            });
+            const data = await response.json();
+
+            if (!data.success) {
+                showNotification(data.message || 'Failed to create view', 'error');
+                confirmBtn.disabled = false;
+                return;
+            }
+
+            modal.hide();
+            await refreshViewList();
+            showOntologyDesignerEmptyState(false);
+
+            // Initialize designer if not yet done
+            if (!designerInitialized) {
+                await initializeOntoVizCanvas();
+            }
+
+            // Make the new view the active one server-side.
+            await fetch('/domain/design-views/switch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name }),
+                credentials: 'same-origin'
+            });
+            currentDesignView = name;
+            const selector = document.getElementById('designViewSelector');
+            if (selector) selector.value = name;
+
+            // Render the curated subset and persist it to the new view.
+            // Entities start collapsed (header-only) by default.
+            isLoadingData = true;
+            const layout = _buildFreshDesignLayout(visible);
+            ontologyDesigner.clear();
+            if (layout) {
+                layout.visibility.collapsedEntities = [...visible];
+                ontologyDesigner.fromJSON(layout, { autoLayout: false, center: true, animate: false });
+                await saveDesignLayout(layout);
+                _syncCollapseAllButton();
+            }
+            setTimeout(() => {
+                isLoadingData = false;
+                layoutDirty = false;
+                ontologyVersionAtLoad = _getOntologyVersion();
+            }, 600);
+
+            showNotification(`Business view "${name}" created with ${visible.size} entities`, 'success', 2500);
+        } catch (error) {
+            showNotification('Error creating view: ' + error.message, 'error');
+            confirmBtn.disabled = false;
+        }
+    });
+
+    modal.show();
+    document.getElementById('assistantViewName').focus();
+}
+
+/**
  * Show rename view dialog
  */
 function showRenameViewDialog() {
@@ -976,7 +1565,13 @@ function showDeleteViewDialog() {
     if (window.isActiveVersion === false) return;
     const existingModal = document.getElementById('deleteViewModal');
     if (existingModal) existingModal.remove();
-    
+
+    // Warn when this is the last remaining view.
+    const viewCount = document.getElementById('designViewSelector')?.options.length || 0;
+    const lastViewNote = viewCount <= 1
+        ? '<p class="text-warning small mb-0 mt-2"><i class="bi bi-exclamation-triangle me-1"></i>This is the last view — deleting it leaves no Business View until you create a new one.</p>'
+        : '';
+
     const modalHtml = `
         <div class="modal fade" id="deleteViewModal" tabindex="-1">
             <div class="modal-dialog modal-dialog-centered">
@@ -988,6 +1583,7 @@ function showDeleteViewDialog() {
                     <div class="modal-body">
                         <p>Are you sure you want to delete the view <strong>"${currentDesignView}"</strong>?</p>
                         <p class="text-muted mb-0">This action cannot be undone. The entities and relationships will still exist in the ontology.</p>
+                        ${lastViewNote}
                     </div>
                     <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
@@ -1016,9 +1612,26 @@ function showDeleteViewDialog() {
                 currentDesignView = data.current_view;
                 await refreshViewList();
                 showNotification('View deleted', 'success', 2000);
-                
-                // Load the new current view
-                await switchToView(data.current_view);
+
+                if (data.current_view) {
+                    // Load the new current view
+                    await switchToView(data.current_view);
+                } else {
+                    // No views left — clear the canvas and show the empty state.
+                    // Guard with isLoadingData (and cancel any pending auto-save)
+                    // so the entity-delete callbacks fired by clear() can't
+                    // trigger a sync that overwrites the ontology with an empty
+                    // canvas.
+                    if (autoSaveTimeout) {
+                        clearTimeout(autoSaveTimeout);
+                        autoSaveTimeout = null;
+                    }
+                    layoutDirty = false;
+                    isLoadingData = true;
+                    if (ontologyDesigner) ontologyDesigner.clear();
+                    isLoadingData = false;
+                    showOntologyDesignerEmptyState(true);
+                }
             } else {
                 showNotification(data.message || 'Failed to delete view', 'error');
             }
@@ -1099,19 +1712,44 @@ async function loadOntologyIntoDesigner(showAlert = true) {
     
     // Set flag to prevent auto-save during loading
     isLoadingData = true;
-    console.log('[LOAD] Starting data load - auto-save disabled');
-    
+
+    // Close the load-order race: on a full page load the Designer can run before
+    // GET /ontology/load has populated OntologyState.config.classes. Without this
+    // await we fall into the "saved-layout-only" branch below, load a stale view
+    // and then serialise it back — resurrecting removed attributes/relationships/
+    // parents. Waiting guarantees the ontology is the authoritative content source
+    // whenever it actually has classes.
+    if (typeof window.waitForOntologyLoaded === 'function') {
+        try {
+            await window.waitForOntologyLoaded();
+        } catch (e) {
+            console.warn('[LOAD] waitForOntologyLoaded rejected — proceeding:', e);
+        }
+    }
+
     // First, try to load from saved design layout (domain persistence)
     const savedLayout = await loadDesignLayoutFromProject();
-    
+
+    // Resolve ontology classes up-front. ``OntologyState.config`` can exist while
+    // ``classes`` is still empty (it is populated asynchronously after a reload).
+    // Guarding the merge branch on ``classes.length`` — not just on ``config``
+    // being truthy — stops us from building a zero-entity layout that renders a
+    // blank canvas; we fall through to the saved-layout-only branch instead.
+    const _ontologyReady = typeof OntologyState !== 'undefined' && OntologyState.config;
+    const classes = _ontologyReady ? (OntologyState.config.classes || []) : [];
+    const properties = _ontologyReady ? (OntologyState.config.properties || []) : [];
+
+    // ``center`` only the saved layout when it hides part of the graph (a curated
+    // business view): the visible subset is re-framed so it can't end up
+    // off-screen around now-hidden anchors. Full views keep their exact saved
+    // positions (center: false).
+    const _layoutHasHidden = (savedLayout?.visibility?.hiddenEntities?.length || 0) > 0;
+
     // If we have a saved layout AND ontology data, merge them
     // The saved layout provides positions/anchors, the ontology provides the current data (including properties)
-    if (savedLayout && savedLayout.entities && savedLayout.entities.length > 0 && 
-        typeof OntologyState !== 'undefined' && OntologyState.config) {
-        
-        const classes = OntologyState.config.classes || [];
-        const properties = OntologyState.config.properties || [];
-        
+    if (savedLayout && savedLayout.entities && savedLayout.entities.length > 0 &&
+        classes.length > 0) {
+
         // Create lookup maps
         const savedEntityMap = new Map();
         savedLayout.entities.forEach(e => savedEntityMap.set(e.name, e));
@@ -1289,14 +1927,16 @@ async function loadOntologyIntoDesigner(showAlert = true) {
         
         const inhCount = mergedLayout.inheritances ? mergedLayout.inheritances.length : 0;
         console.log('Loading merged layout:', mergedLayout.entities.length + ' entities, ' + mergedLayout.relationships.length + ' relationships, ' + inhCount + ' inheritances');
-        ontologyDesigner.fromJSON(mergedLayout, { autoLayout: false, center: false, animate: false });
+        // Content came from the ontology (authoritative) with saved positions.
+        designerContentAuthoritative = true;
+        ontologyDesigner.fromJSON(mergedLayout, { autoLayout: false, center: _layoutHasHidden, animate: false });
         
         // Re-enable auto-save after loading completes
         setTimeout(() => {
             isLoadingData = false;
             layoutDirty = false;
+            ontologyDirty = false;
             ontologyVersionAtLoad = _getOntologyVersion();
-            console.log('[LOAD] Data load complete - auto-save re-enabled');
         }, 600);  // Wait longer than auto-save debounce (500ms)
         return true;
     }
@@ -1322,14 +1962,18 @@ async function loadOntologyIntoDesigner(showAlert = true) {
         
         const inhCount = savedLayout.inheritances ? savedLayout.inheritances.length : 0;
         console.log('Loading from saved design layout:', savedLayout.entities.length + ' entities, ' + inhCount + ' inheritances');
-        ontologyDesigner.fromJSON(savedLayout, { autoLayout: false, center: false, animate: false });
+        // Stale-fallback: the ontology was not available, so this canvas reflects
+        // a design-view snapshot only. Mark it non-authoritative so autosave never
+        // serialises it back over the session ontology.
+        designerContentAuthoritative = false;
+        ontologyDesigner.fromJSON(savedLayout, { autoLayout: false, center: _layoutHasHidden, animate: false });
         
         // Re-enable auto-save after loading completes
         setTimeout(() => {
             isLoadingData = false;
             layoutDirty = false;
+            ontologyDirty = false;
             ontologyVersionAtLoad = _getOntologyVersion();
-            console.log('[LOAD] Data load complete - auto-save re-enabled');
         }, 600);
         return true;
     }
@@ -1343,7 +1987,7 @@ async function loadOntologyIntoDesigner(showAlert = true) {
         
         if (classes.length === 0) {
             if (showAlert) {
-                showNotification('No classes defined in the ontology. Please add classes in the Entities tab first.', 'info');
+                showNotification('No entities defined in the ontology. Please add entities in the Entities tab first.', 'info');
             }
             console.log('No classes to load into designer');
             isLoadingData = false;
@@ -1351,7 +1995,9 @@ async function loadOntologyIntoDesigner(showAlert = true) {
         }
         
         ontologyDesigner.clear();
-        
+        // Built directly from OntologyState.config (authoritative content).
+        designerContentAuthoritative = true;
+
         // Create entity map for relationship linking
         const entityMap = new Map();
         
@@ -1457,20 +2103,20 @@ async function loadOntologyIntoDesigner(showAlert = true) {
         console.log('Loaded ' + classes.length + ' classes, ' + relCount + ' relationships, and ' + inhCount + ' inheritances into designer');
         
         if (showAlert) {
-            showNotification('Imported ' + classes.length + ' classes, ' + relCount + ' relationships, and ' + inhCount + ' inheritances from ontology', 'success');
+            showNotification('Imported ' + classes.length + ' entities, ' + relCount + ' relationships, and ' + inhCount + ' inheritances from ontology', 'success');
         }
         
         // Re-enable auto-save after loading and layout resolution completes
         setTimeout(() => {
             isLoadingData = false;
             layoutDirty = false;
+            ontologyDirty = false;
             ontologyVersionAtLoad = _getOntologyVersion();
-            console.log('[LOAD] Data load complete - auto-save re-enabled');
         }, 600);
         return true;
     } else {
         if (showAlert) {
-            showNotification('No ontology loaded. Please load an ontology first from the Information tab.', 'warning');
+            showNotification('No ontology loaded. Please load an ontology first from the General tab.', 'warning');
         }
         console.log('OntologyState not available');
         isLoadingData = false;
@@ -1479,7 +2125,7 @@ async function loadOntologyIntoDesigner(showAlert = true) {
 }
 
 /**
- * Create a Knowledge Graph group from the current business view's entities.
+ * Create a Graph Viewer group from the current business view's entities.
  */
 function createGroupFromView() {
     if (window.isActiveVersion === false) return;
@@ -1488,14 +2134,17 @@ function createGroupFromView() {
         return;
     }
 
-    const design = ontologyDesigner.toJSON();
-    const entities = design.entities || [];
-    if (entities.length === 0) {
-        showNotification('This view has no entities to group.', 'warning');
+    // Only the entities actually visible in the business view should become
+    // group members — hidden entities (curated out of the view) are excluded.
+    const memberNames = (typeof ontologyDesigner.getVisibleEntityNames === 'function'
+        ? ontologyDesigner.getVisibleEntityNames()
+        : (ontologyDesigner.toJSON().entities || []).map(e => e.name)
+    ).filter(Boolean);
+
+    if (memberNames.length === 0) {
+        showNotification('This view has no visible entities to group.', 'warning');
         return;
     }
-
-    const memberNames = entities.map(e => e.name).filter(Boolean);
     const viewName = currentDesignView || 'default';
     const defaultGroupName = viewName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '');
 

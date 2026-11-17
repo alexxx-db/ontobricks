@@ -1,12 +1,17 @@
 {% extends "base.html" %}
 
-{% block title %}Domain - OntoBricks{% endblock %}
+{% block title %}{{ brand_page_title('Domain') }}{% endblock %}
 
 {% block extra_css %}
 <!-- Domain module styles (extracted from partials) -->
 <link rel="stylesheet" href="{{ url_for('static', filename='query/css/query-sync.css') }}?v={{ asset_version }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='domain/css/domain-information.css') }}?v={{ asset_version }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='domain/css/domain-metadata.css') }}?v={{ asset_version }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='domain/css/domain-validation.css') }}?v={{ asset_version }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='domain/css/domain-review.css') }}?v={{ asset_version }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='domain/css/domain-versions.css') }}?v={{ asset_version }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='domain/css/domain-audit.css') }}?v={{ asset_version }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='domain/css/domain-collaboration.css') }}?v={{ asset_version }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='global/css/config.css') }}">
 {% endblock %}
 
@@ -21,7 +26,7 @@
         
         <!-- Right Content Area -->
         <div class="sidebar-content">
-            <!-- Information Section -->
+            <!-- General section (id remains information) -->
             <div id="information-section" class="sidebar-section active">
                 {% include "partials/domain/_domain_information.html" %}
             </div>
@@ -34,6 +39,21 @@
             <!-- Validation Section -->
             <div id="validation-section" class="sidebar-section">
                 {% include "partials/domain/_domain_validation.html" %}
+            </div>
+
+            <!-- Review / Validation workflow Section -->
+            <div id="review-section" class="sidebar-section">
+                {% include "partials/domain/_domain_review.html" %}
+            </div>
+
+            <!-- Collaboration: My Tasks Section -->
+            <div id="mytasks-section" class="sidebar-section">
+                {% include "partials/domain/_domain_mytasks.html" %}
+            </div>
+
+            <!-- Collaboration: Discussions timeline Section -->
+            <div id="discussions-section" class="sidebar-section">
+                {% include "partials/domain/_domain_discussions.html" %}
             </div>
             
             <!-- Versions Section -->
@@ -60,6 +80,32 @@
             <div id="sync-section" class="sidebar-section">
                 {% include "partials/dtwin/_query_sync.html" %}
             </div>
+
+            <!-- Audit trail (review + build activity) Section -->
+            <div id="audit-section" class="sidebar-section">
+                {% include "partials/domain/_domain_audit.html" %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Run details modal (page-level so it can open from Runs and Audit trail
+     sections alike; must stay outside any .sidebar-section). -->
+<div class="modal fade" id="runDetailsModal" tabindex="-1" aria-labelledby="runDetailsModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="runDetailsModalLabel">
+                    <i class="bi bi-info-circle me-2"></i>Build Run Details
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="runDetailsBody">
+                <!-- Populated by JS -->
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
         </div>
     </div>
 </div>
@@ -83,8 +129,13 @@
 <script src="{{ url_for('static', filename='domain/js/domain-metadata.js') }}?v={{ asset_version }}"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script src="{{ url_for('static', filename='domain/js/domain-validation.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='domain/js/domain-review.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='domain/js/domain-actions.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='domain/js/domain-versions.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='global/js/runs-render.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='domain/js/domain-runs.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='domain/js/domain-audit.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='domain/js/domain-collaboration.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='domain/js/domain-documents.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='domain/js/domain-owl-content.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='domain/js/domain-r2rml.js') }}?v={{ asset_version }}"></script>

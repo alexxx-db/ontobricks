@@ -3,7 +3,7 @@
 The :class:`RegistryStore` ABC is the single seam between the registry
 services (:mod:`back.objects.registry.RegistryService`,
 :mod:`back.objects.registry.PermissionService`,
-:mod:`back.objects.registry.scheduler`,
+:mod:`back.objects.registry.schedule.BuildScheduler`,
 :mod:`back.objects.session.GlobalConfigService`) and the underlying
 Lakebase Postgres storage.
 
@@ -19,7 +19,7 @@ Always go through :class:`RegistryFactory` to obtain a concrete store
 
 Domain-scoped binary artefacts (the ``documents/`` uploads imported by
 the ontology designer) always live on the Unity Catalog Volume and are
-managed by :class:`back.core.databricks.VolumeFileService` — the store
+managed by :class:`back.core.databricks.unity_catalog.VolumeFileService` — the store
 handles JSON-shaped data only.
 
 The historical JSON-on-Volume backend (``VolumeRegistryStore``) was
@@ -30,18 +30,34 @@ removed in v0.4.0. Operators with on-Volume registry data must run
 from __future__ import annotations
 
 from .base import (
+    BuildRunEntry,
+    ChangeEvent,
+    DocumentRow,
+    DomainComment,
     DomainSummary,
+    DomainTask,
+    GraphAnalyticsResult,
+    GraphAnalyticsRun,
     RegistryStore,
+    ReviewEvent,
     ScheduleHistoryEntry,
     StoreError,
 )
 from .factory import RegistryFactory
 
 __all__ = [
+    "BuildRunEntry",
+    "ChangeEvent",
+    "DocumentRow",
+    "DomainComment",
     "DomainSummary",
+    "DomainTask",
+    "GraphAnalyticsResult",
+    "GraphAnalyticsRun",
     "LakebaseRegistryStore",
     "RegistryFactory",
     "RegistryStore",
+    "ReviewEvent",
     "ScheduleHistoryEntry",
     "StoreError",
 ]

@@ -1,9 +1,7 @@
 """Registry — domain registry, permissions, and scheduled builds."""
 
-from back.objects.registry.RegistryService import (
-    RegistryCfg,
-    RegistryService,
-)
+from back.objects.registry.RegistryCfg import RegistryCfg
+from back.objects.registry.RegistryService import RegistryService
 from back.objects.registry.PermissionService import (
     PermissionService,
     permission_service,
@@ -18,7 +16,6 @@ from back.objects.registry.PermissionService import (
     role_level,
     min_role,
 )
-from back.objects.registry.guards import require
 from back.objects.registry.registry_cache import (
     invalidate_registry_cache,
     get_registry_cache_snapshot,
@@ -31,6 +28,8 @@ from back.objects.registry.obx_format import CURRENT_OBX_FORMAT_VERSION
 __all__ = [
     "RegistryCfg",
     "RegistryService",
+    "ReviewService",
+    "CommentService",
     "PermissionService",
     "permission_service",
     "ROLE_ADMIN",
@@ -43,7 +42,6 @@ __all__ = [
     "ASSIGNABLE_ROLES",
     "role_level",
     "min_role",
-    "require",
     "BuildScheduler",
     "get_scheduler",
     "invalidate_registry_cache",
@@ -56,14 +54,38 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    """Lazy-import scheduler (APScheduler) so tests and minimal envs can import RegistryCfg."""
+    """Lazy-import scheduler (APScheduler) so tests and minimal envs can import RegistryCfg.
+
+    ``ReviewService`` and ``CommentService`` are also lazy: they import
+    ``back.objects.session`` at module load, and the ``session`` package
+    imports ``back.objects.registry.registry_cache`` during its own init —
+    so importing them eagerly here would create a fragile import cycle.
+    """
+    if name == "ReviewService":
+        from back.objects.registry.collab.ReviewService import (
+            ReviewService as _ReviewService,
+        )
+
+        globals()["ReviewService"] = _ReviewService
+        return _ReviewService
+    if name == "CommentService":
+        from back.objects.registry.collab.CommentService import (
+            CommentService as _CommentService,
+        )
+
+        globals()["CommentService"] = _CommentService
+        return _CommentService
     if name == "BuildScheduler":
-        from back.objects.registry.scheduler import BuildScheduler as _BuildScheduler
+        from back.objects.registry.schedule.BuildScheduler import (
+            BuildScheduler as _BuildScheduler,
+        )
 
         globals()["BuildScheduler"] = _BuildScheduler
         return _BuildScheduler
     if name == "get_scheduler":
-        from back.objects.registry.scheduler import get_scheduler as _get_scheduler
+        from back.objects.registry.schedule.BuildScheduler import (
+            get_scheduler as _get_scheduler,
+        )
 
         globals()["get_scheduler"] = _get_scheduler
         return _get_scheduler

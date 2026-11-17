@@ -1,10 +1,28 @@
 /**
  * OntoBricks — query-sync.css
- * Triple store / Digital Twin build (sync) section — extracted from _query_sync.html
+ * Triple store / Knowledge Graph build (sync) section — extracted from _query_sync.html
  */
 
 #sync-section .sync-content-section {
     position: relative;
+}
+
+/* Knowledge Graph readiness indicator (next to each sub-page title) */
+.kg-status-indicator .badge {
+    font-size: 0.7rem;
+    vertical-align: middle;
+}
+
+.kg-status-indicator .kg-status-spinner {
+    width: 0.7rem;
+    height: 0.7rem;
+    border-width: 0.12em;
+    vertical-align: -0.05rem;
+}
+
+.kg-status-indicator .kg-go-build-btn {
+    font-size: 0.72rem;
+    line-height: 1.4;
 }
 
 #syncLoadingOverlay.sync-loading-overlay {
@@ -13,16 +31,12 @@
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(248, 249, 250, 0.95);
+    background: rgba(255, 255, 255, 0.95);
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     z-index: 10;
-}
-
-#syncTabs.ob-nav-tabs-gap {
-    gap: 2px;
 }
 
 #syncProgressArea .progress.ob-progress-md {
@@ -44,46 +58,46 @@
 /* Readiness tiles now use shared .ob-kpi-tile from components.css */
 
 /* =====================================================================
- * Building Digital Twin — live build log card
+ * Building Knowledge Graph — live build log card
  * ===================================================================== */
 
-#syncBuildLogCard .sync-build-log {
+.timed-task-log-card .sync-build-log {
     display: flex;
     flex-direction: column;
     gap: 4px;
 }
 
-#syncBuildLogCard .sync-build-row {
+.timed-task-log-card .sync-build-row {
     display: grid;
     grid-template-columns: 24px 1fr auto;
     align-items: start;
     gap: 8px;
     padding: 6px 8px;
     border-radius: 6px;
-    background: #fafafa;
+    background: #ffffff;
     border: 1px solid #f0f0f0;
 }
 
-#syncBuildLogCard .sync-build-row.sync-step-running {
+.timed-task-log-card .sync-build-row.sync-step-running {
     background: #eff6ff;
     border-color: #bfdbfe;
 }
 
-#syncBuildLogCard .sync-build-row.sync-step-completed {
+.timed-task-log-card .sync-build-row.sync-step-completed {
     background: #f0fdf4;
     border-color: #dcfce7;
 }
 
-#syncBuildLogCard .sync-build-row.sync-step-failed {
+.timed-task-log-card .sync-build-row.sync-step-failed {
     background: #fef2f2;
     border-color: #fecaca;
 }
 
-#syncBuildLogCard .sync-build-row.sync-step-skipped {
+.timed-task-log-card .sync-build-row.sync-step-skipped {
     opacity: 0.7;
 }
 
-#syncBuildLogCard .sync-step-icon {
+.timed-task-log-card .sync-step-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -91,38 +105,38 @@
     line-height: 1;
 }
 
-#syncBuildLogCard .sync-step-body {
+.timed-task-log-card .sync-step-body {
     min-width: 0;
 }
 
-#syncBuildLogCard .sync-step-title {
+.timed-task-log-card .sync-step-title {
     font-weight: 500;
     font-size: 0.875rem;
     line-height: 1.3;
     color: #111827;
 }
 
-#syncBuildLogCard .sync-build-row.sync-step-pending .sync-step-title,
-#syncBuildLogCard .sync-build-row.sync-step-skipped .sync-step-title {
+.timed-task-log-card .sync-build-row.sync-step-pending .sync-step-title,
+.timed-task-log-card .sync-build-row.sync-step-skipped .sync-step-title {
     color: #6b7280;
     font-weight: 400;
 }
 
-#syncBuildLogCard .sync-step-detail {
+.timed-task-log-card .sync-step-detail {
     font-size: 0.78rem;
     color: #4b5563;
     margin-top: 2px;
     word-break: break-word;
 }
 
-#syncBuildLogCard .sync-step-time {
+.timed-task-log-card .sync-step-time {
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
     align-self: center;
     padding-left: 8px;
 }
 
-/* ── Digital Twin architecture diagram ────────── */
+/* ── Knowledge Graph architecture diagram ────────── */
 .dt-arch-diagram {
     display: flex;
     align-items: stretch;
@@ -185,6 +199,11 @@
 }
 .dt-arch-sub-item .dt-arch-name { margin-top: 0; }
 .dt-arch-build-note {
+    /* Force onto its own flex row below the arch cards. Bootstrap `w-100`
+       only sets width:100%, which under `flex-wrap` still shrinks and stays
+       inline — stealing horizontal space and collapsing the Sync/Graph DB
+       card titles to one character per line. flex-basis:100% guarantees a wrap. */
+    flex-basis: 100%;
     margin-top: 0.5rem;
     padding-top: 0.5rem;
     border-top: 1px solid #f0f0f0;
@@ -197,6 +216,12 @@
     align-items: stretch;
     flex: 2;
     gap: 0;
+}
+/* Storage-kind badge on the Lakehouse Build page: whether ..._data is a
+   materialized Delta table or a pass-through view over the gateway. */
+.dbx-storage-badge {
+    font-size: 0.65rem;
+    flex-shrink: 0;
 }
 .dt-arch-icon-triplestore   { color: #FF3621; }
 .dt-arch-icon-lakebase-img  { width: 1.5rem; height: 1.5rem; flex-shrink: 0; }

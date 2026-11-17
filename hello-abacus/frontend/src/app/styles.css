@@ -1,0 +1,56 @@
+:root {
+  font-family: Inter, system-ui, sans-serif;
+  color: #17202a;
+  background: #f5f7fa;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 680px;
+  margin: 12vh auto;
+  padding: 2rem;
+  background: white;
+  border-radius: 16px;
+  box-shadow: 0 12px 40px #17202a14;
+}
+
+.eyebrow {
+  color: #067a6f;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.intro {
+  color: #566573;
+}
+
+form {
+  display: flex;
+  gap: 0.75rem;
+  margin: 2rem 0;
+}
+
+input {
+  flex: 1;
+  border: 1px solid #ccd5dd;
+  border-radius: 8px;
+  padding: 0.75rem;
+}
+
+button {
+  border: 0;
+  border-radius: 8px;
+  padding: 0.75rem 1.25rem;
+  color: white;
+  background: #067a6f;
+  cursor: pointer;
+}
+
+li {
+  margin: 0.5rem 0;
+}

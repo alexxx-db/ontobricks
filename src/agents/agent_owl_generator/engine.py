@@ -10,6 +10,7 @@ engine transparently degrades to a single-shot generation (no tool calls).
 """
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +24,7 @@ from agents.agent_owl_generator.tools import (
     TOOL_DEFINITIONS,
     TOOL_HANDLERS,
 )
+from agents.tools.pitfalls import tool_check_owl_pitfalls
 from agents.engine_base import (
     AgentStep,
     call_serving_endpoint,
@@ -37,7 +39,42 @@ logger = get_logger(__name__)
 MAX_ITERATIONS = 10
 LLM_TIMEOUT = 180
 
+# Bounded PGE retry cap for the Evaluator stage (§3.5): how many times the
+# deterministic Stage-1 ontology checks may feed retry_hints back into
+# generation before owl delivery proceeds regardless.
+MAX_OWL_EVAL_ROUNDS = 2
+
+# Output-token budget per LLM call. Databricks-hosted models cap output at
+# ~8192 tokens (see agent_auto_icon_assign._ABSOLUTE_MAX_TOKENS); the full
+# ontology Turtle is emitted in one message, so budgeting below the cap risks
+# a length-truncated body that fails to parse downstream (→ empty ontology).
+# Exhaustive per-class datatype-property coverage (see # ATTRIBUTE COVERAGE)
+# makes Turtle large; 8192 is the platform ceiling — the truncation guard
+# below retries with a conciseness hint when finish_reason == "length".
+_GEN_MAX_TOKENS = 8192
+
 _TRACE_NAME = "owl_generator"
+
+# Max pitfall-fix rounds the agent may consume (overridable via options dict).
+# The agent drives the quality loop itself via check_owl_pitfalls tool calls.
+_DEFAULT_MAX_FIX_ROUNDS = 5
+
+# Over-generation guard. An over-decomposed ontology (one class per column or
+# per attribute value) explodes the downstream auto-mapping cost — the mapper
+# chunks ~5 classes/chunk with cool-downs, so a 110-class ontology needs ~22
+# chunks and overruns the scenario budget. Cap the accepted class count; on
+# overflow, ask the model (bounded) to consolidate to the core entities.
+# Overridable via options["max_classes"]; <= 0 disables the guard.
+_DEFAULT_MAX_CLASSES = 40
+_MAX_CONSOLIDATE_ROUNDS = 2
+
+# Matches an owl:Class declaration: a subject typed via `a` or `rdf:type`.
+_OWL_CLASS_DECL_RE = re.compile(r"(?:\ba|\brdf:type)\s+owl:Class\b")
+
+
+def _count_owl_classes(turtle: str) -> int:
+    """Count owl:Class declarations in a Turtle string (declaration-only)."""
+    return len(_OWL_CLASS_DECL_RE.findall(turtle or ""))
 
 
 # =====================================================
@@ -55,6 +92,7 @@ class AgentResult:
     iterations: int = 0
     error: str = ""
     usage: Dict[str, int] = field(default_factory=dict)
+    iteration_summary: List[Dict] = field(default_factory=list)
 
 
 # =====================================================
@@ -82,16 +120,19 @@ Your goal is to generate a concise, logically consistent OWL ontology (**Turtle*
 
 # TOOLS
 You have four tools:
-  • list_documents  – discover documents in the domain volume
-  • read_document   – read a document's text content
-  • get_metadata    – get all table schemas (names, columns, types)
+  • list_documents   – discover documents in the domain volume
+  • read_document    – read a document's text content
+  • get_metadata     – get all table schemas (names, columns, types)
   • get_table_detail – get detailed info for one table
 
 # WORKFLOW
 1. Call get_metadata to understand the database schema.
-2. Call list_documents to discover available documents.
-3. Read relevant documents with read_document.
-4. Generate the Turtle ontology from all gathered information.
+2. Call get_table_detail on EVERY table you intend to map a class to — get_metadata
+   truncates wide tables at 80 columns, and you must see the FULL column list to give
+   each class exhaustive attribute coverage (see # ATTRIBUTE COVERAGE).
+3. Call list_documents to discover available documents.
+4. Read relevant documents with read_document.
+5. Output ONLY the final Turtle ontology as plain text (starting with @prefix).
 
 # NAMING RULES (CRITICAL – NO EXCEPTIONS)
 • Classes: PascalCase (Customer, SalesOrder)
@@ -99,9 +140,55 @@ You have four tools:
 • NO spaces, underscores or hyphens in local names.
 • Convert: street_address → streetAddress, Sales Order → SalesOrder
 
+# PROPERTY NAMING — CRITICAL – NO EXCEPTIONS (violations = P3.2 / P3.3 pitfalls)
+• NEVER embed the range class name inside a property name.
+  ❌ WRONG: hasPersonName, containsEvent, hasOrderDate, includesProduct
+  ✅ RIGHT:  hasName, contains, hasDate, includes
+• NEVER embed the domain class name inside a property name.
+  ❌ WRONG: personHasName, orderContainsItem, customerHasAddress
+  ✅ RIGHT:  hasName, containsItem, hasAddress
+• The domain/range are declared separately; the name must express only the relationship verb.
+
+# PROPERTY HIERARCHY RULES (violations = P2.6 pitfall)
+• If you create two properties where one is a specialisation of the other
+  (e.g., hasAddress + hasBillingAddress), you MUST either:
+  (a) Declare rdfs:subPropertyOf (hasBillingAddress rdfs:subPropertyOf hasAddress), OR
+  (b) Merge them into one general property and use a class/type to distinguish instances.
+• Never leave pairs of suspiciously similar property names without an explicit hierarchy link.
+
 # PROPERTY TYPES
 • owl:DatatypeProperty + xsd:type for attributes (string, integer, date …)
 • owl:ObjectProperty for relationships between classes only
+• For EVERY DatatypeProperty you MUST declare rdfs:domain on the property itself
+  (do not rely on owl:Restriction alone — the platform reads attributes from rdfs:domain)
+
+# ATTRIBUTE COVERAGE (CRITICAL — exhaustive, NOT curated)
+The downstream mapping pipeline can only bind a SQL column to a class when that
+column has a matching owl:DatatypeProperty with rdfs:domain on the class. A class
+with few datatype properties produces an ID+Label-only entity that is USELESS for
+analytics. So model attributes EXHAUSTIVELY, not minimally:
+• For EVERY class, emit a DatatypeProperty for EVERY meaningful source column that
+  describes an instance of that class — across ALL tables that realise the class.
+  A single class is often realised by several source tables (e.g. one per source
+  system, region, or tenant) that each hold the same real-world entity in a local
+  schema; UNION their columns mentally and cover the full set. Use get_table_detail
+  on each covering table to see every column.
+• "Meaningful" = a genuine attribute of the entity: dates, measurements, codes,
+  scores, names, statuses, flags, free-text notes. EXCLUDE ONLY: surrogate/auto-
+  increment row keys with no analytical value, audit columns (created_at, updated_by,
+  etl_*, _ingest_*), and the foreign-key columns that ObjectProperty relationships
+  already carry.
+• When two sources expose the SAME attribute under different column names
+  (e.g. total_amount vs TOTAL_AMT; status vs STATUS_CODE), emit ONE datatype
+  property — do NOT emit a per-source duplicate. The mapping layer reconciles the
+  source columns.
+• Name datatype properties in lowerCamelCase derived from business meaning
+  (order_date → orderDate, TOTAL_AMT → totalAmount).
+  Use ONLY [a-z][A-Za-z0-9]* — never underscores, hyphens, or backslash escapes.
+• The "at least 2 datatype properties" floor in the guidelines is a MINIMUM, not a
+  target. Rich, real-world entities (a transaction, an encounter, an event, a core
+  business object) typically warrant 6–11 datatype properties. Aim for full column
+  coverage, not a tidy subset.
 
 # RELATIONSHIP RULES
 • NEVER create bidirectional relationships.
@@ -129,25 +216,29 @@ If you cannot satisfy them with the given input, say so explicitly and ask for c
 2. Model only what is needed to answer the specified competency questions (CQs).  
    - Every class or property you introduce must support at least one CQ or explicit requirement.
 3. Size limits per iteration:  
-   - 30–60 classes.  
+   - Prefer the SMALLEST set of classes that covers the input: roughly one class per real-world entity named in the guidelines/tables (typically 8–25).  
+   - NEVER create a class per column or per attribute value — those are datatype properties (e.g. `status`, `vatAmount`, `readingDate`), not classes. Merge near-duplicates aggressively.  
+   - Hard limit: 40 classes. If you approach it, consolidate rather than add.  
    - At most 4 subclass levels (max depth = 4).  
-   - At most 3 direct superclasses per class; default is a single superclass.
+   - Single inheritance only: at most 1 direct superclass per class.
 If the user does not give CQs, propose a short list of candidate CQs first, get them confirmed, then model.
 
 ## 2. Class and property design rules
 For each **class** you create:[1][2][3][4]
-1. Provide:  
-   - A short, clear natural-language definition (1–2 sentences).  
-   - At least 1 object property (unless the class is explicitly abstract).  
-   - At least 2 datatype properties, when meaningful in the domain.  
+1. Provide:
+   - A short, clear natural-language definition (1–2 sentences).
+   - At least 1 object property (unless the class is explicitly abstract).
+   - Datatype properties covering EVERY meaningful source column for the class
+     (see "# ATTRIBUTE COVERAGE" in the system prompt — exhaustive, not curated;
+     2 is a floor, full column coverage is the goal).
 2. Naming conventions:  
    - Classes: UpperCamelCase (e.g., `CustomerOrder`).  
    - Object properties: lowerCamelCase verbs or verb-like phrases (e.g., `placesOrder`).  
    - Datatype properties: lowerCamelCase nouns or attributes (e.g., `orderDate`).  
    - Do not create two classes or properties that are synonyms or near-duplicates; merge or explain the difference in their definitions.
 3. Inheritance constraints:  
-   - Default to single inheritance (`rdfs:subClassOf` one parent).  
-   - Allow multiple inheritance only if strictly necessary and documented in a comment.  
+   - Always single inheritance (`rdfs:subClassOf` one parent).  
+   - Never assign a second parent to a class that already has one.  
    - Avoid deep chains: no more than 4 levels from the topmost domain root.
 For each **property** you create:
 1. Always specify:  
@@ -209,65 +300,82 @@ If you detect a likely inconsistency or anti-pattern, correct it before output a
 # Internal helpers
 # =====================================================
 
-# Pitfall IDs that do not require ML deps — safe to run inside the agent loop.
-_NON_ML_PATTERNS = [
-    "P1.1", "P1.2", "P1.3",
-    "P2.1", "P2.2", "P2.3", "P2.4", "P2.5", "P2.6",
-    "P3.1", "P3.2", "P3.3",
-    "P4.1",
-]
+def _parse_pitfall_tool_result(tool_result_json: str) -> Optional[Dict]:
+    """Parse the JSON returned by the check_owl_pitfalls tool.  Returns None on error."""
+    try:
+        return json.loads(tool_result_json)
+    except Exception:
+        return None
 
 
-def _check_owl_pitfalls(turtle_text: str, iteration: int) -> Optional[str]:
-    """Parse *turtle_text* as an rdflib Graph, run non-ML pitfall checks, and
-    return a feedback prompt string if any issues are found, or ``None`` if clean.
+# Stage-1 absolute (Tier-1) ontology defects that the Evaluator forces a
+# retry on.  Coverage ratios are computed and logged but are advisory at the
+# generation stage (they are Tier-2 in the scorecard), so they do not by
+# themselves trigger a regeneration — only hard structural defects do.
+_EVAL_ABSOLUTE_CHECKS = (
+    "orphan_class_count",
+    "dangling_domain_range_count",
+    "naming_violation_count",
+    "duplicate_class_count",
+)
 
-    Gracefully returns ``None`` on parse errors or missing optional deps so that
-    a pitfall-check failure never blocks OWL delivery.
+
+def _evaluate_ontology_stage(
+    turtle_text: str, metadata: dict, iteration: int
+) -> Optional[str]:
+    """Run the Stage-1 deterministic ontology checks (§3.2) on *turtle_text*.
+
+    Parses the Turtle into the registry shape, runs the shared intrinsic
+    checks, and returns a concrete ``retry_hint`` feedback string when any
+    Tier-1 absolute defect (orphan class, dangling domain/range, naming
+    violation, duplicate class) is present — turning owl-gen into a real
+    PGE loop.  Returns ``None`` when the ontology is structurally clean.
+
+    Fails open: any parse/dep error returns ``None`` so a check failure
+    never blocks OWL delivery (mirrors the pitfall-tool check).
     """
     try:
-        from rdflib import Graph
-        from back.core.external.pitfalls import PitfallsService
-        import tempfile, os
+        from back.core.w3c.owl.OntologyParser import OntologyParser
+        from back.objects.ontology.Ontology import Ontology
+        from agents.pge_eval.ontology_metrics import evaluate_ontology
 
-        graph = Graph()
-        graph.parse(data=turtle_text, format="turtle")
-
-        svc = PitfallsService()
-        result = svc.run_analysis(graph, patterns=_NON_ML_PATTERNS)
-
-        issues = {
-            pid: r
-            for pid, r in result["results"].items()
-            if isinstance(r.get("count"), int) and r["count"] > 0
+        # The model sometimes prepends a prose sentence or wraps the Turtle in
+        # a markdown fence; strip that the same way the downstream registry
+        # does, so the Evaluator parses real output instead of skipping.
+        turtle_text = Ontology.clean_owl_output(turtle_text)
+        parser = OntologyParser(turtle_text)
+        ontology = {
+            "classes": parser.get_classes(),
+            "properties": parser.get_properties(),
         }
-        if not issues:
-            logger.info("Iteration %d: pitfall check — ontology is CLEAN", iteration)
-            return None
-
-        total = sum(r["count"] for r in issues.values())
+        metrics, issues, _footprint = evaluate_ontology(ontology, metadata or {})
         logger.info(
-            "Iteration %d: pitfall check — %d issue(s) in %d pattern(s): %s",
+            "Iteration %d: ontology evaluator — metrics=%s",
             iteration,
-            total,
-            len(issues),
-            list(issues.keys()),
+            metrics,
         )
 
+        absolute_issues = [
+            i for i in issues if i.get("check") in _EVAL_ABSOLUTE_CHECKS
+        ]
+        if not absolute_issues:
+            logger.info(
+                "Iteration %d: ontology evaluator — no Tier-1 defects", iteration
+            )
+            return None
+
         lines = [
-            "The Turtle ontology you just produced has the following pitfall issues. "
-            "Please fix ALL of them and output the corrected Turtle (no markdown, no comments, "
+            "The ontology you produced has structural defects. Fix ALL of them "
+            "and output ONLY the corrected Turtle (no markdown, no comments, "
             "starting with @prefix declarations):\n"
         ]
-        for pid, r in issues.items():
-            lines.append(f"**{pid}** — {r.get('title', pid)} ({r['count']} occurrence(s))")
-            for item in (r.get("items") or [])[:5]:
-                lines.append(f"  • {item}")
+        # Cap feedback to keep the prompt bounded.
+        for issue in absolute_issues[:12]:
+            lines.append(f"  • {issue['hint']}")
         return "\n".join(lines)
-
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "Iteration %d: pitfall check skipped due to error: %s",
+            "Iteration %d: ontology evaluator skipped due to error: %s",
             iteration,
             exc,
         )
@@ -341,6 +449,7 @@ def run_agent(
     domain_version: Optional[str] = None,
     selected_tables: Optional[List[str]] = None,
     selected_docs: Optional[List[str]] = None,
+    warehouse_id: Optional[str] = None,
     on_step: Optional[Callable[[str], None]] = None,
 ) -> AgentResult:
     """Run the ontology-generation agent.
@@ -371,6 +480,7 @@ def run_agent(
         domain_name=domain_name or "",
         domain_folder=domain_folder or "",
         domain_version=domain_version or "1",
+        warehouse_id=warehouse_id or "",
         metadata=metadata or {},
     )
     logger.info("Agent context created — host=%s, registry=%s", ctx.host, ctx.registry)
@@ -381,6 +491,19 @@ def run_agent(
     )
 
     result = AgentResult(success=False)
+
+    # Generation-quality loop configuration (from options with defaults).
+    # The agent drives its own check_owl_pitfalls → fix loop; max_fix_rounds
+    # is the Python-side budget cap after which we force a final text output.
+    max_fix_rounds = int(options.get("generation_max_iterations", _DEFAULT_MAX_FIX_ROUNDS))
+    max_classes = int(options.get("max_classes", _DEFAULT_MAX_CLASSES))
+    max_eval_rounds = int(options.get("owl_eval_max_rounds", MAX_OWL_EVAL_ROUNDS))
+    logger.info(
+        "run_agent: quality loop config — max_fix_rounds=%d, max_classes=%d, max_eval_rounds=%d",
+        max_fix_rounds,
+        max_classes,
+        max_eval_rounds,
+    )
 
     # Narrow metadata to selected tables when a subset was chosen
     if selected_tables and metadata.get("tables"):
@@ -464,8 +587,9 @@ def run_agent(
     # Agent loop
     # ------------------------------------------------------------------
     tools_supported = True
-    _owl_fix_rounds = 0          # number of pitfall-fix rounds already done
-    _MAX_OWL_FIX_ROUNDS = 2      # cap to avoid runaway retries
+    _owl_fix_rounds = 0        # pitfall-fix rounds consumed so far
+    _consolidate_rounds = 0    # over-generation consolidation rounds consumed
+    _owl_eval_rounds = 0       # Evaluator (Stage-1 PGE) retry rounds consumed
 
     for iteration in range(MAX_ITERATIONS):
         logger.info(
@@ -500,7 +624,7 @@ def run_agent(
                 endpoint_name,
                 messages,
                 tools=send_tools,
-                max_tokens=4096,
+                max_tokens=_GEN_MAX_TOKENS,
                 temperature=0.1,
                 timeout=LLM_TIMEOUT,
                 trace_name=_TRACE_NAME,
@@ -532,7 +656,7 @@ def run_agent(
                         endpoint_name,
                         messages,
                         tools=None,
-                        max_tokens=4096,
+                        max_tokens=_GEN_MAX_TOKENS,
                         temperature=0.1,
                         timeout=LLM_TIMEOUT,
                         trace_name=_TRACE_NAME,
@@ -685,11 +809,11 @@ def run_agent(
                 len(messages),
             )
         else:
-            # ---- Agent produced a text response (should be OWL) ----
+            # ---- Agent produced a text response ----
             content = extract_message_content(llm_response)
             starts_with_prefix = content.strip().startswith("@prefix")
             logger.info(
-                "Iteration %d: agent produced final text output — %d chars, starts_with_@prefix=%s",
+                "Iteration %d: agent produced text output — %d chars, starts_with_@prefix=%s",
                 iteration + 1,
                 len(content),
                 starts_with_prefix,
@@ -700,12 +824,48 @@ def run_agent(
                     iteration + 1,
                     content.strip(),
                 )
-            logger.debug(
-                "Iteration %d: full OWL output (%d chars):\n%s",
-                iteration + 1,
-                len(content),
-                content[:2000],
-            )
+
+            # ── Truncation guard ────────────────────────────────────────────
+            # A length-capped completion is Turtle cut off mid-statement: it
+            # fails to parse in every RDF syntax downstream and lands an empty
+            # ontology (silent success). Don't accept it — ask the model to
+            # re-emit the ontology in full and more concisely, or fail loudly
+            # when no iterations remain to recover.
+            if finish_reason == "length":
+                logger.warning(
+                    "Iteration %d: text answer truncated (finish_reason=length, "
+                    "%d chars) — not accepting as final OWL",
+                    iteration + 1,
+                    len(content),
+                )
+                if iteration < MAX_ITERATIONS - 1:
+                    notify(
+                        "Ontology output was truncated — asking the agent to "
+                        "re-emit it more concisely…"
+                    )
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your previous Turtle was cut off before it finished "
+                            "(output token limit). Re-emit the COMPLETE ontology, "
+                            "keeping every rdfs:comment to one short sentence. "
+                            "Output ONLY valid Turtle starting with @prefix — no "
+                            "prose, no code fences."
+                        ),
+                    })
+                    continue
+                result.error = (
+                    "LLM output was truncated (finish_reason=length) and could not "
+                    "be completed within the iteration budget — the generated "
+                    "ontology is incomplete."
+                )
+                logger.error(
+                    "Agent: truncated final answer at iteration %d with no budget "
+                    "to recover",
+                    iteration + 1,
+                )
+                return result
 
             result.steps.append(
                 AgentStep(
@@ -715,33 +875,161 @@ def run_agent(
                 )
             )
 
-            # ----------------------------------------------------------
-            # Pitfall verification — parse OWL and run structural checks.
-            # If issues are found and we still have fix rounds remaining,
-            # feed the issues back to the LLM and continue the loop.
-            # ----------------------------------------------------------
-            pitfall_feedback = _check_owl_pitfalls(content, iteration + 1)
-            if pitfall_feedback and _owl_fix_rounds < _MAX_OWL_FIX_ROUNDS:
-                _owl_fix_rounds += 1
-                notify(f"Pitfall issues found — fix round {_owl_fix_rounds}/{_MAX_OWL_FIX_ROUNDS}…")
-                messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": pitfall_feedback})
-                logger.info(
-                    "Iteration %d: %d pitfall issue(s) detected — starting fix round %d",
-                    iteration + 1,
-                    pitfall_feedback.count("**"),
-                    _owl_fix_rounds,
-                )
-                continue   # next iteration will produce fixed OWL
+            # ── Over-generation guard ───────────────────────────────────────
+            # An over-decomposed ontology (a class per column/value) is rarely
+            # what the guidelines asked for and balloons downstream auto-mapping
+            # cost. If the model emits far more classes than the cap, ask it once
+            # (bounded) to consolidate to the core entities before accepting.
+            if (
+                starts_with_prefix
+                and max_classes > 0
+                and _consolidate_rounds < _MAX_CONSOLIDATE_ROUNDS
+            ):
+                n_classes = _count_owl_classes(content)
+                if n_classes > max_classes:
+                    _consolidate_rounds += 1
+                    logger.warning(
+                        "Iteration %d: ontology declares %d owl:Class (cap=%d) — "
+                        "asking the agent to consolidate (round %d/%d)",
+                        iteration + 1, n_classes, max_classes,
+                        _consolidate_rounds, _MAX_CONSOLIDATE_ROUNDS,
+                    )
+                    notify(
+                        f"Ontology is over-detailed ({n_classes} classes) — asking "
+                        f"the agent to consolidate to the core entities "
+                        f"(≤{max_classes})…"
+                    )
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Your ontology declares {n_classes} classes — far more "
+                            f"than this domain needs. Consolidate to AT MOST "
+                            f"{max_classes} core classes: keep the real-world "
+                            "entities from the guidelines, merge near-duplicates, "
+                            "and DO NOT create a class per column or per attribute "
+                            "value (those are datatype properties, not classes). "
+                            "Re-emit the COMPLETE ontology as valid Turtle starting "
+                            "with @prefix — no prose, no code fences."
+                        ),
+                    })
+                    continue
 
+            # ── External pitfall check (fast, no extra LLM call) ─────────────
+            if starts_with_prefix and _owl_fix_rounds < max_fix_rounds:
+                notify("Checking ontology quality…")
+                pf_result_json = tool_check_owl_pitfalls(ctx, turtle_text=content)
+                pf_data = _parse_pitfall_tool_result(pf_result_json)
+
+                if pf_data and "error" not in pf_data:
+                    _owl_fix_rounds += 1
+                    score = pf_data.get("score", 0)
+                    warnings = pf_data.get("warnings", [])
+                    pitfall_ids = [w["id"] for w in warnings]
+                    critical_count = sum(
+                        w["count"] for w in warnings if w["id"].startswith("P1.")
+                    )
+                    is_clean = pf_data.get("is_clean", False)
+                    round_status = "passed" if is_clean else (
+                        "challenged" if _owl_fix_rounds < max_fix_rounds
+                        else "max_rounds_reached"
+                    )
+
+                    result.iteration_summary.append({
+                        "round": _owl_fix_rounds,
+                        "score": score,
+                        "critical_count": critical_count,
+                        "pitfalls": pitfall_ids,
+                        "status": round_status,
+                    })
+                    notify(f"__iter__:{json.dumps({'round': _owl_fix_rounds, 'score': score, 'critical': critical_count, 'pitfalls': pitfall_ids, 'status': round_status, 'warnings': warnings})}")
+
+                    if not is_clean and round_status == "challenged":
+                        fix_instruction = pf_data.get("fix_instruction", "")
+                        notify(
+                            f"Fix round {_owl_fix_rounds}/{max_fix_rounds} — "
+                            f"score {score}/100, {len(warnings)} warning(s)…"
+                        )
+                        logger.info(
+                            "Iteration %d: pitfall check — score=%d, %d warning(s) → injecting fix",
+                            iteration + 1, score, len(warnings),
+                        )
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"{fix_instruction}\n\n"
+                                "Output ONLY the corrected Turtle. "
+                                "Start with @prefix. No prose, no code fences."
+                            ),
+                        })
+                        continue  # next loop iteration asks the LLM to fix
+
+                    if not is_clean:
+                        notify(
+                            f"Max fix rounds ({max_fix_rounds}) reached — "
+                            "accepting best available ontology."
+                        )
+                    else:
+                        notify(f"Ontology is clean — score {score}/100 ✓")
+                    logger.info(
+                        "Iteration %d: pitfall check — score=%d, is_clean=%s, fix_round=%d/%d",
+                        iteration + 1, score, is_clean,
+                        _owl_fix_rounds, max_fix_rounds,
+                    )
+
+            # --------------------------------------------------------------
+            # Evaluator stage (PGE loop) — after the pitfall-tool loop is
+            # clean/maxed, run the Stage-1 deterministic ontology checks (§3.2).
+            # On a Tier-1 structural defect, feed concrete retry_hints back to
+            # the generator, bounded by MAX_OWL_EVAL_ROUNDS. Only retry when
+            # there's another iteration left, so a usable ontology is never
+            # discarded by exhausting MAX_ITERATIONS.
+            # --------------------------------------------------------------
+            eval_feedback = _evaluate_ontology_stage(content, ctx.metadata, iteration + 1)
+            if (
+                eval_feedback
+                and max_eval_rounds > 0
+                and _owl_eval_rounds < max_eval_rounds
+                and iteration < MAX_ITERATIONS - 1
+            ):
+                _owl_eval_rounds += 1
+                notify(
+                    f"Ontology defects found — eval round "
+                    f"{_owl_eval_rounds}/{max_eval_rounds}…"
+                )
+                result.steps.append(
+                    AgentStep(
+                        step_type="evaluator",
+                        content=eval_feedback[:200],
+                        duration_ms=0,
+                    )
+                )
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": eval_feedback})
+                logger.info(
+                    "Iteration %d: ontology evaluator found defects — eval round %d",
+                    iteration + 1,
+                    _owl_eval_rounds,
+                )
+                continue   # next iteration will produce corrected OWL
+
+            # ── Accept this text as the final OWL ────────────────────────────
             result.success = True
             result.owl_content = content
             result.iterations = iteration + 1
             result.usage = total_usage
 
+            final_score = (
+                result.iteration_summary[-1]["score"]
+                if result.iteration_summary else None
+            )
             logger.info(
-                "===== AGENT COMPLETE ===== iterations=%d, prompt_tokens=%d, completion_tokens=%d, owl_chars=%d",
+                "===== AGENT COMPLETE ===== iterations=%d, fix_rounds=%d, final_score=%s, "
+                "prompt_tokens=%d, completion_tokens=%d, owl_chars=%d",
                 result.iterations,
+                _owl_fix_rounds,
+                final_score,
                 total_usage["prompt_tokens"],
                 total_usage["completion_tokens"],
                 len(content),

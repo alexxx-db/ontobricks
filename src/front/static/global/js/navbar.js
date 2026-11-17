@@ -29,9 +29,119 @@ document.addEventListener('DOMContentLoaded', function() {
  * separate requests. Admin-only nav items are now gated declaratively
  * via ``[data-requires-app="admin"]`` in ``permissions.css`` so no
  * extra fetch or JS pass is needed.
+ *
+ * Cross-domain ``/resolve`` bridges switch the session server-side and
+ * land with ``?domain_switched=1``. Bust the navbar cache *before* the
+ * first fetch so the Domain name/version update immediately.
  */
 function initNavbar() {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('domain_switched') === '1') {
+        invalidateDomainCaches();
+        params.delete('domain_switched');
+        const qs = params.toString();
+        const clean = window.location.pathname + (qs ? '?' + qs : '') + window.location.hash;
+        try { history.replaceState(null, '', clean); } catch (_) { /* ignore */ }
+    }
+    restoreLastConfirmedDomainInfo();
     loadNavbarState();
+    initSubnavActiveState();
+    bindWorkspaceMapTrigger();
+}
+
+/**
+ * Bind the L2 domain identity/context trigger to the workspace map modal.
+ */
+function bindWorkspaceMapTrigger() {
+    const triggerIds = ['domainContextTrigger', 'settingsDomainReturnLink'];
+    triggerIds.forEach((id) => {
+        const link = document.getElementById(id);
+        if (!link || link.dataset.workspaceMapBound === 'true') return;
+        link.dataset.workspaceMapBound = 'true';
+        link.addEventListener('click', openWorkspaceMap);
+    });
+}
+
+function openWorkspaceMap(event) {
+    if (event) event.preventDefault();
+    const modalElement = document.getElementById('workspaceMapModal');
+    if (!modalElement || typeof bootstrap === 'undefined' || !bootstrap.Modal) return;
+    syncWorkspaceMapTitle();
+    highlightWorkspaceMapCurrent();
+    bootstrap.Modal.getOrCreateInstance(modalElement).show();
+}
+
+function syncWorkspaceMapTitle() {
+    const source = document.getElementById('currentDomainName');
+    const target = document.getElementById('workspaceMapDomainLabel');
+    if (source && target) target.textContent = source.textContent;
+}
+
+function highlightWorkspaceMapCurrent() {
+    const path = window.location.pathname;
+    const section = new URLSearchParams(window.location.search).get('section')
+        || (window.location.hash || '').replace(/^#/, '');
+
+    document.querySelectorAll('[data-workspace-map-item]').forEach((anchor) => {
+        anchor.classList.remove('is-current');
+        anchor.removeAttribute('aria-current');
+
+        let target;
+        try {
+            target = new URL(anchor.getAttribute('href') || '', window.location.origin);
+        } catch (_) {
+            return;
+        }
+        if (!path.startsWith(target.pathname)) return;
+
+        const targetSection = target.searchParams.get('section') || '';
+        const matchesSection = targetSection && section === targetSection;
+        const matchesDefault = !section
+            && anchor.getAttribute('data-workspace-map-default') === 'true';
+        if (matchesSection || matchesDefault) {
+            anchor.classList.add('is-current');
+            anchor.setAttribute('aria-current', 'page');
+        }
+    });
+}
+
+window.openWorkspaceMap = openWorkspaceMap;
+
+/**
+ * Mark the correct Level-2 subnav link as active based on the current URL
+ * path prefix. Runs once on page load — no polling needed.
+ */
+function initSubnavActiveState() {
+    const path = window.location.pathname;
+    const links = document.querySelectorAll('.ob-subnav-link[data-subnav-route]');
+    links.forEach(link => {
+        const route = link.getAttribute('data-subnav-route');
+        if (route && path.startsWith(route)) {
+            link.classList.add('active');
+            disableCurrentSubnavDropdown(link);
+        }
+    });
+}
+
+/**
+ * The current L2 area (Domain / Ontology / Mapping / KG) already has its
+ * sections in the left sidebar, so the matching L2 dropdown is redundant.
+ * Drop Bootstrap dropdown wiring and the menu, keep a static active tab.
+ */
+function disableCurrentSubnavDropdown(toggle) {
+    const item = toggle.closest('.ob-subnav-item');
+    const menu = item ? item.querySelector(':scope > .dropdown-menu') : null;
+    toggle.classList.remove('dropdown-toggle');
+    toggle.removeAttribute('data-bs-toggle');
+    toggle.removeAttribute('aria-expanded');
+    toggle.removeAttribute('role');
+    toggle.setAttribute('aria-current', 'page');
+    toggle.addEventListener('click', event => event.preventDefault());
+    if (item) {
+        item.classList.remove('dropdown');
+        item.classList.add('is-current');
+    }
+    if (menu) menu.remove();
 }
 
 /**
@@ -39,6 +149,37 @@ function initNavbar() {
  * apply domain info and warehouse icon to the DOM.
  * Validation indicators have moved to the Domain Validation page.
  */
+const DOMAIN_INFO_STORAGE_KEY = 'ontobricks:last-confirmed-domain-info';
+
+function rememberDomainInfo(data) {
+    try {
+        sessionStorage.setItem(DOMAIN_INFO_STORAGE_KEY, JSON.stringify(data));
+    } catch (_) { /* sessionStorage unavailable or quota exceeded */ }
+}
+
+function clearRememberedDomainInfo() {
+    try {
+        sessionStorage.removeItem(DOMAIN_INFO_STORAGE_KEY);
+    } catch (_) { /* sessionStorage unavailable */ }
+}
+
+function restoreLastConfirmedDomainInfo() {
+    try {
+        const raw = sessionStorage.getItem(DOMAIN_INFO_STORAGE_KEY);
+        if (!raw) return false;
+        const data = JSON.parse(raw);
+        if (!domainIsLoaded(data)) {
+            clearRememberedDomainInfo();
+            return false;
+        }
+        applyDomainInfo(data);
+        return true;
+    } catch (_) {
+        clearRememberedDomainInfo();
+        return false;
+    }
+}
+
 async function loadNavbarState() {
     try {
         const state = await fetchCached('/navbar/state', 15000);
@@ -47,8 +188,8 @@ async function loadNavbarState() {
         applyBrandLogo(state.branding || {});
     } catch (error) {
         console.error('Error loading navbar state:', error);
-        updateDomainMenuVisibility(false);
-        updateMenusForDomainStatus(false);
+        restoreLastConfirmedDomainInfo();
+        window.OB?.updateLlmAvailability(false);
     }
 }
 
@@ -61,8 +202,15 @@ async function loadNavbarState() {
 function applyBrandLogo(branding) {
     const img = document.getElementById('brandLogoImg');
     if (!img) return;
-    if (branding && branding.is_custom && branding.logo_url) {
+    if (branding && branding.logo_url) {
         img.src = branding.logo_url;
+    }
+    if (branding && branding.app_title) {
+        img.alt = branding.app_title;
+    }
+    const brandText = document.getElementById('brandTitleText');
+    if (brandText && branding && branding.app_title) {
+        brandText.textContent = branding.app_title;
     }
 }
 
@@ -70,7 +218,7 @@ window.applyBrandLogo = applyBrandLogo;
 
 
 /**
- * Refresh all three workflow indicators (Ontology, Mapping, Digital Twin)
+ * Refresh all three workflow indicators (Ontology, Mapping, Knowledge Graph)
  * in the top navbar. Call this single function after any change that could
  * affect one or more of these statuses.
  *
@@ -99,6 +247,23 @@ function invalidateDomainCaches() {
     }
 }
 
+const DOMAIN_GENERAL_HREF = '/domain/?section=information';
+
+/**
+ * After a domain is loaded (navbar, home, registry, import), land on
+ * Domain → General. Reloading the current page would keep the user on
+ * Home with only the top menus updated.
+ */
+function navigateToDomainGeneral() {
+    const path = (window.location.pathname || '').replace(/\/+$/, '') || '/';
+    const section = new URLSearchParams(window.location.search).get('section') || 'information';
+    if (path === '/domain' && section === 'information') {
+        window.location.reload();
+        return;
+    }
+    window.location.href = DOMAIN_GENERAL_HREF;
+}
+
 window.refreshNavbarIndicators = refreshNavbarIndicators;
 window.invalidateDomainCaches = invalidateDomainCaches;
 
@@ -118,37 +283,158 @@ function applyWarehouseIcon(warehouse) {
     }
 }
 
+// Lifecycle status → Bootstrap badge classes + label.
+const DOMAIN_STATUS_BADGE = {
+    'DRAFT': { cls: 'bg-warning-subtle text-dark border-warning', label: 'Draft' },
+    'IN-REVIEW': { cls: 'bg-info-subtle text-dark border-info', label: 'In Review' },
+    'PUBLISHED': { cls: 'bg-success-subtle text-dark border-success', label: 'Published' }
+};
+
+/**
+ * Render (or remove) a lifecycle-status badge as a sibling of *el*.
+ * Status values are a controlled enum so no escaping is required.
+ */
+function applyDomainStatusBadge(el, status) {
+    if (!el || !el.parentNode) return;
+    let badge = el.parentNode.querySelector('.domain-status-badge');
+    if (!status) {
+        if (badge) badge.remove();
+        return;
+    }
+    const cfg = DOMAIN_STATUS_BADGE[String(status).toUpperCase()]
+        || DOMAIN_STATUS_BADGE['DRAFT'];
+    if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'domain-status-badge badge border ms-2';
+        badge.style.fontSize = '0.6rem';
+        el.parentNode.insertBefore(badge, el.nextSibling);
+    }
+    badge.className = 'domain-status-badge badge border ms-2 ' + cfg.cls;
+    badge.textContent = cfg.label;
+}
+
 /**
  * Apply domain name and menu visibility from pre-fetched data.
  */
-function applyDomainInfo(data) {
-    const currentDomainNameEl = document.getElementById('currentDomainName');
-    const domainSectionName = document.getElementById('domainSectionName');
-
+function domainIsLoaded(data) {
     const stats = data.stats || {};
     const hasContent = (stats.entities > 0) || (stats.entity_mappings > 0);
-    const hasCustomName = data.info && data.info.name && data.info.name !== 'NewProject' && data.info.name !== 'NewDomain';
-    const hasDomain = hasCustomName || hasContent;
+    const name = data.info && data.info.name;
+    const hasCustomName = name && name !== 'NewProject' && name !== 'NewDomain';
+    return Boolean(hasCustomName || hasContent);
+}
+
+async function hasLoadedDomain() {
+    const state = await fetchCached('/navbar/state', 15000);
+    return domainIsLoaded(state.domain || {});
+}
+
+function applyDomainInfo(data) {
+    const currentDomainNameEl = document.getElementById('currentDomainName');
+    const domainContextVersion = document.getElementById('domainContextVersion');
+    const domainSectionName = document.getElementById('domainSectionName');
+    const hasDomain = domainIsLoaded(data);
+    // The navbar-state source of truth is domain.info.llm_endpoint.
+    window.OB?.updateLlmAvailability(Boolean(data.info?.llm_endpoint?.trim()));
 
     const domainName = (data.info && data.info.name) ? data.info.name : 'NewDomain';
     const version = (data.info && data.info.version) || '1';
+    const status = (data.info && data.info.status) || 'DRAFT';
+
+    if (hasDomain) {
+        rememberDomainInfo(data);
+    } else {
+        clearRememberedDomainInfo();
+    }
 
     if (currentDomainNameEl) {
         if (hasDomain) {
-            currentDomainNameEl.textContent = `${domainName} V${version}`;
+            currentDomainNameEl.textContent = domainName;
+            applyDomainStatusBadge(currentDomainNameEl, status);
         } else {
             currentDomainNameEl.textContent = 'Domain';
+            applyDomainStatusBadge(currentDomainNameEl, null);
+        }
+    }
+    if (domainContextVersion) {
+        domainContextVersion.textContent = hasDomain ? String(version) : '';
+    }
+
+    const mapLabel = document.getElementById('workspaceMapDomainLabel');
+    if (mapLabel) {
+        mapLabel.textContent = hasDomain ? `${domainName} V${version}` : 'Domain';
+        applyDomainStatusBadge(mapLabel, hasDomain ? status : null);
+    }
+    const contextTrigger = document.getElementById('domainContextTrigger');
+    if (contextTrigger) {
+        if (hasDomain) {
+            contextTrigger.setAttribute(
+                'aria-label',
+                `Open workspace map for ${domainName}, version ${version}, ${statusLabel(status)}`
+            );
+        } else {
+            contextTrigger.setAttribute('aria-label', 'Open workspace map for Domain');
+        }
+    }
+    const settingsReturnLink = document.getElementById('settingsDomainReturnLink');
+    if (settingsReturnLink) {
+        if (hasDomain) {
+            const label = `Back to domain for ${domainName}, opens domain navigation via the workspace map`;
+            settingsReturnLink.setAttribute('aria-label', label);
+            settingsReturnLink.setAttribute('title', label);
+        } else {
+            settingsReturnLink.setAttribute('aria-label', 'Back to domain');
+            settingsReturnLink.setAttribute('title', 'Back to domain');
         }
     }
 
     if (domainSectionName) {
         domainSectionName.textContent = domainName;
+        applyDomainStatusBadge(domainSectionName, hasDomain ? status : null);
     }
 
     updateDomainMenuVisibility(hasDomain);
 
-    const hasRegistry = data.registry && data.registry.catalog && data.domain_folder;
-    updateMenusForDomainStatus(hasRegistry);
+    // Sub-pages unlock as soon as a domain is open in session.
+    // UC-save is no longer required for basic navigation.
+    updateMenusForDomainStatus(hasDomain);
+
+    // Ontology-only ("No Backend") domains have no graph, so Mapping and
+    // Knowledge Graph are disabled entirely.
+    updateMenusForGraphBackend(hasDomain ? (data.info && data.info.graph_backend) : null);
+}
+
+/**
+ * Disable Mapping + Knowledge Graph navigation for "No Backend" domains.
+ * @param {string|null} backend - The per-domain graph backend, or null.
+ */
+function updateMenusForGraphBackend(backend) {
+    const graphless = backend === 'none';
+    const title = 'Not available for a No Backend (ontology-only) domain';
+    document.querySelectorAll('.nav-requires-graph').forEach(link => {
+        if (graphless) {
+            link.classList.add('nav-disabled');
+            link.setAttribute('aria-disabled', 'true');
+            link.style.pointerEvents = 'none';
+            link.setAttribute('title', title);
+        } else {
+            link.classList.remove('nav-disabled');
+            link.removeAttribute('aria-disabled');
+            link.style.pointerEvents = '';
+            link.removeAttribute('title');
+        }
+    });
+    document.querySelectorAll('.sidebar-requires-graph').forEach(link => {
+        if (graphless) {
+            link.classList.add('sidebar-disabled', 'disabled');
+            link.style.pointerEvents = 'none';
+            link.setAttribute('title', title);
+        } else {
+            link.classList.remove('sidebar-disabled', 'disabled');
+            link.style.pointerEvents = '';
+            link.removeAttribute('title');
+        }
+    });
 }
 
 /**
@@ -262,12 +548,35 @@ function enableMenusAfterSave() {
 }
 
 /**
- * Update domain dropdown menu visibility based on domain state
- * Note: All menu items are now always visible
+ * Update L2 subnav visibility based on domain state.
+ *
+ * The L2 slot shows the domain workspace rail outside Settings, and the
+ * Settings return control when Settings has a domain open in session.
  */
 function updateDomainMenuVisibility(hasDomain) {
-    // All domain menu items are now always visible
-    // This function is kept for compatibility but does nothing
+    const isSettingsPage = document.body.dataset.page === 'settings';
+    const showSettingsReturn = isSettingsPage && hasDomain;
+    const showWorkspaceRail = !isSettingsPage && hasDomain;
+
+    // Show/hide L2 subnav
+    const subnav = document.getElementById('obSubnav');
+    if (subnav) {
+        subnav.classList.toggle('d-none', !showSettingsReturn && !showWorkspaceRail);
+        if (typeof window.OBBreadcrumb !== 'undefined' && typeof window.OBBreadcrumb._updateChromeHeight === 'function') {
+            window.OBBreadcrumb._updateChromeHeight();
+        }
+    }
+    const domainWorkspaceSubnavNav = document.getElementById('domainWorkspaceSubnavNav');
+    if (domainWorkspaceSubnavNav) {
+        domainWorkspaceSubnavNav.classList.toggle('d-none', !showWorkspaceRail);
+    }
+    const settingsDomainReturnNav = document.getElementById('settingsDomainReturnNav');
+    if (settingsDomainReturnNav) {
+        settingsDomainReturnNav.classList.toggle('d-none', !showSettingsReturn);
+    }
+    document.querySelectorAll('[data-subnav-domain-chrome]').forEach((el) => {
+        el.classList.toggle('d-none', !showWorkspaceRail);
+    });
 }
 
 
@@ -283,40 +592,73 @@ window.refreshDigitalTwinStatus = refreshNavbarIndicators;
 // ==========================================
 
 /**
- * Start a new domain (clears current data)
+ * Start a new domain — closes any currently loaded domain (with the shared
+ * save/discard/cancel flow), then collects the new details and registers it.
  */
 async function domainNew() {
-    const confirmed = await showConfirmDialog({
-        title: 'New Domain',
-        message: 'Start a new domain? This will clear all current ontology, design, and mapping data.',
-        confirmText: 'Start New',
-        confirmClass: 'btn-warning',
-        icon: 'file-earmark-plus'
-    });
-    if (!confirmed) return;
-    
+    const closed = await closeCurrentDomain({ navigate: false });
+    if (!closed) return;
+
+    const input = await showNewDomainDialog();
+    if (!input) return;
+
     try {
-        const response = await fetch('/domain/clear', {
+        // Persist name, description, and LLM endpoint to session.
+        const payload = { name: input.name };
+        if (input.description) payload.description = input.description;
+        if (input.llm_endpoint) payload.llm_endpoint = input.llm_endpoint;
+        if (input.llm_endpoint_kind) {
+            payload.llm_endpoint_kind = input.llm_endpoint_kind;
+        }
+        if (input.graph_backend) payload.graph_backend = input.graph_backend;
+        await fetch('/domain/info', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
             credentials: 'same-origin'
         });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-            showNotification('New domain started', 'success');
-            invalidateDomainCaches();
-            // Hand off the spinner to the next page: domain.js / domain-information.js
-            // pick this flag up on DOMContentLoaded, show the overlay until the
-            // initial Promise.all (info + version-status + LLM endpoints) resolves.
-            try { sessionStorage.setItem('ob_creating_new_domain', '1'); } catch (e) {}
-            setTimeout(() => {
-                window.location.href = '/domain/#information';
-            }, 1000);
-        } else {
-            showNotification('Error: ' + data.message, 'error');
-        }
+
+        invalidateDomainCaches();
+
+        // Sync any stale Domain → General form on the current page with the NEW
+        // domain values. When "New Domain" is triggered from another domain's
+        // General page, #domainName still holds the previously-loaded
+        // domain's name. doDomainSave()'s pre-save duplicate-name guard reads
+        // that field, so without this it would validate (and reject) the OLD
+        // name — e.g. "A domain named \"cust360auto\" already exists" — instead
+        // of the new one.
+        try {
+            const nameEl = document.getElementById('domainName');
+            if (nameEl) {
+                nameEl.value = input.name;
+                nameEl.classList.remove('is-invalid');
+            }
+            const dupHint = document.getElementById('domainNameDuplicateHint');
+            if (dupHint) dupHint.remove();
+            const descEl = document.getElementById('domainDescription');
+            if (descEl) descEl.value = input.description || '';
+            const llmEl = document.getElementById('domainLlmEndpoint');
+            if (llmEl && input.llm_endpoint) llmEl.value = input.llm_endpoint;
+            const llmKindEl = document.getElementById('domainLlmEndpointKind');
+            if (llmKindEl && input.llm_endpoint_kind) {
+                llmKindEl.value = input.llm_endpoint_kind;
+            }
+            const llmDisplayEl = document.getElementById('domainLlmEndpointDisplay');
+            if (llmDisplayEl && input.llm_endpoint) {
+                llmDisplayEl.value = input.llm_endpoint;
+            }
+            const backendEl = document.getElementById('domainGraphBackend');
+            if (backendEl && input.graph_backend) {
+                backendEl.value = input.graph_backend;
+                if (typeof applyGraphlessConstraints === 'function') applyGraphlessConstraints();
+            }
+            if (typeof updateAutoBaseUri === 'function') updateAutoBaseUri();
+        } catch (e) { /* General form not on this page — nothing to sync */ }
+
+        // Register the new domain in the registry directly (no Save popup)
+        // and open it on success.
+        const ok = await doDomainSave({ afterSave: '/domain/#information' });
+        if (!ok) return;
     } catch (error) {
         console.error('Error creating new domain:', error);
         showNotification('Failed to create new domain: ' + error.message, 'error');
@@ -324,10 +666,29 @@ async function domainNew() {
 }
 
 /**
- * Save domain to Unity Catalog Volume
- * Volume path uses the domain folder; file name = version number
+ * Save domain to the registry.
+ * Persists domain info / design layout first, then saves without a confirmation popup.
  */
+let _domainSaving = false;
+
+/** Swap the navbar Save icon for a spinner (and block re-clicks) while saving. */
+function setDomainSaveBusy(busy) {
+    document.querySelectorAll('.ob-subnav-save-btn').forEach((btn) => {
+        btn.classList.toggle('is-saving', busy);
+        btn.setAttribute('aria-busy', busy ? 'true' : 'false');
+        btn.querySelector('i.bi')?.classList.toggle('d-none', busy);
+        btn.querySelector('.ob-save-spinner')?.remove();
+        if (busy) {
+            btn.insertAdjacentHTML('afterbegin',
+                '<span class="spinner-border ob-save-spinner" role="status" aria-hidden="true"></span>');
+        }
+    });
+}
+
 async function domainSave() {
+    if (_domainSaving || !validateDomainInfoForm()) return;
+    _domainSaving = true;
+    setDomainSaveBusy(true);
     try {
         // First, save domain info from form if on the domain page
         await saveDomainInfoBeforeSave();
@@ -365,13 +726,125 @@ async function domainSave() {
             }
         }
         
-        // Show catalog/schema selection dialog
-        showDomainSaveDialog();
+        await doDomainSave();
     } catch (error) {
         console.error('Error preparing save:', error);
         showNotification('Failed to prepare save: ' + error.message, 'error');
+    } finally {
+        _domainSaving = false;
+        setDomainSaveBusy(false);
     }
 }
+
+/**
+ * Read the MCP tab into the persisted policy shape.
+ *
+ * Returns undefined when the tab is absent so a partial form cannot wipe a
+ * stored policy. Only non-default entries are emitted, mirroring the
+ * server-side coercion in back/core/mcp_tools.py.
+ */
+function buildMcpPolicy() {
+    const toolEls = document.querySelectorAll('.js-mcp-tool');
+    const contextEls = document.querySelectorAll('.js-mcp-context');
+    if (!toolEls.length && !contextEls.length) return undefined;
+
+    const policy = {};
+    const disabled = Array.from(toolEls)
+        .filter(el => !el.checked)
+        .map(el => el.dataset.toolName);
+    if (disabled.length) policy.disabled_tools = disabled;
+
+    const context = {};
+    contextEls.forEach(el => {
+        if (el.value && el.value !== 'normal') context[el.dataset.featureName] = el.value;
+    });
+    if (Object.keys(context).length) policy.context = context;
+    return policy;
+}
+
+/**
+ * Build the ``/domain/info`` payload from the Domain → General form.
+ *
+ * Single source of truth for both save entry points (the General form's
+ * own Save and the auto-save that runs before a UC save) so the two cannot
+ * drift and silently drop a field.
+ */
+function buildDomainInfoPayload() {
+    const nameEl = document.getElementById('domainName');
+    const descEl = document.getElementById('domainDescription');
+    const authorEl = document.getElementById('domainAuthor');
+    const quorumEl = document.getElementById('domainReviewQuorum');
+    const baseUriEl = document.getElementById('domainBaseUri');
+    const llmEndpointEl = document.getElementById('domainLlmEndpoint');
+    const llmEndpointKindEl = document.getElementById('domainLlmEndpointKind');
+    const graphBackendEl = document.getElementById('domainGraphBackend');
+    const neo4jConnEl = document.getElementById('domainNeo4jDatabase');
+    const materializationEl = document.getElementById('domainLakehouseMaterialization');
+    const versionEl = document.getElementById('domainVersionSelect');
+
+    const payload = {
+        name: nameEl ? nameEl.value.trim() : undefined,
+        description: descEl ? descEl.value.trim() : undefined,
+        author: authorEl ? authorEl.value.trim() : undefined,
+        base_uri: baseUriEl ? baseUriEl.value.trim() : undefined,
+        base_uri_auto: (typeof _baseUriAutoMode !== 'undefined') ? _baseUriAutoMode : undefined,
+        llm_endpoint: llmEndpointEl ? llmEndpointEl.value : undefined,
+        llm_endpoint_kind: llmEndpointKindEl ? llmEndpointKindEl.value : undefined,
+        review_quorum: quorumEl ? Math.max(1, parseInt(quorumEl.value, 10) || 1) : undefined,
+        graph_backend: graphBackendEl ? graphBackendEl.value : undefined,
+        // Only meaningful for Neo4j; cleared for other backends so a stale
+        // connection name cannot linger on the domain.
+        neo4j_connection: graphBackendEl
+            ? (graphBackendEl.value === 'neo4j' && neo4jConnEl ? neo4jConnEl.value : '')
+            : undefined,
+        // Only meaningful for Lakehouse. Off Lakehouse, store the product
+        // default (`view`) so switching back to Lakehouse does not revive a
+        // materialized copy. Other engines ignore this field.
+        lakehouse_materialization: graphBackendEl
+            ? (graphBackendEl.value === 'databricks' && materializationEl
+                ? materializationEl.value : 'view')
+            : undefined,
+        graph_cache_enabled: (function () {
+            const backend = graphBackendEl ? graphBackendEl.value : '';
+            const cacheEl = document.getElementById('domainGraphCacheEnabled');
+            if (backend !== 'databricks' && backend !== 'lakebase') return undefined;
+            return cacheEl ? cacheEl.checked : true;
+        })(),
+        version: versionEl ? versionEl.value : undefined,
+        mcp_policy: buildMcpPolicy(),
+    };
+
+    // Drop absent fields so a page without the full form cannot clobber
+    // values already stored on the domain.
+    Object.keys(payload).forEach(key => {
+        if (payload[key] === undefined) delete payload[key];
+    });
+    return payload;
+}
+
+window.buildDomainInfoPayload = buildDomainInfoPayload;
+
+/**
+ * True when the Domain → General form can be persisted.
+ *
+ * A Neo4j domain must name a connection — the server rejects a blank one, so
+ * catch it here with a message that names the fix.
+ */
+function validateDomainInfoForm() {
+    const graphBackendEl = document.getElementById('domainGraphBackend');
+    if (!graphBackendEl || graphBackendEl.value !== 'neo4j') return true;
+    const neo4jConnEl = document.getElementById('domainNeo4jDatabase');
+    if (neo4jConnEl && neo4jConnEl.value) return true;
+    if (typeof showNotification === 'function') {
+        showNotification(
+            'Select a Neo4j connection (managed in Settings → Neo4j) before saving.',
+            'warning'
+        );
+    }
+    return false;
+}
+
+window.validateDomainInfoForm = validateDomainInfoForm;
 
 /**
  * Save domain info from form fields before saving to UC
@@ -383,35 +856,29 @@ async function saveDomainInfoBeforeSave() {
     const authorEl = document.getElementById('domainAuthor');
     const baseUriEl = document.getElementById('domainBaseUri');
     const llmEndpointEl = document.getElementById('domainLlmEndpoint');
-    const versionEl = document.getElementById('domainVersionSelect');
+    const graphBackendEl = document.getElementById('domainGraphBackend');
 
     // If any form fields exist, save the domain info
-    if (nameEl || descEl || authorEl || baseUriEl || llmEndpointEl) {
-        const domainInfoPayload = {
-            name: nameEl ? nameEl.value.trim() : undefined,
-            description: descEl ? descEl.value.trim() : undefined,
-            author: authorEl ? authorEl.value.trim() : undefined,
-            base_uri: baseUriEl ? baseUriEl.value.trim() : undefined,
-            base_uri_auto: (typeof _baseUriAutoMode !== 'undefined') ? _baseUriAutoMode : undefined,
-            llm_endpoint: llmEndpointEl ? llmEndpointEl.value : undefined,
-            version: versionEl ? versionEl.value : undefined,
-        };
-        
-        // Remove undefined values
-        Object.keys(domainInfoPayload).forEach(key => {
-            if (domainInfoPayload[key] === undefined) delete domainInfoPayload[key];
-        });
-        
+    if (nameEl || descEl || authorEl || baseUriEl || llmEndpointEl || graphBackendEl) {
+        const domainInfoPayload = buildDomainInfoPayload();
+
         // Only save if we have something to save
         if (Object.keys(domainInfoPayload).length > 0) {
             console.log('[Domain] Auto-saving domain info before UC save:', domainInfoPayload);
             try {
-                await fetch('/domain/info', {
+                const response = await fetch('/domain/info', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(domainInfoPayload),
                     credentials: 'same-origin'
                 });
+                const data = await response.json();
+                if (!response.ok || data.success !== true) {
+                    throw new Error(data.message || 'Domain info save failed');
+                }
+                window.OB?.updateLlmAvailability(
+                    Boolean((data.info?.llm_endpoint || '').trim())
+                );
                 invalidateDomainCaches();
             } catch (e) {
                 console.warn('Could not auto-save domain info:', e);
@@ -421,74 +888,16 @@ async function saveDomainInfoBeforeSave() {
 }
 
 /**
- * Show confirmation dialog before saving to the registry.
+ * Persist the domain to the registry (no confirmation popup).
+ * Kept as a named export for callers that previously opened the save dialog.
+ * @param {Object} [opts]
+ * @param {string} [opts.afterSave] - URL to navigate to after a successful save.
  */
-async function showDomainSaveDialog() {
-    const modalHtml = `
-        <div class="modal fade" id="domainSaveModal" tabindex="-1">
-            <div class="modal-dialog">
-                <div class="modal-content">
-                    <div class="modal-header">
-                        <h5 class="modal-title"><i class="bi bi-cloud-upload"></i> Save Domain to Registry</h5>
-                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-                    </div>
-                    <div class="modal-body">
-                        <div id="saveRegistryInfo" class="mb-3">
-                            <span class="spinner-border spinner-border-sm me-1"></span> Checking registry...
-                        </div>
-                        <div class="alert alert-info small">
-                            <i class="bi bi-info-circle"></i>
-                            <strong>Domain:</strong> <span id="saveDomainName">Loading...</span><br>
-                            <strong>Version:</strong> <span id="saveDomainVersion">Loading...</span>
-                        </div>
-                    </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                        <button type="button" class="btn btn-primary" id="btnConfirmSave" disabled>
-                            <i class="bi bi-cloud-upload"></i> Save
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    `;
-
-    const existingModal = document.getElementById('domainSaveModal');
-    if (existingModal) existingModal.remove();
-    document.body.insertAdjacentHTML('beforeend', modalHtml);
-    const modal = new bootstrap.Modal(document.getElementById('domainSaveModal'));
-    modal.show();
-
-    try {
-        const infoData = await fetchOnce('/domain/info');
-        if (infoData.success) {
-            document.getElementById('saveDomainName').textContent = infoData.info.name || 'NewDomain';
-            document.getElementById('saveDomainVersion').textContent = infoData.info.version || '1';
-        }
-    } catch (_) { /* ignore */ }
-
-    // Check registry
-    try {
-        const regResp = await fetch('/settings/registry', { credentials: 'same-origin' });
-        const reg = await regResp.json();
-        const infoDiv = document.getElementById('saveRegistryInfo');
-        if (reg.configured) {
-            infoDiv.innerHTML = '<div class="alert alert-success small mb-0"><i class="bi bi-check-circle-fill text-success me-1"></i> Registry</div>';
-            document.getElementById('btnConfirmSave').disabled = false;
-        } else {
-            infoDiv.innerHTML = '<div class="alert alert-warning small mb-0"><i class="bi bi-exclamation-triangle me-1"></i> Registry not configured. <a href="/settings">Go to Settings</a></div>';
-        }
-    } catch (e) {
-        document.getElementById('saveRegistryInfo').innerHTML = '<div class="alert alert-danger small mb-0">Error checking registry</div>';
-    }
-
-    document.getElementById('btnConfirmSave').addEventListener('click', async () => {
-        modal.hide();
-        await doDomainSave();
-    });
+async function showDomainSaveDialog(opts = {}) {
+    return doDomainSave({ afterSave: opts.afterSave });
 }
 
-async function doDomainSave() {
+async function doDomainSave(opts = {}) {
     try {
         // Belt-and-suspenders duplicate-name guard: domain.js already
         // checks ``/domain/check-name`` (debounced 500 ms on every
@@ -508,7 +917,7 @@ async function doDomainSave() {
                 || 'A domain with this name already exists in the registry. Please choose a different name.';
             showNotification(_msg, 'error');
             try { _nameEl.focus(); } catch (e) {}
-            return;
+            return false;
         }
         showNotification('Saving domain to registry...', 'info', 5000);
         const response = await fetch('/domain/save-to-uc', {
@@ -519,20 +928,418 @@ async function doDomainSave() {
         });
         const data = await response.json();
         if (data.success) {
+            if (typeof clearRegistryDirty === 'function') clearRegistryDirty();
             showNotification(data.message || 'Domain saved successfully!', 'success');
             enableMenusAfterSave();
             await refreshNavbarIndicators();
             loadDomainName();
+            if (opts.afterSave) {
+                setTimeout(() => { window.location.href = opts.afterSave; }, 800);
+            }
+            return true;
         } else {
             showNotification('Error: ' + data.message, 'error');
+            return false;
         }
     } catch (error) {
         showNotification('Error: ' + error.message, 'error');
+        return false;
+    }
+}
+
+// ==========================================
+// Domain close (release edit lock + return home)
+// ==========================================
+
+/**
+ * Close the currently open domain.
+ *
+ * Single-editor concurrency is release-based: the domain stays locked for
+ * every other user until the holder closes it here (or an admin takes
+ * over). Closing asks whether to save first, then releases the edit lock,
+ * resets the session and returns to the Home page.
+ */
+function canSaveBeforeClose() {
+    if (window.OB && typeof window.OB.canEditOntology === 'function') {
+        return window.OB.canEditOntology();
+    }
+    return isSwitchSaveAllowed() && window.editLockMode !== 'view';
+}
+
+async function closeCurrentDomain(options = {}) {
+    const { navigate = false } = options;
+    let loaded;
+    try {
+        loaded = await hasLoadedDomain();
+    } catch (error) {
+        showNotification('Could not determine whether a domain is open.', 'error');
+        return false;
+    }
+    if (!loaded) return true;
+
+    const allowSave = canSaveBeforeClose();
+    const choice = await showCloseDomainDialog({ allowSave });
+    if (!choice || choice === 'cancel') return false;
+
+    if (choice === 'save' && allowSave) {
+        await saveDomainInfoBeforeSave();
+        const saved = await doDomainSave({ afterSave: null });
+        if (!saved) return false;
+    }
+
+    return closeDomainSession({ navigate });
+}
+
+async function domainClose() {
+    await closeCurrentDomain({ navigate: true });
+}
+
+/**
+ * Release the edit lock, reset the session and optionally navigate to Home.
+ */
+async function closeDomainSession(options = {}) {
+    const { navigate = true } = options;
+    showDomainLoading('Closing domain...');
+    try {
+        const response = await fetch('/domain/close', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin'
+        });
+        const data = await response.json();
+        if (!response.ok || data.success === false) {
+            throw new Error(data.message || 'Could not close domain');
+        }
+        invalidateDomainCaches();
+        if (navigate) {
+            window.location.href = '/';
+        } else {
+            applyDomainInfo({});
+            hideDomainLoading();
+        }
+        return true;
+    } catch (error) {
+        hideDomainLoading();
+        showNotification('Failed to close domain: ' + error.message, 'error');
+        return false;
     }
 }
 
 /**
- * Load domain from Unity Catalog Volume
+ * Ask the user whether to save before closing.
+ * Resolves to 'save' | 'discard' | 'cancel'.
+ */
+function showCloseDomainDialog(options = {}) {
+    const { allowSave = true } = options;
+    return new Promise((resolve) => {
+        const existing = document.getElementById('domainCloseModal');
+        if (existing) existing.remove();
+
+        const closeHint = allowSave
+            ? 'Do you want to save your changes before closing?'
+            : 'This domain is open in read-only mode and cannot be saved from this session.';
+        const saveAction = allowSave ? `<button type="button" class="btn btn-primary" id="closeSaveBtn">
+                   <i class="bi bi-cloud-upload"></i> Save &amp; Close
+               </button>`
+            : '';
+        const modalHtml = `
+            <div class="modal fade" id="domainCloseModal" tabindex="-1">
+                <div class="modal-dialog modal-dialog-centered">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title"><i class="bi bi-x-circle me-2"></i>Close Domain</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body">
+                            <p class="mb-2">Closing releases the edit lock so another user can edit this domain.</p>
+                            <p class="text-muted mb-0">${closeHint}</p>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" id="closeCancelBtn">Cancel</button>
+                            <button type="button" class="btn btn-outline-danger" id="closeDiscardBtn">
+                                <i class="bi bi-x-lg"></i> Close without saving
+                            </button>
+                            ${saveAction}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.insertAdjacentHTML('beforeend', modalHtml);
+        const modalEl = document.getElementById('domainCloseModal');
+        const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+
+        let outcome = 'cancel';
+        const finish = (choice) => { outcome = choice; modal.hide(); };
+
+        document.getElementById('closeCancelBtn').addEventListener('click', () => finish('cancel'));
+        document.getElementById('closeDiscardBtn').addEventListener('click', () => finish('discard'));
+        const saveBtn = document.getElementById('closeSaveBtn');
+        if (saveBtn) {
+            saveBtn.addEventListener('click', () => finish('save'));
+        }
+
+        modalEl.addEventListener('hidden.bs.modal', () => {
+            modalEl.remove();
+            resolve(outcome);
+        });
+
+        modal.show();
+    });
+}
+
+// ==========================================
+// Domain switch (reload current / load another version)
+// ==========================================
+
+/**
+ * Create a new version from the current domain state.
+ *
+ * This global action is shared by the Versions popup and Domain > Versions.
+ * Branching remains available for read-only or incomplete domain versions.
+ */
+async function createNewDomainVersion(options = {}) {
+    const confirmed = await showConfirmDialog({
+        title: 'Create New Version',
+        message: 'This will copy the current version and increment the version number. Continue?',
+        confirmText: 'Create Version',
+        confirmClass: 'btn-primary',
+        icon: 'plus-circle'
+    });
+    if (!confirmed) return;
+
+    if (typeof options.closeSourceModal === 'function') {
+        options.closeSourceModal();
+    }
+    showDomainLoading('Creating and loading new version…');
+
+    try {
+        showNotification('Creating new version…', 'info', 2000);
+
+        const response = await fetch('/domain/create-version', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin'
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            showNotification('Version ' + data.new_version + ' created!', 'success');
+            if (typeof invalidateDomainCaches === 'function') invalidateDomainCaches();
+            window.location.reload();
+        } else {
+            hideDomainLoading();
+            if (typeof options.restoreSourceModal === 'function') {
+                options.restoreSourceModal();
+            }
+            showNotification('Error: ' + data.message, 'error');
+        }
+    } catch (err) {
+        hideDomainLoading();
+        if (typeof options.restoreSourceModal === 'function') {
+            options.restoreSourceModal();
+        }
+        showNotification('Error: ' + err.message, 'error');
+    }
+}
+
+/**
+ * Switch the open domain to another version — or reload the current one — from
+ * the Registry.
+ *
+ * Opens a popup listing every available version of the currently open domain
+ * (the current one flagged) so the user can either reload it (discard the
+ * in-session edits and re-fetch from the Registry) or jump to a different
+ * version. Because both paths overwrite the session, the popup offers to
+ * *save first*; unchecking that box discards unsaved changes.
+ */
+async function domainSwitch() {
+    let info;
+    try {
+        const resp = await fetch('/domain/info', { credentials: 'same-origin' });
+        info = await resp.json();
+    } catch (e) {
+        showNotification('Could not read the current domain', 'error');
+        return;
+    }
+
+    const domainSlug = (info && info.domain_folder) || '';
+    const domainName = (info && (info.name || (info.info && info.info.name))) || 'domain';
+    const currentVersion = (info && (info.info && info.info.version)) || (info && info.version) || '';
+
+    if (!domainSlug) {
+        showNotification('Save the domain to the registry first before switching versions', 'warning');
+        return;
+    }
+
+    showSwitchDomainDialog(domainSlug, domainName, String(currentVersion));
+}
+
+/**
+ * True when the loaded domain version allows persisting design edits (DRAFT).
+ * Mirrors ``window.OB.canEditOntology`` / ``version-check.js`` signals without
+ * requiring the permissions module.
+ */
+function isSwitchSaveAllowed() {
+    if (window.isActiveVersion === false) return false;
+    if (window.versionStatus && window.versionStatus !== 'DRAFT') return false;
+    return true;
+}
+
+/**
+ * Render the Switch-version popup for the currently open domain.
+ */
+function showSwitchDomainDialog(domainSlug, domainName, currentVersion) {
+    const existing = document.getElementById('domainSwitchModal');
+    if (existing) existing.remove();
+
+    const modalHtml = `
+        <div class="modal fade" id="domainSwitchModal" tabindex="-1">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="bi bi-arrow-repeat me-2"></i>Switch Version</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p class="mb-2 small text-muted">
+                            <i class="bi bi-diagram-3 me-1"></i>Domain: <strong>${escapeHtmlAttr(domainName)}</strong>
+                        </p>
+                        <div class="mb-3">
+                            <label class="form-label" for="switchVersionSelect">Version to load</label>
+                            <select class="form-select" id="switchVersionSelect" disabled>
+                                <option value="">Loading versions…</option>
+                            </select>
+                            <div class="form-text">Pick the current version to reload it from the Registry, or another version to switch.</div>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="switchSaveFirst" checked>
+                            <label class="form-check-label" for="switchSaveFirst">
+                                Save my changes before switching
+                            </label>
+                            <div class="form-text text-warning-emphasis" id="switchSaveFirstHint">
+                                <i class="bi bi-exclamation-triangle me-1"></i>Unchecking discards any unsaved changes.
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-outline-secondary" id="btnCreateVersionFromSwitch">
+                            <i class="bi bi-plus-circle me-1"></i> New Version
+                        </button>
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="button" class="btn btn-primary" id="btnConfirmSwitch" disabled>
+                            <i class="bi bi-arrow-repeat"></i> Switch
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+    const modalEl = document.getElementById('domainSwitchModal');
+    const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+    modal.show();
+    modalEl.addEventListener('hidden.bs.modal', () => modalEl.remove());
+
+    configureSwitchSaveOption();
+    populateSwitchVersions(currentVersion);
+    document.getElementById('btnCreateVersionFromSwitch').addEventListener('click', () => createNewDomainVersion({
+        closeSourceModal: () => modal.hide(),
+        restoreSourceModal: () => showSwitchDomainDialog(domainSlug, domainName, currentVersion)
+    }));
+
+    document.getElementById('btnConfirmSwitch').addEventListener('click', async () => {
+        const select = document.getElementById('switchVersionSelect');
+        const version = select.value;
+        if (!version) {
+            showNotification('Please select a version', 'warning');
+            return;
+        }
+        const saveCheckbox = document.getElementById('switchSaveFirst');
+        const saveFirst = saveCheckbox && saveCheckbox.checked && !saveCheckbox.disabled
+            && isSwitchSaveAllowed();
+        modal.hide();
+
+        if (saveFirst) {
+            if (typeof saveDomainInfoBeforeSave === 'function') await saveDomainInfoBeforeSave();
+            const ok = await doDomainSave({ afterSave: null });
+            if (!ok) return;
+        }
+
+        await doDomainLoad(domainSlug, version);
+    });
+}
+
+/**
+ * Enable or disable the "save before switching" option based on lifecycle
+ * status. Non-DRAFT versions are read-only — switching is navigation only.
+ */
+function configureSwitchSaveOption() {
+    const saveCheckbox = document.getElementById('switchSaveFirst');
+    const saveHint = document.getElementById('switchSaveFirstHint');
+    if (!saveCheckbox) return;
+
+    const editable = isSwitchSaveAllowed();
+    if (editable) {
+        saveCheckbox.checked = true;
+        saveCheckbox.disabled = false;
+        return;
+    }
+
+    saveCheckbox.checked = false;
+    saveCheckbox.disabled = true;
+    if (saveHint) {
+        saveHint.classList.remove('text-warning-emphasis');
+        saveHint.classList.add('text-muted');
+        saveHint.innerHTML =
+            '<i class="bi bi-lock me-1"></i>This version is read-only; switching will not save changes.';
+    }
+}
+
+/**
+ * Fill the Switch popup version dropdown from ``/domain/versions-list``.
+ * The currently loaded version is flagged and pre-selected.
+ */
+async function populateSwitchVersions(currentVersion) {
+    const select = document.getElementById('switchVersionSelect');
+    const confirmBtn = document.getElementById('btnConfirmSwitch');
+    try {
+        const resp = await fetch('/domain/versions-list', { credentials: 'same-origin' });
+        const data = await resp.json();
+
+        if (!data.success || !data.versions || data.versions.length === 0) {
+            select.innerHTML = '<option value="">No versions found</option>';
+            return;
+        }
+
+        select.innerHTML = '';
+        data.versions.forEach((v) => {
+            const ver = String(v.version);
+            const isCurrent = v.is_current || ver === String(currentVersion);
+            const label = `v${ver} — ${statusLabel(v.status)}` + (isCurrent ? ' (current — reload)' : '');
+            const opt = document.createElement('option');
+            opt.value = ver;
+            opt.textContent = label;
+            if (isCurrent) opt.selected = true;
+            select.appendChild(opt);
+        });
+        select.disabled = false;
+        confirmBtn.disabled = false;
+    } catch (e) {
+        select.innerHTML = '<option value="">Error loading versions</option>';
+    }
+}
+
+/** Minimal attribute-safe escaper for interpolated text. */
+function escapeHtmlAttr(text) {
+    const div = document.createElement('div');
+    div.textContent = text == null ? '' : String(text);
+    return div.innerHTML;
+}
+
+/**
+ * Load domain from the Lakebase registry
  */
 async function domainLoad() {
     // Check if warehouse is selected first
@@ -707,10 +1514,11 @@ async function loadVersionsForDomainFromRegistry(domainName) {
         versionSelect.disabled = false;
 
         if (data.success && data.versions && data.versions.length > 0) {
+            const statuses = data.version_status || {};
             const sorted = data.versions.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
             versionSelect.innerHTML = '';
-            sorted.forEach((ver, idx) => {
-                const label = idx === 0 ? `${ver} (Latest)` : `${ver} (Read-Only)`;
+            sorted.forEach((ver) => {
+                const label = `v${ver} — ${statusLabel(statuses[ver])}`;
                 versionSelect.innerHTML += `<option value="${ver}">${label}</option>`;
             });
             versionSelect.value = sorted[0];
@@ -727,6 +1535,14 @@ async function loadVersionsForDomainFromRegistry(domainName) {
     }
 }
 
+function statusLabel(status) {
+    switch ((status || 'DRAFT').toUpperCase()) {
+        case 'PUBLISHED': return 'Published';
+        case 'IN-REVIEW': return 'In Review';
+        default: return 'Draft';
+    }
+}
+
 async function doDomainLoad(domainSlug, version) {
     showDomainLoading(`Loading ${domainSlug}...`);
     try {
@@ -739,8 +1555,14 @@ async function doDomainLoad(domainSlug, version) {
         const data = await response.json();
         if (data.success) {
             showNotification(data.message || 'Domain loaded successfully!', 'success');
+            // The server session already points at the new domain. Drop the
+            // stale remembered badge and repaint from the fresh /navbar/state
+            // *before* reloading, so the navbar never keeps showing the
+            // previous domain during the reload delay (or briefly after it).
             invalidateDomainCaches();
-            setTimeout(() => location.reload(), 1000);
+            clearRememberedDomainInfo();
+            await loadNavbarState();
+            setTimeout(() => navigateToDomainGeneral(), 1000);
         } else {
             hideDomainLoading();
             showNotification('Error: ' + data.message, 'error');
@@ -749,52 +1571,6 @@ async function doDomainLoad(domainSlug, version) {
         hideDomainLoading();
         showNotification('Error: ' + error.message, 'error');
     }
-}
-
-/**
- * Handle the selected domain export file - parse and check for versions
- */
-async function handleDomainFile(input) {
-    const file = input.files[0];
-    if (!file) return;
-    
-    try {
-        // Read the file content first
-        const content = await file.text();
-        let importedDomain;
-        
-        try {
-            importedDomain = JSON.parse(content);
-        } catch (e) {
-            showNotification('Error: Invalid JSON in domain file', 'error');
-            input.value = '';
-            return;
-        }
-        
-        // Check if file has versions
-        if (importedDomain.versions && Object.keys(importedDomain.versions).length > 0) {
-            const versions = Object.keys(importedDomain.versions).sort().reverse();
-            
-            if (versions.length > 1) {
-                // Show version selection dialog
-                showVersionSelectionDialog(versions, importedDomain, async (selectedVersion) => {
-                    await importDomainWithVersion(importedDomain, selectedVersion);
-                });
-            } else {
-                // Only one version, load it directly
-                await importDomainWithVersion(importedDomain, versions[0]);
-            }
-        } else {
-            // Legacy format without versions - load directly
-            await importDomainDirect(importedDomain);
-        }
-    } catch (error) {
-        console.error('Error loading domain file:', error);
-        showNotification('Failed to load domain: ' + error.message, 'error');
-    }
-    
-    // Reset file input
-    input.value = '';
 }
 
 /**
@@ -929,7 +1705,7 @@ function handleImportResponse(data) {
         }
         showNotification(msg, 'success');
         invalidateDomainCaches();
-        setTimeout(() => location.reload(), 1500);
+        setTimeout(() => navigateToDomainGeneral(), 1500);
     } else {
         hideDomainLoading();
         showNotification('Error loading domain: ' + data.message, 'error');
@@ -939,11 +1715,15 @@ function handleImportResponse(data) {
 // Expose domain actions globally
 window.domainNew = domainNew;
 window.domainSave = domainSave;
+window.domainClose = domainClose;
+window.domainSwitch = domainSwitch;
+window.createNewDomainVersion = createNewDomainVersion;
 window.domainLoad = domainLoad;
 window.showDomainSaveDialog = showDomainSaveDialog;
 window.showDomainLoadDialog = showDomainLoadDialog;
 window.doDomainSave = doDomainSave;
 window.doDomainLoad = doDomainLoad;
+window.navigateToDomainGeneral = navigateToDomainGeneral;
 window.checkDomainSavedStatus = loadDomainName;
 window.enableMenusAfterSave = enableMenusAfterSave;
 window.updateMenusForDomainStatus = updateMenusForDomainStatus;

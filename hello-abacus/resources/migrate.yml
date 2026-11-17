@@ -1,0 +1,26 @@
+resources:
+  jobs:
+    migrate:
+      name: hello-abacus-migrate${var.name_suffix}
+      tasks:
+        - task_key: atlas_apply
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/migrate.py
+            parameters:
+              - ${workspace.file_path}
+              - projects/hello-abacus${var.name_suffix}/branches/production/endpoints/primary
+              - app
+              - ${var.app_users_role}
+        - task_key: uc_tables
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/create_tables.py
+            parameters:
+              - ${resources.schemas.app_data.id}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - databricks-sdk==0.81.0

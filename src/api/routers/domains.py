@@ -3,7 +3,7 @@
 Mounted at ``/api/v1/domains`` and ``/api/v1/domain/...`` (prefix ``/v1`` on the sub-app).
 """
 
-from typing import List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
@@ -18,6 +18,14 @@ from back.core.errors import (
 )
 from back.core.logging import get_logger
 from back.objects.digitaltwin import DigitalTwin
+from back.objects.digitaltwin.node.NodeContextService import NodeContextService
+from back.objects.digitaltwin.node.NodeBusinessRuleService import (
+    BUSINESS_RULES_FEATURE,
+    NodeBusinessRuleService,
+)
+from back.objects.digitaltwin.node.NodeShaclService import NodeShaclService
+from back.objects.digitaltwin.node.VirtualAttributeService import VirtualAttributeService
+from back.objects.ontology.ClassModel import ClassModel
 from back.objects.registry import RegistryCfg, RegistryService
 from back.objects.session import SessionManager, get_domain, get_session_manager
 
@@ -62,6 +70,19 @@ class SparkSQLResponse(BaseModel):
 class DomainInfo(BaseModel):
     name: str
     description: str = ""
+    graph_backend: Literal["none", "lakebase", "databricks", "neo4j"] = Field(
+        default="lakebase",
+        description="Backend configured on the numeric-latest PUBLISHED version; "
+        "'none' denotes an ontology-only domain.",
+    )
+    # Per-domain MCP surface policy. Empty means "every tool exposed, every
+    # ontology attachment surfaced normally".
+    mcp_policy: Dict[str, Any] = Field(default_factory=dict)
+    # False when the numeric-latest PUBLISHED version has never been built:
+    # the domain is ontology-only, so the MCP surface exposes describe_ontology
+    # (plus the registry tools) and hides every graph tool. Defaults True so a
+    # client that predates the field keeps the full surface.
+    has_graph: bool = True
 
 
 class DomainsResponse(BaseModel):
@@ -110,6 +131,8 @@ class DesignStatusResponse(BaseModel):
 class VersionInfo(BaseModel):
     version: str
     is_latest: bool = False
+    status: str = "DRAFT"
+    is_published: bool = False
 
 
 class VersionsResponse(BaseModel):
@@ -117,6 +140,25 @@ class VersionsResponse(BaseModel):
     domain_name: Optional[str] = None
     versions: List[VersionInfo] = Field(default_factory=list)
     latest_version: Optional[str] = None
+    message: Optional[str] = None
+
+
+class ClassActionsItem(BaseModel):
+    name: str
+    uri: str
+    datasets: List[dict] = Field(default_factory=list)
+    dataset: Optional[dict] = None
+    bridges: List[dict] = Field(default_factory=list)
+    actions: List[dict] = Field(default_factory=list)
+    business_rules: List[dict] = Field(default_factory=list)
+    virtualAttributes: List[dict] = Field(default_factory=list)
+    shacl_shape_count: int = 0
+
+
+class ClassActionsResponse(BaseModel):
+    success: bool
+    domain_name: Optional[str] = None
+    classes: List[ClassActionsItem] = Field(default_factory=list)
     message: Optional[str] = None
 
 
@@ -163,7 +205,14 @@ async def list_registry_domains(
     return DomainsResponse(
         success=True,
         domains=[
-            DomainInfo(name=p["name"], description=p["description"]) for p in items
+            DomainInfo(
+                name=p["name"],
+                description=p["description"],
+                graph_backend=p.get("graph_backend", "lakebase"),
+                mcp_policy=p.get("mcp_policy") or {},
+                has_graph=p.get("has_graph", True),
+            )
+            for p in items
         ],
     )
 
@@ -216,12 +265,29 @@ async def list_domain_versions(
         raise NotFoundError(f"No versions found for domain '{domain_name}'")
 
     latest = versions_sorted[0]
+
+    def _status_for(version: str) -> str:
+        # Cheap single-column status lookup instead of loading the full
+        # version document (ontology + assignment + layout + metadata)
+        # just to read one field.
+        status = svc.get_version_status(domain_name, version)
+        return (status or "DRAFT").upper()
+
+    versions = []
+    for v in versions_sorted:
+        status = _status_for(v)
+        versions.append(
+            VersionInfo(
+                version=v,
+                is_latest=(v == latest),
+                status=status,
+                is_published=(status == "PUBLISHED"),
+            )
+        )
     return VersionsResponse(
         success=True,
         domain_name=domain_name,
-        versions=[
-            VersionInfo(version=v, is_latest=(v == latest)) for v in versions_sorted
-        ],
+        versions=versions,
         latest_version=latest,
     )
 
@@ -290,9 +356,7 @@ async def get_domain_design_status(
         has_owl=has_owl,
     )
 
-    meta = domain._data.get("domain", domain._data.get("project", {})).get(
-        "metadata", {}
-    )
+    meta = domain._data["domain"].get("metadata", {})
     tables = meta.get("tables", [])
     metadata_status = MetadataStatus(
         ready=len(tables) > 0,
@@ -414,6 +478,109 @@ async def get_domain_design_status(
 
 
 # ---------------------------------------------------------------------------
+# GET /domain/classes
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/domain/classes",
+    response_model=ClassActionsResponse,
+    response_model_exclude_none=True,
+    summary="List class Actions (dataset + bridges + actions + virtual attributes)",
+    description="Return per-class dataset, bridge, Unity Catalog function "
+    "action and virtual attribute metadata for all classes in the domain's "
+    "published ontology. Virtual attributes are declarations only — their "
+    "values come from the node-context endpoint. Only non-empty values are "
+    "included.",
+)
+async def get_domain_classes(
+    domain_name: Optional[str] = Query(
+        None,
+        description="Domain name in the registry (uses current session domain if omitted)",
+    ),
+    domain_version: Optional[str] = Query(
+        None,
+        description="Domain version to load (uses latest version if omitted)",
+    ),
+    registry_catalog: Optional[str] = Query(None, description="Override registry catalog"),
+    registry_schema: Optional[str] = Query(None, description="Override registry schema"),
+    registry_volume: Optional[str] = Query(None, description="Override registry volume"),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    domain = DigitalTwin.resolve_domain(
+        domain_name,
+        session_mgr,
+        settings,
+        registry_catalog,
+        registry_schema,
+        registry_volume,
+        domain_version,
+    )
+    _raw_dname = domain.domain_folder or (domain.info or {}).get("name", "")
+    dname = _raw_dname if isinstance(_raw_dname, str) else ""
+    raw_classes = domain.get_classes() or []
+
+    # External surface: honour the domain's MCP context policy so a disabled
+    # attachment is never handed to an MCP client.
+    policy = NodeContextService.resolve_context_policy(domain)
+    disabled = NodeContextService.context_feature_disabled
+    swrl_rules = NodeBusinessRuleService.domain_swrl_rules(domain)
+
+    items: List[ClassActionsItem] = []
+    for cls in raw_classes:
+        datasets = (
+            []
+            if disabled(policy, "dataset")
+            else ClassModel.normalize_datasets(cls)
+        )
+        dataset = datasets[0] if datasets else None
+        bridges = (
+            []
+            if disabled(policy, "bridges")
+            else NodeContextService.enrich_bridge_targets(
+                cls.get("bridges") or [],
+                session_mgr=session_mgr,
+                settings=settings,
+                registry_catalog=registry_catalog,
+                registry_schema=registry_schema,
+                registry_volume=registry_volume,
+            )
+        )
+        actions = [] if disabled(policy, "actions") else cls.get("actions") or []
+        business_rules = (
+            []
+            if disabled(policy, BUSINESS_RULES_FEATURE)
+            else NodeBusinessRuleService.class_entries(cls, swrl_rules)
+        )
+        virtual_attributes = (
+            []
+            if disabled(policy, "virtual_attributes")
+            else VirtualAttributeService.class_entries(cls)
+        )
+        items.append(
+            ClassActionsItem(
+                name=cls.get("name", ""),
+                uri=cls.get("uri", ""),
+                datasets=datasets,
+                dataset=dataset,
+                bridges=bridges,
+                actions=actions,
+                business_rules=business_rules,
+                virtualAttributes=virtual_attributes,
+                shacl_shape_count=NodeShaclService.count_applicable(
+                    domain, cls.get("name", "")
+                ),
+            )
+        )
+
+    logger.info(
+        "API: domain/classes for '%s' — %d classes", dname, len(items)
+    )
+    return ClassActionsResponse(success=True, domain_name=dname, classes=items)
+
+
+# ---------------------------------------------------------------------------
 # GET /domain/ontology, /domain/r2rml, /domain/sparksql
 # ---------------------------------------------------------------------------
 
@@ -484,7 +651,7 @@ async def get_domain_ontology(
     if not owl_content:
         raise InfrastructureError("Could not generate OWL content")
 
-    base_uri = domain.ontology.get("base_uri", DEFAULT_BASE_URI)
+    base_uri = domain.ontology.get("base_uri") or DEFAULT_BASE_URI
     logger.info(
         "API: returning OWL for domain '%s' (%d classes, %d properties)",
         domain.domain_folder or "(session)",
@@ -552,7 +719,7 @@ async def get_domain_r2rml(
         try:
             from back.core.w3c import R2RMLGenerator
 
-            base_uri = domain.ontology.get("base_uri", DEFAULT_BASE_URI)
+            base_uri = domain.ontology.get("base_uri") or DEFAULT_BASE_URI
             generator = R2RMLGenerator(base_uri)
             r2rml_content = generator.generate_mapping(
                 domain.assignment, domain.ontology
@@ -565,7 +732,7 @@ async def get_domain_r2rml(
     if not r2rml_content:
         raise InfrastructureError("Could not generate R2RML content")
 
-    base_uri = domain.ontology.get("base_uri", DEFAULT_BASE_URI)
+    base_uri = domain.ontology.get("base_uri") or DEFAULT_BASE_URI
     logger.info(
         "API: returning R2RML for domain '%s' (%d entities, %d relationships)",
         domain.domain_folder or "(session)",
@@ -629,7 +796,7 @@ async def get_domain_sparksql(
     if not r2rml_content:
         raise ValidationError("No R2RML mapping available. Configure mappings first.")
 
-    base_uri = domain.ontology.get("base_uri", DEFAULT_BASE_URI)
+    base_uri = domain.ontology.get("base_uri") or DEFAULT_BASE_URI
     try:
         entity_mappings, relationship_mappings = sparql.extract_r2rml_mappings(
             r2rml_content

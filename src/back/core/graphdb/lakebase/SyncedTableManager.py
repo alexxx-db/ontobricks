@@ -6,7 +6,7 @@ plane (Databricks Delta -> Lakebase Postgres) without iterating triples
 in the FastAPI process.
 
 The full architecture is described in
-:doc:`/graphdb-integration` (Lakebase managed-synced section).
+:doc:`/guides/backend` (Lakebase managed-synced section).
 
 SDK compatibility
 -----------------
@@ -37,6 +37,7 @@ from back.core.errors import (
     ValidationError,
 )
 from back.core.logging import get_logger
+from shared.config.constants import HTTP_USER_AGENT
 
 
 def _raise_if_cancelled(
@@ -231,7 +232,11 @@ class _RestDatabaseAPI:
         if host and not host.startswith(("http://", "https://")):
             host = "https://" + host
         token = os.environ.get("DATABRICKS_TOKEN") or ""
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": HTTP_USER_AGENT,
+        }
         body = kwargs.get("body")
         resp = requests.request(
             method,
@@ -435,13 +440,44 @@ class SyncedTableManager:
         """
         existing = self.get(name)
         if existing is not None:
-            logger.info("Synced table %s already exists — reusing", name)
-            return existing
+            existing_state = self._extract_state(existing)
+            if existing_state not in _TERMINAL_FAIL:
+                logger.info("Synced table %s already exists — reusing", name)
+                return existing
+            logger.warning(
+                "Synced table %s is in terminal state %s (%s) — attempting "
+                "to replace the broken registration",
+                name,
+                existing_state,
+                self._extract_status_message(existing) or "no status message",
+            )
+            try:
+                self._w().database.delete_synced_database_table(
+                    name=name, purge_data=True
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not delete broken synced table %s (%s) — "
+                    "trying a fallback registration name",
+                    name,
+                    exc,
+                )
+            else:
+                if self.get(name) is None:
+                    logger.info("Deleted broken synced table %s", name)
+                    existing = None
+                else:
+                    logger.warning(
+                        "Broken synced table %s is still visible after DELETE — "
+                        "trying a fallback registration name",
+                        name,
+                    )
 
         # ── Candidate names: primary first, then ghost-state fallbacks ────────
-        candidates = [name] + [
+        fallback_candidates = [
             f"{name}{sfx}" for sfx in self._GHOST_FALLBACK_SUFFIXES
         ]
+        candidates = ([name] if existing is None else []) + fallback_candidates
         actual_name = name  # updated when a fallback is used
 
         for candidate in candidates:
@@ -458,6 +494,15 @@ class SyncedTableManager:
             if candidate != name:
                 existing_fallback = self.get(candidate)
                 if existing_fallback is not None:
+                    fallback_state = self._extract_state(existing_fallback)
+                    if fallback_state in _TERMINAL_FAIL:
+                        logger.warning(
+                            "Synced table fallback %s is also in terminal state %s "
+                            "— trying the next candidate",
+                            candidate,
+                            fallback_state,
+                        )
+                        continue
                     logger.info(
                         "Synced table fallback %s already exists — reusing "
                         "(primary %s has a ghost control-plane reservation).",
@@ -639,7 +684,7 @@ class SyncedTableManager:
                     f"Root causes in order of likelihood:\n"
                     f"  1. The app SP lacks CAN_USE on the Lakebase Autoscaling "
                     f"project — the /api/2.0/permissions/database-instances grant "
-                    f"used by bootstrap-lakebase-perms.sh may not apply to "
+                    f"used by scripts/bootstrap/lakebase-perms.sh may not apply to "
                     f"Autoscaling projects.  Re-run the bootstrap script and verify "
                     f"the grant appears in the project's ACL.\n"
                     f"  2. The SP lacks SELECT on the Unity Catalog table — run: "
@@ -733,7 +778,11 @@ class SyncedTableManager:
                     name,
                 )
                 self._wait_for_pipeline_update(
-                    pid, uid, remaining, cancel_check=cancel_check
+                    name,
+                    pid,
+                    uid,
+                    remaining,
+                    cancel_check=cancel_check,
                 )
             idle_pipeline_wait_done = True
 
@@ -885,6 +934,7 @@ class SyncedTableManager:
 
     def _wait_for_pipeline_update(
         self,
+        synced_table_name: str,
         pipeline_id: str,
         update_id: str,
         timeout_s: float,
@@ -900,6 +950,20 @@ class SyncedTableManager:
                 cancel_check,
                 f"waiting for pipeline update {update_id}",
             )
+            synced = self.get(synced_table_name)
+            if synced is None:
+                raise InfrastructureError(
+                    f"Synced table {synced_table_name} disappeared while waiting "
+                    f"for pipeline update {update_id}"
+                )
+            synced_state = self._extract_state(synced)
+            if synced_state in _TERMINAL_FAIL:
+                detail = self._extract_status_message(synced)
+                suffix = f": {detail}" if detail else ""
+                raise InfrastructureError(
+                    f"Synced table {synced_table_name} reached terminal failure "
+                    f"state {synced_state}{suffix}"
+                )
             try:
                 resp = self._w().pipelines.get_update(
                     pipeline_id=pipeline_id,
@@ -975,42 +1039,6 @@ class SyncedTableManager:
             create_database_objects_if_missing=create_database_objects_if_missing,
         )
 
-    def _build_synced_table_sdk(
-        self,
-        *,
-        name: str,
-        source_table_full_name: str,
-        primary_key_columns: List[str],
-        sync_mode: str,
-        create_database_objects_if_missing: bool,
-    ) -> Any:
-        sync_mode_norm = (sync_mode or "snapshot").upper()
-        scheduling_policy_cls = getattr(_db_svc, "SyncedTableSchedulingPolicy", None)
-        if scheduling_policy_cls is not None:
-            policy = getattr(scheduling_policy_cls, sync_mode_norm, None) or getattr(
-                scheduling_policy_cls, "SNAPSHOT"
-            )
-        else:
-            policy = sync_mode_norm
-
-        spec = _db_svc.SyncedTableSpec(  # type: ignore[union-attr]
-            source_table_full_name=source_table_full_name,
-            primary_key_columns=list(primary_key_columns),
-            scheduling_policy=policy,
-            create_database_objects_if_missing=create_database_objects_if_missing,
-        )
-        # NOTE: _build_synced_table_payload always returns a plain dict now
-        # (see its docstring), so this method is never called from the hot path.
-        # It is kept for completeness.  The SDK SyncedDatabaseTable object does
-        # not expose database_branch, so we cannot use it for branch-targeted
-        # creation.
-        return _db_svc.SyncedDatabaseTable(  # type: ignore[union-attr]
-            name=name,
-            database_instance_name=self._project or None,
-            logical_database_name=self._logical_db or None,
-            spec=spec,
-        )
-
     def _build_synced_table_dict(
         self,
         *,
@@ -1056,6 +1084,13 @@ class SyncedTableManager:
         )
         raw = str(getattr(state, "name", state)).upper()
         return raw.removeprefix("SYNCED_TABLE_")
+
+    @staticmethod
+    def _extract_status_message(synced: Any) -> str:
+        status = getattr(synced, "data_synchronization_status", None)
+        if status is None:
+            return ""
+        return str(getattr(status, "message", "") or "").strip()
 
     @staticmethod
     def _is_not_found(exc: Exception) -> bool:

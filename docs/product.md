@@ -1,5 +1,26 @@
 # Product & go-to-market
 
+<!-- toc -->
+**Contents**
+
+- [OntoBricks -- Value Proposition Deck](#ontobricks----value-proposition-deck)
+  - [Agenda](#agenda)
+  - [Slide 1: The Data Semantics Gap](#slide-1-the-data-semantics-gap)
+  - [Slide 2: Where OntoBricks Fits](#slide-2-where-ontobricks-fits)
+  - [Slide 3: The 4-Click Pipeline](#slide-3-the-4-click-pipeline)
+  - [Slide 4: Key Features and Capabilities](#slide-4-key-features-and-capabilities)
+  - [Slide 5: Competitive Landscape](#slide-5-competitive-landscape)
+  - [Slide 6: Value Proposition](#slide-6-value-proposition)
+  - [Slide 7: Conclusion and Next Steps](#slide-7-conclusion-and-next-steps)
+- [OntoBricks — Field Engineering Innovation Project](#ontobricks--field-engineering-innovation-project)
+  - [Summary](#summary)
+  - [Problem Statement](#problem-statement)
+  - [Proposed Solution](#proposed-solution)
+  - [What Solutions Exist Today](#what-solutions-exist-today)
+  - [Final Deliverable and Impact](#final-deliverable-and-impact)
+  - [Additional Information for Support Requested](#additional-information-for-support-requested)
+<!-- /toc -->
+
 ## OntoBricks -- Value Proposition Deck
 
 > Slide-ready content for presenting OntoBricks to enterprise stakeholders.
@@ -32,16 +53,16 @@ Organizations invest heavily in Lakehouse platforms to store and process data at
 | **Siloed knowledge**        | Domain expertise is trapped in documentation, ER diagrams, or the heads of senior engineers -- disconnected from the data itself.                                           |
 | **Query-only exploration**  | Understanding relationships requires ad-hoc SQL joins. There is no visual, graph-based way to navigate across tables.                                                       |
 | **Inaccessible standards**  | Industry ontologies (FIBO for finance, CDISC for clinical, IOF for manufacturing) exist but require specialized desktop tools that do not integrate with the data platform. |
-| **No schema-to-graph path** | Building a knowledge graph from Lakehouse tables today requires stitching together multiple external tools, custom ETL, and manual RDF generation.                          |
+| **No schema-to-graph path** | Building a graph viewer from Lakehouse tables today requires stitching together multiple external tools, custom ETL, and manual RDF generation.                          |
 
 
-**The result:** data is stored but not understood, relationships are implicit but not navigable, and knowledge graph adoption stalls because the infrastructure barrier is too high.
+**The result:** data is stored but not understood, relationships are implicit but not navigable, and graph viewer adoption stalls because the infrastructure barrier is too high.
 
 ---
 
 ### Slide 2: Where OntoBricks Fits
 
-#### A Knowledge Graph Builder that lives inside Databricks.
+#### A Graph Viewer Builder that lives inside Databricks.
 
 OntoBricks is not a separate platform. It deploys as a **Databricks App** and uses the services you already have.
 
@@ -50,14 +71,14 @@ flowchart LR
     subgraph databricksPlatform ["Databricks Platform"]
         UC["Unity Catalog<br/>Tables, Volumes, Metadata"]
         WH["SQL Warehouse<br/>Query Execution"]
-        MS["Model Serving<br/>LLM Endpoints"]
+        MS["AI Gateway / Serving<br/>LLM targets"]
         TS["Delta Triple Store<br/>Subject-Predicate-Object"]
     end
 
     subgraph ontoBricks ["OntoBricks App"]
-        OD["Ontology Designer<br/>OWL / RDFS"]
+        OD["Ontology Studio<br/>OWL / RDFS"]
         MA["Mapping<br/>R2RML Mapping"]
-        DT["Digital Twin<br/>Knowledge Graph"]
+        DT["Knowledge Graph<br/>Graph Viewer"]
     end
 
     UC -->|metadata| OD
@@ -79,7 +100,7 @@ flowchart LR
 | -------------- | -------------------------------------------------------------------------- |
 | Unity Catalog  | Storage for tables, domain files (Volumes), and metadata                  |
 | SQL Warehouse  | Executes all data queries -- no separate compute                           |
-| Model Serving  | Powers LLM-driven ontology generation and auto-mapping                  |
+| AI Gateway / Model Serving | Powers LLM-driven ontology generation and auto-mapping; **No LLM** opts out |
 | Delta Table    | Triple store -- triples live in your Lakehouse, not in a separate graph DB |
 | Databricks App | Deployment target -- `databricks apps deploy` and you are live             |
 | MCP Server     | Exposes knowledge-graph tools to the Databricks Playground and LLM clients |
@@ -91,9 +112,9 @@ flowchart LR
 
 ### Slide 3: The 4-Click Pipeline
 
-#### From raw tables to a queryable knowledge graph in minutes, not months.
+#### From raw tables to a queryable graph viewer in minutes, not months.
 
-After a one-time setup (Databricks connection, LLM endpoint, triple store table), the entire pipeline is four actions:
+After a one-time setup (Databricks connection, LLM target, triple store table), the entire pipeline is four actions:
 
 ```mermaid
 flowchart LR
@@ -105,7 +126,7 @@ flowchart LR
     S1 -->|"UC tables & columns"| S2
     S2 -->|"LLM designs entities"| S3
     S3 -->|"LLM maps SQL"| S4
-    S4 -->|"Delta materialization"| KG["Knowledge Graph Ready"]
+    S4 -->|"Delta materialization"| KG["Graph Viewer Ready"]
 ```
 
 
@@ -114,9 +135,9 @@ flowchart LR
 | Step  | Where in OntoBricks      | What happens                                                                        | Powered by        |
 | ----- | ------------------------ | ----------------------------------------------------------------------------------- | ----------------- |
 | **1** | Domain > Metadata       | Fetches table and column metadata from Unity Catalog                                | Unity Catalog API |
-| **2** | Ontology > Generate      | LLM designs entities, relationships, attributes, and inheritance from your metadata | Model Serving     |
-| **3** | Mapping > Auto-Map | LLM generates SQL queries and column mappings for every entity and relationship     | Model Serving     |
-| **4** | Digital Twin > Build     | Executes all mappings and populates the triple store table                          | SQL Warehouse     |
+| **2** | Ontology > Generate      | LLM designs entities, relationships, attributes, and inheritance from your metadata | AI Gateway / Model Serving |
+| **3** | Mapping > Auto-Map | LLM generates SQL queries and column mappings for every entity and relationship     | AI Gateway / Model Serving |
+| **4** | Knowledge Graph > Build     | Executes all mappings and populates the triple store table                          | SQL Warehouse     |
 
 
 **Traditional approach:** weeks of manual ontology design, custom ETL pipelines, separate graph database setup.
@@ -134,7 +155,7 @@ flowchart LR
 
 | Capability                | Description                                                                                  |
 | ------------------------- | -------------------------------------------------------------------------------------------- |
-| Visual Designer (OntoViz) | Drag-and-drop entities, relationships, and inheritance hierarchies on an interactive canvas  |
+| Studio (OntoViz) | Drag-and-drop entities, relationships, and inheritance hierarchies on an interactive canvas  |
 | LLM-Powered Wizard        | Point to Unity Catalog tables; the LLM generates a complete OWL ontology from metadata       |
 | Industry Standards        | One-click import of FIBO (6 domains), CDISC (5 standards), IOF (3 domains)                   |
 | OWL/RDFS Import           | Load existing ontologies from files or Unity Catalog Volumes                                 |
@@ -153,13 +174,13 @@ flowchart LR
 | R2RML Generation     | W3C-compliant mapping generated automatically -- users never write mapping rules |
 
 
-#### Digital Twin (Sync and Explore)
+#### Knowledge Graph (Sync and Explore)
 
 
 | Capability            | Description                                                                          |
 | --------------------- | ------------------------------------------------------------------------------------ |
 | One-Click Sync        | Materialize triples into a Delta table stored in Unity Catalog                       |
-| Knowledge Graph       | Sigma.js WebGL graph with search, filtering, depth control, and entity detail panels |
+| Graph Viewer       | Sigma.js WebGL graph with search, filtering, depth control, and entity detail panels |
 | Quality Checks        | Async validation against ontology constraints (cardinality, orphans, value rules)    |
 | Dashboard Integration | Embed Databricks dashboards with parameter mapping to ontology entities              |
 | Triples Grid          | Sortable, searchable table view of all materialized triples                          |
@@ -180,27 +201,27 @@ flowchart LR
 
 | Capability | Description |
 | --- | --- |
-| REST API (Digital Twin) | Stateless endpoints for triple store status, entity search, ontology/R2RML/SQL retrieval, and build triggers |
+| REST API (Knowledge Graph) | Stateless endpoints for triple store status, entity search, ontology/R2RML/SQL retrieval, and build triggers |
 | GraphQL API | Auto-generated typed schema per domain with configurable depth, GraphiQL playground |
 | MCP Server | Model Context Protocol server for Databricks Playground and LLM clients (Cursor, Claude Desktop) |
-| Ontology Assistant | Conversational agent for natural-language ontology editing (add entities, clean orphans, etc.) |
+| Ontology Assistant | Conversational agent for natural-language ontology editing; uses the domain-saved AI Gateway or Model Serving target |
 
 
 ---
 
 ### Slide 5: Competitive Landscape
 
-#### No existing solution provides an integrated, Databricks-native knowledge graph experience.
+#### No existing solution provides an integrated, Databricks-native graph viewer experience.
 
 
 | Solution                       | What it does                                                                           | Limitation for Databricks users                                                                                          |
 | ------------------------------ | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | **Palantir Foundry**           | Powerful ontology layer (Ontology + AIP) for entity modeling and operational analytics | Proprietary platform; requires Palantir infrastructure; expensive licensing; no W3C standards (OWL/RDF); lock-in         |
 | **Snowflake Cortex + Horizon** | ML functions and governance catalog for the Snowflake ecosystem                        | No ontology design; no RDF/OWL; no graph visualization; Snowflake-only -- not available on Databricks                    |
-| **Microsoft Fabric + Purview** | Unified analytics with a governance catalog (Purview) for lineage and classification   | Governance-focused, not ontology-focused; no knowledge graph materialization; no visual graph exploration; Azure-centric |
+| **Microsoft Fabric + Purview** | Unified analytics with a governance catalog (Purview) for lineage and classification   | Governance-focused, not ontology-focused; no graph viewer materialization; no visual graph exploration; Azure-centric |
 | **Neo4j / Amazon Neptune**     | Dedicated graph databases optimized for traversal queries                              | Separate infrastructure; data must be exported from the Lakehouse; no native Delta integration; data duplication         |
 | **Stardog**                    | Knowledge graph platform with virtual graph and reasoning                              | Separate server; JDBC connector to Databricks but no native integration; commercial license                              |
-| **TopBraid / Protege**         | Enterprise and desktop OWL ontology editors                                            | No Databricks integration; cannot map to tables; no SQL generation; no knowledge graph exploration                       |
+| **TopBraid / Protege**         | Enterprise and desktop OWL ontology editors                                            | No Databricks integration; cannot map to tables; no SQL generation; no graph viewer exploration                       |
 | **dbt Semantic Layer**         | SQL-based semantic modeling for metrics and dimensions                                 | No ontology/OWL; no graph visualization; limited to dimensional modeling concepts                                        |
 
 
@@ -211,9 +232,9 @@ OntoBricks is the **only** solution that combines all of the following in a sing
 - Databricks-native (deploys as an App, uses UC + SQL Warehouse)
 - W3C standards-based (OWL, R2RML, SPARQL)
 - LLM-automated (ontology generation + data mapping)
-- Graph-visualizing (interactive knowledge graph)
+- Graph-visualizing (interactive graph viewer)
 - Industry-standard ready (FIBO, CDISC, IOF)
-- Open-source (MIT license)
+- Source-available under the [Databricks License](../LICENSE.txt)
 
 ---
 
@@ -224,7 +245,7 @@ OntoBricks is the **only** solution that combines all of the following in a sing
 
 | Benefit                     | Without OntoBricks                                                        | With OntoBricks                                                            |
 | --------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| **Time to knowledge graph** | Weeks to months of manual ontology design, custom ETL, and graph DB setup | Minutes -- 4-click LLM-automated pipeline                                  |
+| **Time to graph viewer** | Weeks to months of manual ontology design, custom ETL, and graph DB setup | Minutes -- 4-click LLM-automated pipeline                                  |
 | **Infrastructure cost**     | Separate graph database (Neo4j, Neptune, Stardog) + compute + maintenance | Zero -- triples live in Delta, queries run on SQL Warehouse                |
 | **Industry compliance**     | Requires Protege or TopBraid + manual import + custom integration         | One-click import of FIBO, CDISC, IOF directly from the Databricks platform |
 | **Knowledge sharing**       | ER diagrams in Confluence, tribal knowledge in meetings                   | Versioned ontology domains in Unity Catalog, shareable across teams       |
@@ -240,7 +261,7 @@ OntoBricks is the **only** solution that combines all of the following in a sing
 | -------------------- | --------------------------------------------------------------------- |
 | **Data Engineers**   | Build semantic layers without leaving the Databricks platform         |
 | **Domain Experts**   | Model and explore entity relationships visually, without SQL          |
-| **Data Architects**  | Evaluate knowledge graph approaches with zero infrastructure overhead |
+| **Data Architects**  | Evaluate graph viewer approaches with zero infrastructure overhead |
 | **Compliance Teams** | Apply industry standards (FIBO, CDISC, IOF) to real data              |
 
 
@@ -248,7 +269,7 @@ OntoBricks is the **only** solution that combines all of the following in a sing
 
 ### Slide 7: Conclusion and Next Steps
 
-#### Deploy a knowledge graph on Databricks in minutes.
+#### Deploy a graph viewer on Databricks in minutes.
 
 **Get started:**
 
@@ -262,7 +283,7 @@ databricks apps deploy --app-name ontobricks
 | Resource      | Details                                                                  |
 | ------------- | ------------------------------------------------------------------------ |
 | SQL Warehouse | Serverless recommended; Classic also supported                           |
-| Model Serving | Optional -- required for LLM features (ontology generation, auto-mapping) |
+| AI Gateway or Model Serving | Optional — required for LLM features (ontology generation, auto-mapping). Leave unset (**No LLM**) to run without AI. |
 | Unity Catalog | For table access and domain storage (Volumes)                           |
 
 
@@ -271,9 +292,9 @@ databricks apps deploy --app-name ontobricks
 
 | Resource                 | Link                                                |
 | ------------------------ | --------------------------------------------------- |
-| Source Code              | GitHub repository (MIT license)                     |
+| Source Code              | GitHub repository ([Databricks License](../LICENSE.txt)) |
 | Documentation            | Full user guide, architecture docs, API reference   |
-| Automated Pipeline Guide | Step-by-step: tables to knowledge graph in 4 clicks |
+| Automated Pipeline Guide | Step-by-step: tables to graph viewer in 4 clicks |
 | Import Guide             | FIBO, CDISC, IOF import instructions                |
 | MCP Server Guide         | Deployment, tools, client configuration for Playground, Cursor, Claude Desktop |
 
@@ -288,7 +309,7 @@ databricks apps deploy --app-name ontobricks
 
 ---
 
-*OntoBricks -- Bridging relational data and knowledge graphs on Databricks.*
+*OntoBricks -- Bridging relational data and graph viewers on Databricks.*
 
 ---
 
@@ -296,11 +317,11 @@ databricks apps deploy --app-name ontobricks
 
 ### Summary
 
-OntoBricks is a **Knowledge Graph Builder for Databricks** that brings **graph database capabilities and formal reasoning** to the Lakehouse — without requiring separate graph infrastructure. It transforms relational tables stored in Unity Catalog into a structured knowledge graph by leveraging semantic web standards (OWL, R2RML, RDF), a Lakebase Postgres graph engine, OWL 2 RL reasoning, and LLM-powered automation.
+OntoBricks is a **Graph Viewer Builder for Databricks** that brings **graph database capabilities and formal reasoning** to the Lakehouse — without requiring separate graph infrastructure. It transforms relational tables stored in Unity Catalog into a structured graph viewer by leveraging semantic web standards (OWL, R2RML, RDF), a Lakebase Postgres graph engine, OWL 2 RL reasoning, and LLM-powered automation.
 
-Users can design ontologies visually or import industry standards (FIBO for finance, CDISC for clinical data, IOF for manufacturing), map ontology entities to Databricks tables, materialize the result into a Delta-backed triple store mirrored on Lakebase Postgres, run **formal reasoning** (OWL 2 RL deductive closure, SWRL rules, transitive/symmetric inference), and explore the knowledge graph through interactive visualization. The entire pipeline — from raw tables to a reasoned, queryable knowledge graph — can be completed in as few as four clicks thanks to LLM-driven ontology generation and automatic data mapping.
+Users can design ontologies visually or import industry standards (FIBO for finance, CDISC for clinical data, IOF for manufacturing), map ontology entities to Databricks tables, materialize the result into a Delta-backed triple store mirrored on Lakebase Postgres, run **formal reasoning** (OWL 2 RL deductive closure, SWRL rules, transitive/symmetric inference), and explore the graph viewer through interactive visualization. The entire pipeline — from raw tables to a reasoned, queryable graph viewer — can be completed in as few as four clicks thanks to LLM-driven ontology generation and automatic data mapping.
 
-OntoBricks runs as a **Databricks App**, making it natively integrated with the Databricks platform: Unity Catalog for storage and metadata, SQL Warehouses for query execution, and Model Serving endpoints for LLM features.
+OntoBricks runs as a **Databricks App**, making it natively integrated with the Databricks platform: Unity Catalog for storage and metadata, SQL Warehouses for query execution, and AI Gateway or Model Serving for LLM features.
 
 ---
 
@@ -312,7 +333,7 @@ Organizations on Databricks accumulate large volumes of structured data across c
 - **Knowledge is siloed**: Domain knowledge about entity relationships (e.g., "a Customer has Contracts, which have Invoices") lives in documentation, tribal knowledge, or ER diagrams disconnected from the actual data.
 - **Exploration is query-driven**: Understanding how entities connect requires writing ad-hoc SQL joins. There is no visual, graph-based way to navigate data across tables.
 - **Industry standards are inaccessible**: Established ontologies like FIBO (finance), CDISC (clinical), and IOF (manufacturing) exist but require specialized tooling (Protégé, TopBraid) that doesn't integrate with the Databricks ecosystem.
-- **No path from schema to knowledge graph**: Building a knowledge graph from Databricks tables today requires stitching together multiple external tools, custom ETL pipelines, and manual RDF generation — a process that is expensive, fragile, and disconnected from the data platform.
+- **No path from schema to graph viewer**: Building a graph viewer from Databricks tables today requires stitching together multiple external tools, custom ETL pipelines, and manual RDF generation — a process that is expensive, fragile, and disconnected from the data platform.
 
 ---
 
@@ -347,19 +368,19 @@ OntoBricks provides an end-to-end, web-based solution that runs directly on Data
 - **Graph Reasoning**: Automatic transitive closure and symmetric expansion based on OWL property characteristics.
 - **Constraint Validation**: Formal checking of cardinality, functional/inverse-functional properties, value constraints, and global rules (no orphans, require labels).
 
-#### Knowledge Graph Exploration
+#### Graph Viewer Exploration
 
-- **Interactive Knowledge Graph**: Sigma.js WebGL-powered graph with search, filtering, depth control, and entity detail panels.
+- **Interactive Graph Viewer**: Sigma.js WebGL-powered graph with search, filtering, depth control, and entity detail panels.
 - **Data Cluster Detection**: Detect communities using Louvain, Label Propagation, or Greedy Modularity — client-side (Graphology) for the visible subgraph, server-side (NetworkX) for the full graph; color-by-cluster mode, adjustable resolution, collapse clusters into navigable super-nodes.
 - **Triples grid**: Sortable, searchable table view of all materialized triples.
 - **Dashboard integration**: Embed Databricks SQL dashboards with parameter mapping to ontology entities.
 
 #### External & Programmatic Access
 
-- **Digital Twin REST API**: Stateless endpoints for triple store status, ontology/R2RML/SQL retrieval, entity search, and build triggers (`/api/v1/digitaltwin/`).
+- **Knowledge Graph REST API**: Stateless endpoints for triple store status, ontology/R2RML/SQL retrieval, entity search, and build triggers (`/api/v1/digitaltwin/`).
 - **GraphQL API**: Auto-generated typed schema per domain with configurable relationship depth and GraphiQL playground.
 - **MCP Server**: Model Context Protocol server deployable as a Databricks App (`mcp-ontobricks`) for Databricks Playground integration and LLM client access (Cursor, Claude Desktop).
-- **Ontology Assistant**: Conversational LLM agent for natural-language ontology editing.
+- **Ontology Assistant**: Conversational LLM agent for natural-language ontology editing, routed through the domain-saved AI Gateway or Model Serving target.
 
 ---
 
@@ -377,7 +398,7 @@ OntoBricks provides an end-to-end, web-based solution that runs directly on Data
 | **dbt + Semantic Layer**       | SQL-based semantic modeling                 | No ontology/OWL support; no graph visualization; limited to dimensional modeling concepts            |
 
 
-**Gap**: No existing solution provides an integrated, Databricks-native experience that combines ontology design, industry-standard import, LLM-powered automation, **graph database capabilities (embedded Cypher engine)**, **formal OWL 2 RL reasoning**, **SWRL rule evaluation**, **W3C SHACL data quality validation**, triple store materialization in Delta, and visual knowledge graph exploration — all deployable as a Databricks App without requiring separate graph infrastructure.
+**Gap**: No existing solution provides an integrated, Databricks-native experience that combines ontology design, industry-standard import, LLM-powered automation, **graph database capabilities (embedded Cypher engine)**, **formal OWL 2 RL reasoning**, **SWRL rule evaluation**, **W3C SHACL data quality validation**, triple store materialization in Delta, and visual graph viewer exploration — all deployable as a Databricks App without requiring separate graph infrastructure.
 
 ---
 
@@ -385,11 +406,11 @@ OntoBricks provides an end-to-end, web-based solution that runs directly on Data
 
 #### Deliverable
 
-A **production-ready Databricks App** (open-source, MIT license) that:
+A **production-ready, source-available Databricks App** under the [Databricks License](../LICENSE.txt) that:
 
 - Deploys in minutes via `databricks apps deploy`
-- Requires only a SQL Warehouse and (optionally) a Model Serving endpoint
-- Stores all domain data in Unity Catalog Volumes (no external dependencies)
+- Requires only a SQL Warehouse and (optionally) an AI Gateway model or Model Serving endpoint
+- Stores domain data in the Lakebase registry (optional GitHub mirror; Unity Catalog Volume for export bundles only)
 - Supports the full lifecycle: design → map → materialize → explore → validate
 
 #### Expected Impact
@@ -404,14 +425,14 @@ A **production-ready Databricks App** (open-source, MIT license) that:
 | **Industry compliance**      | FIBO, CDISC, and IOF ontologies become accessible directly from the Databricks platform                                                                                                    |
 | **Time to value**            | LLM automation reduces the manual effort from weeks of custom development to minutes of guided interaction                                                                                 |
 | **Reusability**              | Saved domains (ontology + mappings) can be versioned, shared, and applied to new datasets                                                                                                 |
-| **Data quality**             | Built-in quality checks and formal constraint validation ensure the knowledge graph adheres to ontology semantics                                                                          |
+| **Data quality**             | Built-in quality checks and formal constraint validation ensure the graph viewer adheres to ontology semantics                                                                          |
 
 
 #### Target Users
 
 - **Data engineers** building semantic layers on Databricks
 - **Domain experts** (finance, healthcare, manufacturing) who need to model and explore entity relationships
-- **Data architects** evaluating knowledge graph approaches on Lakehouse platforms
+- **Data architects** evaluating graph viewer approaches on Lakehouse platforms
 - **Field engineers** demonstrating Databricks capabilities for knowledge management and data governance use cases
 
 ---
@@ -423,13 +444,13 @@ A **production-ready Databricks App** (open-source, MIT license) that:
 
 | Layer      | Technology                                                                                |
 | ---------- | ----------------------------------------------------------------------------------------- |
-| Backend    | Python 3.10+, FastAPI, RDFLib, Databricks SDK                                             |
+| Backend    | Python 3.11+, FastAPI, RDFLib, Databricks SDK                                             |
 | Reasoning  | owlrl 7.0+ (OWL 2 RL forward chaining), PySHACL 0.26+ (SHACL validation), custom SWRL engine (SQL translator) |
 | Graph DB   | Lakebase Postgres flat triple store (`psycopg`, `COPY FROM STDIN`, optional Lakeflow synced tables); pluggable behind `GraphDBBackend` |
 | Graph Analysis | NetworkX 3.0+ (community detection: Louvain, Label Propagation, Greedy Modularity)    |
 | Frontend   | Bootstrap 5, Sigma.js, Graphology (+ communities-louvain), D3.js, OntoViz (custom), Vanilla JS |
 | Data       | Databricks SQL Connector, Unity Catalog, Delta Lake                                       |
-| AI         | Databricks Model Serving (LLM endpoints)                                                  |
+| AI         | Databricks AI Gateway model services and Model Serving endpoints                          |
 | MCP        | FastMCP, httpx, Databricks SDK (separate App)                                             |
 | Deployment | Databricks Apps (`app.yaml`)                                                              |
 
@@ -439,19 +460,19 @@ A **production-ready Databricks App** (open-source, MIT license) that:
 - Fully functional application with all features implemented
 - Tested with CRM, IoT, energy, and healthcare ontologies
 - Industry-standard imports operational (FIBO, CDISC, IOF)
-- LLM-powered wizard and auto-map working with Databricks Model Serving endpoints
+- LLM-powered wizard and auto-map working with Unity AI Gateway model services and Model Serving endpoints
 - **Reasoning engine operational**: OWL 2 RL deductive closure, SWRL rule engine (SQL translator) with graphical D3 editor, graph reasoning (transitive closure, symmetric expansion), constraint validation, and SHACL data quality shapes (PySHACL + SQL compilation)
 - **Triple store + Graph DB layers**: Delta view (Unity Catalog) + Lakebase Postgres flat store, pluggable behind `GraphDBFactory`
 - MCP server deployed and operational for Databricks Playground
-- **Entity Groups**: OWL-compliant class grouping via `owl:equivalentClass` + `owl:unionOf`, with expand/collapse super-nodes in the Knowledge Graph visualization
+- **Entity Groups**: OWL-compliant class grouping via `owl:equivalentClass` + `owl:unionOf`, with expand/collapse super-nodes in the Graph Viewer visualization
 - **Data Cluster Detection**: Client-side Louvain (Graphology) and server-side community detection (NetworkX: Louvain, Label Propagation, Greedy Modularity) with color-by-cluster, resolution control, and cluster collapse/expand super-nodes
-- Digital Twin REST API with design status, ontology, R2RML, Spark SQL endpoints
+- Knowledge Graph REST API with design status, ontology, R2RML, Spark SQL endpoints
 - GraphQL API with configurable depth and auto-generated schema
 - Documentation: README, user guide, architecture, API reference, import guide, automated pipeline guide
 
 #### Resources Needed
 
 - **Databricks workspace** with a SQL Warehouse (Serverless recommended) for demo and testing
-- **Model Serving endpoint** for LLM features (e.g., Meta Llama 3.3 70B or equivalent)
+- **AI Gateway model service or Model Serving endpoint** for LLM features (optional; **No LLM** disables in-app AI)
 - **Unity Catalog** with sample datasets for demonstration scenarios
-- Visibility and feedback from field engineering teams working on knowledge graph, data governance, and semantic layer use cases
+- Visibility and feedback from field engineering teams working on graph viewer, data governance, and semantic layer use cases

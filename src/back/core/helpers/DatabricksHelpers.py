@@ -1,20 +1,75 @@
 import asyncio
 import os
+import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Callable, Dict, Tuple
 
 import back.core.databricks as _databricks
-from back.core.errors import ValidationError
+from back.core.databricks.request_identity import get_request_identity
+from back.core.errors import AuthorizationError, ValidationError
 from back.core.logging import get_logger
 from shared.config.constants import DEFAULT_BASE_URI
+from shared.llm_target import normalize_llm_endpoint_kind
 
 logger = get_logger(__name__)
 
+# Floor kept at the historical default so small instances never *lose*
+# capacity; larger Databricks App instances (more vCPUs) scale up automatically.
+_BLOCKING_POOL_MIN = 20
+
+
+def _resolve_blocking_pool_size() -> int:
+    """Resolve the blocking-pool worker count.
+
+    Priority: explicit ``ONTOBRICKS_THREAD_POOL_SIZE`` > instance-size
+    derivation (``vCPUs * 4``, floored at :data:`_BLOCKING_POOL_MIN`). This lets
+    a bigger Databricks App instance get more blocking-worker capacity without a
+    config change, while an operator can still pin an exact value.
+    """
+    explicit = os.getenv("ONTOBRICKS_THREAD_POOL_SIZE", "").strip()
+    if explicit:
+        try:
+            value = int(explicit)
+            if value > 0:
+                return value
+        except ValueError:
+            logger.warning("Ignoring non-integer ONTOBRICKS_THREAD_POOL_SIZE=%r", explicit)
+    cpu = os.cpu_count() or 2
+    return max(_BLOCKING_POOL_MIN, cpu * 4)
+
+
+_BLOCKING_POOL_SIZE = _resolve_blocking_pool_size()
 _BLOCKING_POOL = ThreadPoolExecutor(
-    max_workers=int(os.getenv("ONTOBRICKS_THREAD_POOL_SIZE", "20")),
+    max_workers=_BLOCKING_POOL_SIZE,
     thread_name_prefix="ob-blocking",
 )
+
+# In-flight blocking tasks (submitted but not yet finished). Used to detect
+# thread-pool saturation so the app can advise an instance-size upgrade instead
+# of silently queueing (and appearing to hang).
+_inflight_lock = threading.Lock()
+_inflight_blocking = 0
+_peak_inflight_blocking = 0
+
+
+def get_blocking_pool_stats() -> Dict[str, Any]:
+    """Return blocking thread-pool utilisation.
+
+    ``saturated`` is true when every worker is busy, i.e. further blocking work
+    is queued rather than running — the signal used to surface the
+    resource-pressure advisory.
+    """
+    with _inflight_lock:
+        active = _inflight_blocking
+        peak = _peak_inflight_blocking
+    return {
+        "max_workers": _BLOCKING_POOL_SIZE,
+        "active": active,
+        "peak": peak,
+        "saturated": active >= _BLOCKING_POOL_SIZE,
+    }
 
 
 def make_volume_file_service(domain, settings=None):
@@ -48,18 +103,28 @@ class DatabricksHelpers:
     async def run_blocking(func: Callable, *args: Any, **kwargs: Any) -> Any:
         """Run a blocking function in a sized thread pool.
 
-        Uses a dedicated :class:`ThreadPoolExecutor` (default 20 threads,
-        configurable via ``ONTOBRICKS_THREAD_POOL_SIZE``) instead of the
-        default asyncio executor so that concurrent blocking work does not
-        starve the event loop.
+        Uses a dedicated :class:`ThreadPoolExecutor` (sized from the instance's
+        vCPU count, floored at 20, overridable via ``ONTOBRICKS_THREAD_POOL_SIZE``)
+        instead of the default asyncio executor so that concurrent blocking work
+        does not starve the event loop. In-flight tasks are tracked so
+        :func:`get_blocking_pool_stats` can report saturation.
 
         Usage in an ``async def`` route handler::
 
             result = await run_blocking(client.execute_query, sql)
         """
+        global _inflight_blocking, _peak_inflight_blocking
         loop = asyncio.get_running_loop()
         call = partial(func, *args, **kwargs) if kwargs else partial(func, *args)
-        return await loop.run_in_executor(_BLOCKING_POOL, call)
+        with _inflight_lock:
+            _inflight_blocking += 1
+            if _inflight_blocking > _peak_inflight_blocking:
+                _peak_inflight_blocking = _inflight_blocking
+        try:
+            return await loop.run_in_executor(_BLOCKING_POOL, call)
+        finally:
+            with _inflight_lock:
+                _inflight_blocking -= 1
 
     @staticmethod
     def _resolve_registry_cfg(domain, settings) -> Dict[str, str]:
@@ -70,6 +135,20 @@ class DatabricksHelpers:
         from back.objects.registry import RegistryCfg
 
         return RegistryCfg.from_domain(domain, settings).as_dict()
+
+    @staticmethod
+    def resolve_app_registry_context(settings) -> Tuple[str, str, Dict[str, str]]:
+        """Resolve app-instance context for global (non-domain) configuration.
+
+        Branding is instance-wide and must not depend on the active domain in
+        session. This helper always resolves host/token and registry settings
+        from ``domain=None``.
+        """
+        from back.objects.registry import RegistryCfg
+
+        host, token = DatabricksHelpers.get_databricks_host_and_token(None, settings)
+        registry_cfg = RegistryCfg.from_domain(None, settings).as_dict()
+        return host, token, registry_cfg
 
     @staticmethod
     def resolve_warehouse_id(domain, settings) -> str:
@@ -116,6 +195,42 @@ class DatabricksHelpers:
         return os.getenv("DATABRICKS_SQL_WAREHOUSE_ID_DEFAULT", "")
 
     @staticmethod
+    def resolve_delta_warehouse_id(domain, settings) -> str:
+        """Resolve the SQL Warehouse for Lakehouse (Delta) graph queries.
+
+        Resolution order:
+
+        1. ``graph_engine_config.lakehouse.warehouse_id`` (Settings → Back end → Lakehouse)
+        2. Fallback to :meth:`resolve_warehouse_id` (global warehouse)
+        """
+        from back.objects.session import global_config_service
+
+        host, token = DatabricksHelpers.get_databricks_host_and_token(domain, settings)
+        registry_cfg = DatabricksHelpers._resolve_registry_cfg(domain, settings)
+
+        if host and registry_cfg.get("catalog") and registry_cfg.get("schema"):
+            try:
+                wid = global_config_service.get_delta_warehouse_id(
+                    host, token, registry_cfg
+                )
+                if wid:
+                    return wid
+            except Exception as exc:
+                logger.debug("Could not read lakehouse warehouse from engine config: %s", exc)
+
+        return DatabricksHelpers.resolve_warehouse_id(domain, settings)
+
+    @staticmethod
+    def resolve_build_warehouse_id(domain, settings) -> str:
+        """Resolve the SQL warehouse dedicated to build DDL and writes.
+
+        The global/session/deployment warehouse is the build warehouse. This
+        intentionally never consults the Lakehouse query warehouse, which may
+        be Lakehouse//RT and therefore read-only.
+        """
+        return DatabricksHelpers.resolve_warehouse_id(domain, settings)
+
+    @staticmethod
     def _resolve_global_setting(domain, settings, getter_name: str) -> str:
         """Read a single value from the global config (UC Volume), returning '' on failure."""
         from back.objects.session import global_config_service
@@ -142,6 +257,16 @@ class DatabricksHelpers:
         return DatabricksHelpers._resolve_global_setting(
             domain, settings, "get_default_base_uri"
         ) or DEFAULT_BASE_URI.rstrip("/")
+
+    @staticmethod
+    def build_auto_base_uri(domain_name: str, default_domain: str) -> str:
+        """Build the default ontology namespace for a domain display name."""
+        base = (default_domain or DEFAULT_BASE_URI).rstrip("/#")
+        raw_name = (domain_name or "").strip() or "MyDomain"
+        safe_name = (
+            re.sub(r"[^a-zA-Z0-9_-]", "_", raw_name).strip("_") or "MyDomain"
+        )
+        return f"{base}/{safe_name}#"
 
     @staticmethod
     def resolve_default_emoji(domain, settings) -> str:
@@ -188,6 +313,108 @@ class DatabricksHelpers:
             return True
 
     @staticmethod
+    def resolve_lakehouse_use_sea(domain, settings) -> bool:
+        """Resolve the Lakehouse SEA (Statement Execution API) toggle.
+
+        Reads ``graph_engine_config.lakehouse.use_sea`` from the global config.
+        Defaults to ``False`` (Thrift) when unset or the registry is not
+        configured, so classic SQL warehouses keep their current transport.
+        Bypasses ``_resolve_global_setting`` (whose ``if val: return val`` would
+        discard an explicit ``False``), mirroring :meth:`resolve_use_cloud_fetch`.
+
+        In Databricks Apps this enables the direct INLINE Statement Execution
+        transport; locally it enables the SQL connector's Kernel transport.
+        """
+        from back.objects.session import global_config_service
+
+        host, token = DatabricksHelpers.get_databricks_host_and_token(domain, settings)
+        registry_cfg = DatabricksHelpers._resolve_registry_cfg(domain, settings)
+
+        if not host or not registry_cfg.get("catalog") or not registry_cfg.get(
+            "schema"
+        ):
+            return False
+
+        try:
+            return bool(
+                global_config_service.get_delta_warehouse_use_sea(
+                    host, token, registry_cfg
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort default resolution
+            logger.debug(
+                "Could not resolve Lakehouse use_sea, defaulting to False: %s", exc
+            )
+            return False
+
+    @staticmethod
+    def resolve_build_use_sea(domain, settings) -> bool:
+        """Return False because build DDL and writes never use Kernel/SEA."""
+        return False
+
+    @staticmethod
+    def resolve_analytics_job_enabled(domain, settings) -> bool:
+        """Resolve whether oversized graphs may use the serverless analytics job.
+
+        Resolution order:
+
+        1. **Settings › Global** — the admin toggle, when an admin has set it.
+        2. ``ONTOBRICKS_ANALYTICS_JOB_ENABLED`` — the deployment default.
+
+        Like :meth:`resolve_use_cloud_fetch` this bypasses
+        ``_resolve_global_setting``, whose ``if val: return val`` would discard
+        an admin's explicit "off". It also relies on the getter's three-state
+        ``None`` so that "never configured" falls through to the env var while
+        a stored ``False`` still overrides an env var that enables the job.
+        """
+        from back.objects.session import global_config_service
+
+        env_default = bool(getattr(settings, "analytics_job_enabled", False))
+
+        host, token = DatabricksHelpers.get_databricks_host_and_token(domain, settings)
+        registry_cfg = DatabricksHelpers._resolve_registry_cfg(domain, settings)
+        if not host or not registry_cfg.get("catalog") or not registry_cfg.get(
+            "schema"
+        ):
+            return env_default
+
+        try:
+            configured = global_config_service.get_analytics_job_enabled(
+                host, token, registry_cfg
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort default resolution
+            logger.debug(
+                "Could not resolve the global analytics-job toggle, using the "
+                "deployment default (%s): %s",
+                env_default,
+                exc,
+            )
+            return env_default
+
+        return env_default if configured is None else bool(configured)
+
+    @staticmethod
+    def resolve_analytics_job_name(settings) -> str:
+        """Return the graph-analytics job name, or ``""`` if none can be formed.
+
+        ``ONTOBRICKS_ANALYTICS_JOB_NAME`` wins when set. Otherwise the name is
+        derived from the app name as ``<app>-graph-analytics``, matching what the
+        bundle deploys. The derivation needs ``DATABRICKS_APP_NAME``, which the
+        Apps platform injects but a local dev shell does not, so local runs must
+        set the name explicitly.
+
+        Returning ``""`` is meaningful: it is the one case where job mode is
+        configured but cannot run, so callers gating the UI on availability must
+        treat it as unavailable rather than promising metrics the run will then
+        silently fall back from.
+        """
+        explicit = (getattr(settings, "analytics_job_name", "") or "").strip()
+        if explicit:
+            return explicit
+        app_name = (getattr(settings, "ontobricks_app_name", "") or "").strip()
+        return f"{app_name}-graph-analytics" if app_name else ""
+
+    @staticmethod
     def get_databricks_client(domain, settings):
         """Get Databricks client from domain session or settings.
 
@@ -224,7 +451,57 @@ class DatabricksHelpers:
                 use_cloud_fetch=use_cloud_fetch,
             )
 
+        # Local CLI auth: ``DatabricksAuth`` resolves a profile from
+        # ``~/.databrickscfg`` and supplies the host. The client itself does
+        # not need a token here — downstream services call back into
+        # ``DatabricksAuth`` for connection params and headers.
+        probe = _databricks.DatabricksAuth(host=host or None)
+        if probe.has_valid_auth():
+            return _databricks.DatabricksClient(
+                host=probe.host,
+                token="",
+                warehouse_id=warehouse_id,
+                use_cloud_fetch=use_cloud_fetch,
+            )
+
         return None
+
+    @staticmethod
+    def get_data_plane_client(domain, settings):
+        """Return a Databricks client bound to the caller for UC data reads.
+
+        In Databricks App mode the client authenticates with the caller's
+        forwarded OAuth token (on-behalf-of), so Unity Catalog governs what
+        can be read. A missing forwarded token is a hard failure — we never
+        fall back to the app service principal for data-plane reads.
+
+        In local / PAT / CLI mode there is no proxy identity, so this behaves
+        exactly like :meth:`get_databricks_client`.
+        """
+        if not _databricks.is_databricks_app():
+            return DatabricksHelpers.get_databricks_client(domain, settings)
+
+        identity = get_request_identity()
+        if not identity.user_token:
+            raise AuthorizationError(
+                "User authorization is required for this data access. "
+                "The Databricks Apps proxy did not forward a user token."
+            )
+
+        dbcfg = _domain_databricks(domain)
+        host = (
+            dbcfg.get("host")
+            or settings.databricks_host
+            or _databricks.get_workspace_host()
+        )
+        warehouse_id = DatabricksHelpers.resolve_warehouse_id(domain, settings)
+        use_cloud_fetch = DatabricksHelpers.resolve_use_cloud_fetch(domain, settings)
+        return _databricks.DatabricksClient(
+            host=host,
+            token=identity.user_token,
+            warehouse_id=warehouse_id,
+            use_cloud_fetch=use_cloud_fetch,
+        )
 
     @staticmethod
     def get_databricks_credentials(domain, settings) -> Tuple[str, str, str]:
@@ -242,6 +519,30 @@ class DatabricksHelpers:
         host, token = DatabricksHelpers.get_databricks_host_and_token(domain, settings)
         warehouse_id = DatabricksHelpers.resolve_warehouse_id(domain, settings)
         return host, token, warehouse_id
+
+    @staticmethod
+    def get_delta_databricks_credentials(domain, settings) -> Tuple[str, str, str]:
+        """Return ``(host, token, warehouse_id)`` for Delta triple-store SQL."""
+        host, token = DatabricksHelpers.get_databricks_host_and_token(domain, settings)
+        warehouse_id = DatabricksHelpers.resolve_delta_warehouse_id(domain, settings)
+        return host, token, warehouse_id
+
+    @staticmethod
+    def get_build_sql_credentials(domain, settings) -> Tuple[str, str, str]:
+        """Return credentials for build DDL, requiring a build warehouse."""
+        host, token = DatabricksHelpers.get_databricks_host_and_token(domain, settings)
+        warehouse_id = DatabricksHelpers.resolve_build_warehouse_id(domain, settings)
+        if not warehouse_id:
+            raise ValidationError(
+                "No Build SQL Warehouse configured. Select one in "
+                "Settings -> Databricks before building."
+            )
+        return host, token, warehouse_id
+
+    @staticmethod
+    def get_triplestore_sql_credentials(domain, settings) -> Tuple[str, str, str]:
+        """Return credentials for the SQL VIEW and materialization build."""
+        return DatabricksHelpers.get_build_sql_credentials(domain, settings)
 
     @staticmethod
     def get_databricks_host_and_token(domain, settings) -> Tuple[str, str]:
@@ -275,28 +576,50 @@ class DatabricksHelpers:
                     logger.debug("Obtained OAuth token for agent call (host=%s)", host)
                 except Exception as exc:
                     logger.warning("Could not obtain OAuth token in app mode: %s", exc)
+            return _databricks.normalize_host(host), token
+
+        # Local CLI auth fallback for agent / MLflow code paths that need a
+        # bearer token outside the request cycle.
+        if not token:
+            try:
+                auth = _databricks.DatabricksAuth(host=host or None)
+                if auth.has_valid_auth():
+                    if not host:
+                        host = auth.host
+                    token = auth.get_bearer_token()
+                    if token:
+                        logger.debug(
+                            "Obtained CLI profile token for agent call (host=%s)", host
+                        )
+            except Exception as exc:
+                logger.debug("Could not obtain CLI profile token: %s", exc)
 
         return _databricks.normalize_host(host), token
 
     @staticmethod
-    def require_serving_llm(
-        domain,
-        settings,
-    ) -> Tuple[str, str, str]:
-        """Validate host, token, and domain LLM serving endpoint.
+    def require_domain_llm(domain, settings) -> tuple[str, str, str, str]:
+        """Validate the saved domain LLM target and Databricks credentials.
 
-        Returns ``(host, token, endpoint_name)`` or raises :class:`ValidationError`.
+        Reads and trims ``domain.info.llm_endpoint`` before resolving
+        credentials so an empty endpoint always raises the no-LLM guidance
+        message, even when credentials are missing.
+
+        Returns ``(host, token, endpoint_name, endpoint_kind)`` or raises
+        :class:`ValidationError`.
         """
+        info = domain.info or {}
+        endpoint = str(info.get("llm_endpoint") or "").strip()
+        if not endpoint:
+            raise ValidationError(
+                "No LLM selected. Select one in Domain → General → AI."
+            )
         host, token = DatabricksHelpers.get_databricks_host_and_token(domain, settings)
         if not host or not token:
             raise ValidationError("Databricks credentials not configured")
-        endpoint = (domain.info or {}).get("llm_endpoint", "") or ""
-        if not endpoint:
-            raise ValidationError(
-                "No LLM serving endpoint configured. Please set it in Domain Settings.",
-            )
-        return host, token, endpoint
-
+        kind = normalize_llm_endpoint_kind(
+            endpoint, str(info.get("llm_endpoint_kind") or "")
+        )
+        return host, token, endpoint, kind
 
 def effective_uc_version_path(domain) -> str:
     """Return the version-scoped UC Volume path, with domain-level fallback.

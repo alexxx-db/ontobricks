@@ -39,7 +39,7 @@ const OntologyState = {
 
 /**
  * Load base URI from domain session (managed on the Domain page)
- * Base URI is no longer auto-generated - it's managed in the Project Information page.
+ * Base URI is no longer auto-generated — it is managed on Domain → General.
  */
 function generateBaseUri() {
     // This function is kept for backward compatibility but no longer auto-generates
@@ -101,8 +101,13 @@ async function loadDefaultEmoji() {
 /**
  * Save current OntologyState.config to session
  * This is the central save function called after any config change
+ *
+ * @param {Object} [options]
+ * @param {boolean} [options.keepalive] Ask the browser to complete the request
+ *     even if the page is being torn down. Set it when saving from a
+ *     beforeunload / pagehide handler, where a plain fetch is cancelled.
  */
-async function saveConfigToSession() {
+async function saveConfigToSession(options = {}) {
     try {
         // Strip sub-collections managed by their own dedicated endpoints
         // so we don't overwrite them with stale frontend state.
@@ -116,7 +121,8 @@ async function saveConfigToSession() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
-            credentials: 'same-origin'
+            credentials: 'same-origin',
+            keepalive: Boolean(options.keepalive)
         });
         const result = await response.json();
         if (!result.success) {
@@ -276,7 +282,7 @@ async function autoGenerateOwl() {
     if (!name) {
         issues.push('Ontology name is required');
     } else if (name === 'myontology' || name === 'newproject' || name === 'newdomain') {
-        warnings.push('Ontology name is still set to the default. Set a Domain Name in Domain Information.');
+        warnings.push('Ontology name is still set to the default. Set a Domain Name in Domain → General.');
     }
     
     if (!baseUri) {

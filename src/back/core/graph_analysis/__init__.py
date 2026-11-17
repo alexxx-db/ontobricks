@@ -1,12 +1,36 @@
-"""Graph analysis: community detection and cohort discovery."""
+"""Graph analysis: community detection, cohort discovery, and graph metrics."""
 
 from back.core.graph_analysis.CohortVocabulary import CohortVocabulary
 from back.core.graph_analysis.CommunityDetector import CommunityDetector
+from back.core.graph_analysis.GraphBuilder import GraphBuilder
+from back.core.graph_analysis.JobMetrics import (
+    JobMetrics,
+    METRIC_SERIES_COLUMNS,
+    METRIC_SERIES_SAMPLE_SIZE,
+    METRIC_SERIES_SAMPLE_THRESHOLD,
+    analytics_snapshot,
+    metric_series_query,
+    sample_metric_series,
+    validate_metric_series_column,
+    resolve_analytics_source,
+)
+from back.core.graph_analysis.LakeflowRunner import LakeflowRunner
+from back.core.graph_analysis.preflight import (
+    analytics_job_configured,
+    analytics_job_status,
+    probe_data_table,
+)
 from back.core.graph_analysis.models import (
+    MODE_JOB,
     ClusterRequest,
     ClusterResult,
     DetectionResult,
     DetectionStats,
+    EntityTypeProfile,
+    MetricsRequest,
+    NodeMetrics,
+    MetricsStats,
+    MetricsResult,
     CohortHop,
     CohortLink,
     CohortCompat,
@@ -89,6 +113,26 @@ def cohort_uri(base_uri: str, rule_id: str, content_hash: str) -> str:
 __all__ = [
     "CohortVocabulary",
     "CommunityDetector",
+    "GraphBuilder",
+    "JobMetrics",
+    "METRIC_SERIES_COLUMNS",
+    "METRIC_SERIES_SAMPLE_THRESHOLD",
+    "METRIC_SERIES_SAMPLE_SIZE",
+    "LakeflowRunner",
+    "analytics_snapshot",
+    "metric_series_query",
+    "sample_metric_series",
+    "validate_metric_series_column",
+    "resolve_analytics_source",
+    "analytics_job_configured",
+    "analytics_job_status",
+    "probe_data_table",
+    "EntityTypeProfile",
+    "MetricsRequest",
+    "NodeMetrics",
+    "MetricsStats",
+    "MetricsResult",
+    "MODE_JOB",
     "ClusterRequest",
     "ClusterResult",
     "DetectionResult",

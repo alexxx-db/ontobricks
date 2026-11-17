@@ -17,6 +17,8 @@ import requests
 
 from back.core.logging import get_logger
 from agents.llm_utils import call_llm_with_retry
+from agents.tracing import trace_llm
+from shared.llm_target import build_llm_request
 
 logger = get_logger(__name__)
 
@@ -59,6 +61,7 @@ class AgentStep:
 # =====================================================
 
 
+@trace_llm("agent:llm")
 def call_serving_endpoint(
     host: str,
     token: str,
@@ -66,41 +69,58 @@ def call_serving_endpoint(
     messages: List[dict],
     *,
     tools: Optional[List[dict]] = None,
+    response_format: Optional[dict] = None,
     max_tokens: int = 2048,
     temperature: float = 0.1,
     timeout: int = 180,
     trace_name: str = "agent:llm",
+    endpoint_kind: str = "",
 ) -> dict:
     """Call a Databricks serving endpoint (OpenAI-compatible chat completions).
 
     Builds the URL, headers, and payload, then delegates to
     :func:`call_llm_with_retry` for retry/backoff logic.
 
+    ``response_format`` is an opt-in OpenAI/Databricks-style structured-
+    output directive (e.g. ``{"type": "json_schema", "json_schema": {...}}``)
+    for transport-level schema enforcement — see
+    :func:`shared.llm_target.build_llm_request` for the ``tools`` +
+    ``response_format`` mutual-exclusion guard. When an endpoint rejects
+    ``response_format`` with a clear 400 (the same "does not support the
+    ... parameter" shape already handled for ``temperature``), it is
+    stripped and the request retried once, then the ban is cached per
+    endpoint so later calls skip it proactively.
+
     Args:
         trace_name: Used for MLflow span naming via ``@trace_llm``.
     """
-    url = f"{host.rstrip('/')}/serving-endpoints/{endpoint_name}/invocations"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
 
     banned = _unsupported_params(endpoint_name)
-    payload: Dict[str, Any] = {
-        "messages": messages,
-        "max_tokens": max_tokens,
-    }
-    if "temperature" not in banned and temperature is not None:
-        payload["temperature"] = temperature
-    if tools:
-        payload["tools"] = tools
+    url, payload = build_llm_request(
+        host,
+        endpoint_name,
+        endpoint_kind,
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        tools=tools,
+        response_format=response_format,
+    )
+    for param in banned:
+        payload.pop(param, None)
 
     logger.info(
-        "%s: POST %s — %d messages, %d tool defs, max_tokens=%d, temperature=%s",
+        "%s: POST %s — %d messages, %d tool defs, response_format=%s, "
+        "max_tokens=%d, temperature=%s",
         trace_name,
         endpoint_name,
         len(messages),
         len(tools) if tools else 0,
+        bool(payload.get("response_format")),
         max_tokens,
         payload.get("temperature", "<skipped>"),
     )
@@ -116,7 +136,7 @@ def call_serving_endpoint(
         body_text = response.text if response is not None else ""
         # Detect and strip parameters the model rejects, then retry once.
         dropped: List[str] = []
-        for param in ("temperature",):
+        for param in ("temperature", "response_format"):
             if param in payload and _looks_unsupported(body_text, param):
                 banned.add(param)
                 payload.pop(param, None)
@@ -184,7 +204,13 @@ def extract_message_content(llm_response: dict) -> str:
     """Extract text content from an OpenAI-style or predictions-style LLM response."""
     choices = llm_response.get("choices", [])
     if choices:
-        return choices[0].get("message", {}).get("content", "") or ""
+        content = choices[0].get("message", {}).get("content") or ""
+        # Claude endpoints return content as a list of blocks, not a string
+        if isinstance(content, list):
+            content = "".join(
+                b if isinstance(b, str) else b.get("text", "") for b in content
+            )
+        return content
     preds = llm_response.get("predictions", [])
     if preds:
         return preds[0] if isinstance(preds[0], str) else str(preds[0])

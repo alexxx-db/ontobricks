@@ -1,0 +1,123 @@
+# The app's checks, dependency scanning, CalVer tags, publishing the deploy artifact for
+# each tag, building and pushing the Seiji package, and a manual Seiji deploy of a branch
+# into the abacus tenant. Why it is set up this way: Hello Abacus
+# docs/decisions/ADR-0003-gitlab-and-ci.md. Seiji deploys a published tag; see
+# deploy/create.sh.
+#
+# `stages:` must be declared, in this order. The group pipeline execution policy requires
+# every stage list to be an in-order subset of its own, and GitLab's implicit default
+# puts `build` before `test`. Omitting or reordering it fails the whole pipeline with
+# "Cyclic dependencies detected when enforcing policies" and zero jobs.
+#
+# SAST, secret detection and the Wiz IaC scan come from the group's security policies.
+# Do not redeclare them.
+stages:
+  - lint
+  # Hosts `checks`, and `dependency-scanning` and `version` from the souschef includes.
+  - test
+  # Hosts souschef's `build:seiji-package`, which zips the files seiji-packaging.yaml lists.
+  - build
+  # Hosts souschef's `tag:version`, which tags master, qa, release-* and hotfix-*;
+  # `push:seiji-package`, which pushes the package for every branch and tag; and
+  # `publish`, which runs in the pipeline each tag starts.
+  - push
+  # Hosts souschef's manual `deploy:airflow_dev`, which deploys this branch's package to
+  # the abacus tenant through Airflow. It never runs on master, qa or a tag.
+  - deploy
+
+variables:
+  SOUSCHEF_VERSION: master
+  # The image Orion runs this project's tests in. No job in this file uses it. Orion
+  # builds the same name from SOUSCHEF_VARIANT and SOUSCHEF_VERSION when it is absent.
+  ORION_CI_IMAGE: "473376902650.dkr.ecr.us-east-1.amazonaws.com/kitchen-souschef:${SOUSCHEF_VARIANT}-${SOUSCHEF_VERSION}"
+
+include:
+  - project: 'abacusinsights/lunatic-dove/kitchen-souschef'
+    file: '/gitlab_templates/base/init.yml'
+    ref: master
+  - project: 'abacusinsights/lunatic-dove/kitchen-souschef'
+    file: '/gitlab_templates/base/dep_scanning.yml'
+    ref: master
+  - project: 'abacusinsights/lunatic-dove/kitchen-souschef'
+    file: '/gitlab_templates/base/tag.yml'
+    ref: master
+  - project: 'abacusinsights/lunatic-dove/kitchen-souschef'
+    file: '/gitlab_templates/base/spack.yml'
+    ref: master
+  - project: 'abacusinsights/lunatic-dove/kitchen-souschef'
+    file: '/gitlab_templates/base/airflow-deploy-dev.yml'
+    ref: master
+
+checks:
+  stage: test
+  # Node, Python 3.11, curl and bash in one image, so every check runs in one job.
+  image: node:24-bookworm
+  # Shared runners are disabled across the org, so an untagged job waits forever.
+  tags:
+    - abacusinsights2
+  variables:
+    UV_VERSION: "0.11.21"
+    PNPM_VERSION: "12.11.2"
+  script:
+    # The Seiji hooks read their config with jq, and deploy/test_hooks.sh runs them.
+    - command -v jq >/dev/null || (apt-get update -qq && apt-get install -y -qq jq)
+    - curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+    - export PATH="$HOME/.local/bin:$PATH"
+    - npm install --global "pnpm@${PNPM_VERSION}"
+    # The same pinned, checksummed binaries the migrate job ships.
+    - bash scripts/fetch_atlas.sh
+    - |
+      case "$(uname -m)" in
+        x86_64) arch=amd64 ;;
+        aarch64) arch=arm64 ;;
+        *) echo "No Atlas binary for $(uname -m)" >&2; exit 1 ;;
+      esac
+      chmod +x "bin/atlas-linux-$arch"
+      export ATLAS="$PWD/bin/atlas-linux-$arch"
+    # Proves the CLI pin the publish job ships still downloads and matches its checksum.
+    - bash scripts/fetch_databricks_cli.sh
+    - bash scripts/check.sh backend frontend artifact deploy migrations
+  # On tags too, so publish, a later stage, runs only after the checks pass.
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# Builds the artifact for a tag, proves it installs with no index, and copies it with the
+# Atlas binaries and the Databricks CLI to S3, where Seiji reads them. A published tag is never overwritten.
+publish:
+  stage: push
+  image: node:24-bookworm
+  tags:
+    - abacusinsights2
+  variables:
+    UV_VERSION: "0.11.21"
+    PNPM_VERSION: "12.11.2"
+    AWSCLI_VERSION: "1.46.2"
+    BUCKET: abacus-artifacts-kitchen
+    # Not PREFIX, which npm reads as its global install prefix: pnpm would install under
+    # this path, off PATH.
+    S3_PREFIX: databricks-apps/hello-abacus/${CI_COMMIT_TAG}
+  script:
+    - curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+    - export PATH="$HOME/.local/bin:$PATH"
+    - npm install --global "pnpm@${PNPM_VERSION}"
+    # One command per line: a failure on the left of && does not stop the job.
+    - pnpm --dir frontend install --frozen-lockfile
+    - pnpm --dir frontend run build
+    - bash scripts/check.sh artifact
+    - bash scripts/fetch_atlas.sh
+    - bash scripts/fetch_databricks_cli.sh
+    # A failed listing fails the job, rather than reading as nothing published.
+    - |
+      count=$(uvx --from "awscli==${AWSCLI_VERSION}" aws s3api list-objects-v2 \
+        --bucket "$BUCKET" --prefix "${S3_PREFIX}/" --max-keys 1 --query KeyCount --output text)
+      if [ "$count" != 0 ]; then
+        echo "s3://${BUCKET}/${S3_PREFIX}/ is already published; tags are immutable." >&2
+        exit 1
+      fi
+    - uvx --from "awscli==${AWSCLI_VERSION}" aws s3 cp app_artifact/ "s3://${BUCKET}/${S3_PREFIX}/app_artifact/" --recursive --exclude .gitkeep
+    - uvx --from "awscli==${AWSCLI_VERSION}" aws s3 cp bin/ "s3://${BUCKET}/${S3_PREFIX}/bin/" --recursive
+    - uvx --from "awscli==${AWSCLI_VERSION}" aws s3 cp cli/ "s3://${BUCKET}/${S3_PREFIX}/cli/" --recursive
+  rules:
+    - if: $CI_COMMIT_TAG

@@ -17,14 +17,21 @@ Two operating modes are supported:
 
 from __future__ import annotations
 
+from collections import defaultdict
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
+from back.core.graphdb.adjacency import expand_and_fetch_sql
 from back.core.errors import InfrastructureError
+from back.core.graphdb.lakebase import _adjacency_ddl
 from back.core.graphdb.lakebase import _companion_ddl
 from back.core.graphdb.lakebase.LakebaseBase import LakebaseBase
 from back.core.graphdb.lakebase.SyncedTableManager import (
     DEFAULT_TIMEOUT_S as _SYNC_DEFAULT_TIMEOUT_S,
+)
+from back.core.graphdb.props import (
+    execute_expand_with_props_fallback,
+    forget_missing_props,
 )
 from back.core.helpers import validate_table_name
 from back.core.logging import get_logger
@@ -37,8 +44,42 @@ _BULK_DELETE_THRESHOLD = 50
 _COPY_INSERT_TEMP = "_ob_copy_stage"
 _COPY_DELETE_TEMP = "_ob_del_stage"
 
+# Postgres btree version-4 index entry limit (bytes).
+_PG_BTREE_INDEX_MAX_BYTES = 2704
+
 SYNC_MODE_APP = "app_managed"
 SYNC_MODE_MANAGED = "managed_synced"
+
+
+def _is_index_row_size_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    if "index row size" in msg and "btree" in msg:
+        return True
+    return exc.__class__.__name__ == "ProgramLimitExceeded"
+
+
+def _long_literal_detail(batch: List[Dict[str, str]]) -> str:
+    worst = max(
+        batch,
+        key=lambda t: len((t.get("object") or "").encode("utf-8")),
+    )
+    obj_bytes = len((worst.get("object") or "").encode("utf-8"))
+    predicate = worst.get("predicate") or "?"
+    return f"predicate={predicate!r}, object_size={obj_bytes} bytes"
+
+
+def _reraise_lakebase_index_limit(
+    exc: BaseException, batch: List[Dict[str, str]]
+) -> None:
+    if not _is_index_row_size_error(exc):
+        raise exc
+    detail = _long_literal_detail(batch)
+    raise InfrastructureError(
+        "Lakebase triple insert failed: a literal object exceeds the Postgres "
+        f"btree index size limit ({detail}). Run a full Knowledge Graph rebuild "
+        "to apply the object_hash schema, or exclude very long text columns "
+        "from mapping."
+    ) from exc
 
 
 class LakebaseFlatStore(LakebaseBase):
@@ -54,8 +95,13 @@ class LakebaseFlatStore(LakebaseBase):
     :class:`SyncedTableManager`.
 
     ``search_path`` is set on every pooled connection so generated SQL from
-    :class:`TripleStoreBackend` helpers resolves correctly.
+    :class:`GraphDBBackend` helpers resolves correctly.
     """
+
+    supports_materialized_inference_purge = True
+    supports_adjacency = True
+    supports_entity_search = True
+    supports_props = True
 
     def __init__(
         self,
@@ -114,6 +160,51 @@ class LakebaseFlatStore(LakebaseBase):
             )
         return self._synced_manager
 
+    def sql_flavor(self) -> str:
+        return "postgres"
+
+    def adjacency_table_ids(self, table_name: str) -> tuple[str, str]:
+        return (
+            _adjacency_ddl.adj_out_phy(table_name),
+            _adjacency_ddl.adj_in_phy(table_name),
+        )
+
+    def entity_search_table_id(self, table_name: str) -> str:
+        return _adjacency_ddl.entity_search_phy(table_name)
+
+    def entity_search_asserted_table_id(self, table_name: str) -> str:
+        return _adjacency_ddl.entity_search_asserted_phy(table_name)
+
+    def props_table_id(self, table_name: str) -> str:
+        return _adjacency_ddl.props_phy(table_name)
+
+    def rebuild_adjacency(self, table_name: str) -> None:
+        validate_table_name(table_name)
+        union_view = self._sql_relation(table_name)
+        adj_out, adj_in = self.adjacency_table_ids(table_name)
+        search = self.entity_search_table_id(table_name)
+        search_asserted = self.entity_search_asserted_table_id(table_name)
+        asserted_spo = self.synced_table_name(table_name)
+        props = self.props_table_id(table_name)
+        with self._cursor() as cur:
+            _adjacency_ddl.ensure_adjacency_tables(cur, adj_out, adj_in)
+            _adjacency_ddl.ensure_entity_search_table(cur, search)
+            _adjacency_ddl.ensure_entity_search_table(cur, search_asserted)
+            _adjacency_ddl.ensure_props_table(cur, props)
+        with self._txn_cursor() as (_, cur):
+            _adjacency_ddl.rebuild_adjacency_data(cur, union_view, adj_out, adj_in)
+            _adjacency_ddl.rebuild_entity_search_data(cur, union_view, search)
+            _adjacency_ddl.rebuild_entity_search_data(
+                cur, asserted_spo, search_asserted
+            )
+            _adjacency_ddl.rebuild_props_data(cur, union_view, props)
+        with self._cursor() as cur:
+            _adjacency_ddl.analyze_adjacency_tables(cur, adj_out, adj_in)
+            _adjacency_ddl.analyze_entity_search_table(cur, search)
+            _adjacency_ddl.analyze_entity_search_table(cur, search_asserted)
+            _adjacency_ddl.analyze_props_table(cur, props)
+        forget_missing_props(props)
+
     # -- Table-name resolution --------------------------------------------
 
     def _writable_table_id(self, name: str) -> str:
@@ -130,6 +221,23 @@ class LakebaseFlatStore(LakebaseBase):
         # Both modes resolve to the same identifier — in synced mode it is the
         # union view name (which equals the legacy table name).
         return self.physical_table_id(name)
+
+    def synced_table_name(self, table_name: str) -> str:
+        """Return the ``_sync`` table name so callers can query without materialised triples."""
+        return _companion_ddl.synced_phy(table_name)
+
+    def get_inferred_triple_count(self, table_name: str) -> int:
+        """Return the count of triples in the companion (reasoning / app-written) table.
+
+        Queries ``*__app`` directly so callers can determine whether any
+        inferred data exists independently of the union view total.
+        Returns 0 on any error (e.g. companion table not yet created).
+        """
+        companion = _companion_ddl.companion_phy(table_name)
+        try:
+            return self.count_triples(companion)
+        except Exception:
+            return 0
 
     def synced_phy(self, name: str) -> str:
         """Postgres table name for the read-only synced side (managed_synced only)."""
@@ -169,6 +277,53 @@ class LakebaseFlatStore(LakebaseBase):
         companion = self.companion_phy(name)
         with self._cursor() as cur:
             _companion_ddl.ensure_companion(cur, self._schema, companion)
+
+    def drop_app_owned_sync_artifacts_if_present(self, name: str) -> bool:
+        """Remove a user-owned ``_sync`` table (and union view) before Lakeflow sync.
+
+        A leftover ``_sync`` table from an ``app_managed`` build (or a partial
+        ``managed_synced`` attempt) is owned by the app user. Lakeflow's
+        ``databricks_writer_*`` principal must own the table; otherwise the
+        snapshot pipeline fails with ``must be owner of table …_sync``.
+
+        Returns ``True`` when view and/or sync artifacts were dropped.
+        """
+        if not self.is_synced:
+            return False
+        validate_table_name(name)
+        synced = _companion_ddl.synced_phy(name)
+        view = _companion_ddl.view_phy(name)
+        bare_synced = synced.split(".")[-1].strip('"')
+        dropped = False
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT pg_get_userbyid(c.relowner) AS owner
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = ANY(current_schemas(false))
+                  AND c.relname = %s
+                  AND c.relkind = 'r'
+                """,
+                (bare_synced,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            owner = row.get("owner") if isinstance(row, dict) else row[0]
+            if _companion_ddl.is_lakeflow_sync_owner(str(owner)):
+                return False
+            logger.warning(
+                "Dropping app-owned sync artifacts for %s.%s (owner=%s) "
+                "so Lakeflow can recreate the _sync table",
+                self._schema,
+                bare_synced,
+                owner,
+            )
+            _companion_ddl.drop_view(cur, view)
+            _companion_ddl.drop_synced(cur, synced)
+            dropped = True
+        return dropped
 
     def ensure_synced_union_view(
         self,
@@ -261,6 +416,17 @@ class LakebaseFlatStore(LakebaseBase):
             _time.sleep(min(poll_interval_s, remaining))
 
         with self._cursor() as cur:
+            # managed_synced: Lakeflow creates the _sync table. Re-apply index
+            # DDL idempotently so BFS and neighbour traversals stay performant
+            # even if the physical _sync table was recreated upstream.
+            try:
+                _companion_ddl.ensure_graph_indexes(cur, synced)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "ensure_synced_union_view: could not ensure indexes on %s: %s",
+                    synced,
+                    exc,
+                )
             _companion_ddl.ensure_union_view(cur, view, synced, companion)
 
     @staticmethod
@@ -290,6 +456,20 @@ class LakebaseFlatStore(LakebaseBase):
         companion = self.companion_phy(name)
         with self._cursor() as cur:
             _companion_ddl.truncate_companion(cur, companion)
+
+    def purge_materialized_triples(self, table_name: str) -> int:
+        """Truncate the app companion while preserving mapped source triples."""
+        companion = self.companion_phy(table_name)
+        count = self.count_triples(companion)
+        with self._cursor() as cur:
+            _companion_ddl.truncate_companion(cur, companion)
+        from back.core.graphdb.search_cache import rebuild_graph_cache_if_enabled
+
+        rebuild_graph_cache_if_enabled(
+            self, table_name, getattr(self, "_domain", None)
+        )
+        logger.info("Purged %d materialized triples from %s", count, companion)
+        return count
 
     def _idx_name(self, phy: str, suffix: str) -> str:
         base = f"g_{phy}_{suffix}".lower()
@@ -329,6 +509,58 @@ class LakebaseFlatStore(LakebaseBase):
             f"ALTER TABLE {phy} ADD COLUMN IF NOT EXISTS datatype TEXT"
         )
         cur.execute(f"ALTER TABLE {phy} ADD COLUMN IF NOT EXISTS lang TEXT")
+        self._warn_legacy_object_pk(cur, phy)
+
+    @staticmethod
+    def _warn_legacy_object_pk(cur: Any, phy: str) -> None:
+        """Log when an existing table still keys on full ``object`` text."""
+        bare = phy.split(".")[-1].strip('"')
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = ANY(current_schemas(false))
+              AND table_name = %s
+              AND column_name = 'object_hash'
+            LIMIT 1
+            """,
+            (bare,),
+        )
+        if cur.fetchone() is None:
+            logger.warning(
+                "Lakebase table %s uses the legacy PRIMARY KEY (subject, predicate, object) "
+                "and cannot store literal objects longer than %d bytes. "
+                "Run a full Knowledge Graph rebuild to migrate to object_hash.",
+                phy,
+                _PG_BTREE_INDEX_MAX_BYTES,
+            )
+
+    def _expand_and_fetch_spo_sql(
+        self,
+        *,
+        relation: str,
+        selected_uris: list[str],
+        depth: int,
+        max_entities: int,
+        max_triples: int,
+    ) -> str:
+        sql = expand_and_fetch_sql(
+            flavor=self.sql_flavor(),
+            adj_out="adj_out",
+            adj_in="adj_in",
+            spo=relation,
+            selected_uris=selected_uris,
+            depth=depth,
+            max_entities=max_entities,
+            max_triples=max_triples,
+            escape=self._sql_escape,
+        )
+        return (
+            "WITH "
+            f"adj_out AS ({_adjacency_ddl.typed_out_select(relation)}), "
+            f"adj_in AS ({_adjacency_ddl.typed_in_select(relation)}), "
+            + sql.removeprefix("WITH ")
+        )
 
     @staticmethod
     def _require_pg():
@@ -337,15 +569,175 @@ class LakebaseFlatStore(LakebaseBase):
         return _require_psycopg()
 
     def execute_query(self, query: str) -> List[Dict[str, Any]]:
+        from back.core.query_limits import get_graph_query_timeout_s
+
         _, dict_row = self._require_pg()
         pool = self._pool()
+        timeout_ms = get_graph_query_timeout_s() * 1000
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(f'SET search_path TO "{self._schema}", public')
-                cur.execute(query)
-                if cur.description:
-                    return [dict(row) for row in cur.fetchall()]
-                return []
+                cur.execute('SET search_path TO "%s", public' % self._schema.replace('"', '""'))
+                # Bound graph reads so a runaway traversal is cancelled
+                # server-side instead of pinning the pooled connection.
+                #
+                # The pool hands out ``autocommit=True`` connections, so this is
+                # a *session* GUC that would otherwise persist to the next
+                # borrower (e.g. a bulk COPY/INSERT or DDL path) and cancel it
+                # mid-write. Reset it in ``finally`` so the bound is scoped to
+                # this read only. In autocommit mode a statement_timeout cancel
+                # leaves no open transaction to abort, so the RESET runs cleanly.
+                cur.execute(f"SET statement_timeout = {int(timeout_ms)}")
+                try:
+                    cur.execute(query)
+                    if cur.description:
+                        return [dict(row) for row in cur.fetchall()]
+                    return []
+                finally:
+                    cur.execute("RESET statement_timeout")
+
+    def expand_and_fetch_subgraph(
+        self,
+        table_name: str,
+        selected_uris: list[str],
+        depth: int,
+        max_entities: int,
+        max_triples: int,
+    ) -> dict[str, Any]:
+        if not selected_uris:
+            raise ValueError("At least one selected URI is required")
+        depth = max(0, int(depth))
+        max_entities = max(1, int(max_entities))
+        max_triples = max(1, int(max_triples))
+
+        relation = self._sql_relation(table_name)
+        props = ""
+        if self.adjacency_ready(table_name):
+            adj_out, adj_in = self.adjacency_table_ids(table_name)
+            props = self._props_table_for_read(table_name)
+            sql = expand_and_fetch_sql(
+                flavor=self.sql_flavor(),
+                adj_out=self._sql_relation(adj_out),
+                adj_in=self._sql_relation(adj_in),
+                spo=relation,
+                props=self._sql_relation(props) if props else None,
+                selected_uris=selected_uris,
+                depth=depth,
+                max_entities=max_entities,
+                max_triples=max_triples,
+                escape=self._sql_escape,
+            )
+        else:
+            sql = self._expand_and_fetch_spo_sql(
+                relation=relation,
+                selected_uris=selected_uris,
+                depth=depth,
+                max_entities=max_entities,
+                max_triples=max_triples,
+            )
+
+        if props:
+            adj_out, adj_in = self.adjacency_table_ids(table_name)
+            fallback_sql = expand_and_fetch_sql(
+                flavor=self.sql_flavor(),
+                adj_out=self._sql_relation(adj_out),
+                adj_in=self._sql_relation(adj_in),
+                spo=relation,
+                selected_uris=selected_uris,
+                depth=depth,
+                max_entities=max_entities,
+                max_triples=max_triples,
+                escape=self._sql_escape,
+            )
+            rows = execute_expand_with_props_fallback(
+                execute_query=self.execute_query,
+                sql=sql,
+                props_table=props,
+                fallback_sql=fallback_sql,
+            )
+        else:
+            rows = self.execute_query(sql) or []
+        discovered_count = (
+            int(rows[0].get("_ob_expanded_count") or 0)
+            if rows
+            else min(len(set(selected_uris)), max_entities)
+        )
+        triple_capped = len(rows) > max_triples
+        triples = [
+            {
+                "subject": row.get("subject", ""),
+                "predicate": row.get("predicate", ""),
+                "object": row.get("object", ""),
+            }
+            for row in rows[:max_triples]
+        ]
+        entity_capped = discovered_count > max_entities
+        return {
+            "results": triples,
+            "count": len(triples),
+            "expanded_count": min(discovered_count, max_entities),
+            "capped": entity_capped or triple_capped,
+            "timeout_capped": False,
+        }
+
+    def find_subjects_by_patterns(
+        self, table_name: str, like_patterns: List[str]
+    ) -> Set[str]:
+        """Optimized alias expansion for Lakebase Postgres.
+
+        ``describe_entity`` may pass hundreds or thousands of ``%/<local-id>``
+        patterns when expanding URI aliases. Building one giant OR-LIKE chain
+        performs poorly and can hit statement timeouts.
+
+        For fixed suffix patterns (``%/<id>``), group IDs by suffix length and
+        build a single SQL statement with one ``RIGHT(subject, k) = ANY(...)``
+        clause per distinct suffix length. This scales with distinct suffix
+        lengths (typically 1-3), not with total pattern count, while keeping
+        the lookup to a single round-trip.
+        """
+        if not like_patterns:
+            return set()
+
+        rel = self._sql_relation(table_name)
+        by_suffix_len: dict[int, list[str]] = defaultdict(list)
+        generic_patterns: list[str] = []
+
+        for raw in like_patterns:
+            p = (raw or "").strip()
+            if not p:
+                continue
+            if p.startswith("%/") and ("%" not in p[2:]) and ("_" not in p[2:]):
+                local_id = p[2:]
+                suffix_len = len(local_id) + 1
+                by_suffix_len[suffix_len].append(local_id)
+            else:
+                generic_patterns.append(p)
+
+        out: set[str] = set()
+
+        if by_suffix_len:
+            or_clauses = []
+            for suffix_len, ids in sorted(by_suffix_len.items()):
+                array_literals = ", ".join(
+                    f"'/{self._sql_escape(v)}'"
+                    for v in sorted({value for value in ids if value})
+                )
+                or_clauses.append(
+                    f"RIGHT(subject, {suffix_len}) = ANY(ARRAY[{array_literals}])"
+                )
+            rows = self.execute_query(
+                f"SELECT DISTINCT subject FROM {rel} WHERE {' OR '.join(or_clauses)}"
+            ) or []
+            out.update(r["subject"] for r in rows if r.get("subject"))
+
+        if generic_patterns:
+            like_clauses = " OR ".join(
+                f"subject LIKE '{self._sql_escape(p)}'" for p in generic_patterns
+            )
+            sql = f"SELECT DISTINCT subject FROM {rel} WHERE {like_clauses}"
+            rows = self.execute_query(sql) or []
+            out.update(r["subject"] for r in rows if r.get("subject"))
+
+        return out
 
     def create_table(self, table_name: str) -> None:
         validate_table_name(table_name)
@@ -367,7 +759,17 @@ class LakebaseFlatStore(LakebaseBase):
         view = self._readable_table_id(table_name)
         with self._cursor() as cur:
             _companion_ddl.ensure_synced(cur, self._schema, synced)
+            try:
+                self._ensure_legacy_columns(cur, synced)
+            except Exception as _col_err:
+                raise RuntimeError(
+                    f"Table '{synced}' exists but is owned by a different database role "
+                    f"— cannot add missing columns. "
+                    f"Fix: connect to Lakebase with a superuser and run: "
+                    f"DROP TABLE IF EXISTS \"{self._schema}\".\"{synced}\" CASCADE;"
+                ) from _col_err
             _companion_ddl.ensure_companion(cur, self._schema, companion)
+            self._ensure_legacy_columns(cur, companion)
             _companion_ddl.ensure_union_view(cur, view, synced, companion)
         logger.info(
             "Lakebase graph layout ready: %s.[%s | %s | view %s]",
@@ -434,7 +836,7 @@ class LakebaseFlatStore(LakebaseBase):
         with pool.connection() as conn:
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(f'SET search_path TO "{self._schema}", public')
+                    cur.execute('SET search_path TO "%s", public' % self._schema.replace('"', '""'))
                     yield conn, cur
 
     def _copy_insert_batch_phy(self, phy: str, batch: List[Dict[str, str]]) -> int:
@@ -446,33 +848,36 @@ class LakebaseFlatStore(LakebaseBase):
         """
         if not batch:
             return 0
-        with self._txn_cursor() as (_, cur):
-            cur.execute(
-                f"CREATE TEMP TABLE {_COPY_INSERT_TEMP} ("
-                "subject TEXT, predicate TEXT, object TEXT, "
-                "datatype TEXT, lang TEXT) ON COMMIT DROP"
-            )
-            copy_sql = (
-                f"COPY {_COPY_INSERT_TEMP} "
-                "(subject, predicate, object, datatype, lang) FROM STDIN"
-            )
-            with cur.copy(copy_sql) as cp:
-                for t in batch:
-                    dt, lg = self._literal_meta(t)
-                    cp.write_row(
-                        (
-                            (t.get("subject", "") or ""),
-                            (t.get("predicate", "") or ""),
-                            (t.get("object", "") or ""),
-                            dt,
-                            lg,
+        try:
+            with self._txn_cursor() as (_, cur):
+                cur.execute(
+                    f"CREATE TEMP TABLE {_COPY_INSERT_TEMP} ("
+                    "subject TEXT, predicate TEXT, object TEXT, "
+                    "datatype TEXT, lang TEXT) ON COMMIT DROP"
+                )
+                copy_sql = (
+                    f"COPY {_COPY_INSERT_TEMP} "
+                    "(subject, predicate, object, datatype, lang) FROM STDIN"
+                )
+                with cur.copy(copy_sql) as cp:
+                    for t in batch:
+                        dt, lg = self._literal_meta(t)
+                        cp.write_row(
+                            (
+                                (t.get("subject", "") or ""),
+                                (t.get("predicate", "") or ""),
+                                (t.get("object", "") or ""),
+                                dt,
+                                lg,
+                            )
                         )
-                    )
-            cur.execute(
-                f"INSERT INTO {phy} (subject, predicate, object, datatype, lang) "
-                f"SELECT subject, predicate, object, datatype, lang "
-                f"FROM {_COPY_INSERT_TEMP} ON CONFLICT DO NOTHING"
-            )
+                cur.execute(
+                    f"INSERT INTO {phy} (subject, predicate, object, datatype, lang) "
+                    f"SELECT subject, predicate, object, datatype, lang "
+                    f"FROM {_COPY_INSERT_TEMP} ON CONFLICT DO NOTHING"
+                )
+        except Exception as exc:
+            _reraise_lakebase_index_limit(exc, batch)
         return len(batch)
 
     def _copy_insert_batch(

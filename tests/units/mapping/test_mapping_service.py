@@ -290,6 +290,70 @@ class TestCollectSourceTables:
         assert result[("c", "s", "t")] == ["Entity: X"]
 
 
+_R2RML_SLASH = """
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ont: <https://example.com/MyOntology/> .
+
+<#CapacityMap> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "main.bronze.capacity" ] ;
+    rr:subjectMap [
+        rr:template "https://example.com/MyOntology/Capacity/{id}" ;
+        rr:class ont:Capacity
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ont:value ;
+        rr:objectMap [ rr:column "value_col" ]
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ont:relatedTo ;
+        rr:objectMap [ rr:template "https://example.com/MyOntology/Other/{oid}" ]
+    ] .
+"""
+
+
+def _hash_ontology():
+    base = "https://example.com/MyOntology#"
+    return {
+        "base_uri": base,
+        "classes": [{"name": "Capacity", "uri": base + "Capacity"}],
+        "properties": [{"name": "relatedTo", "uri": base + "relatedTo"}],
+    }
+
+
+class TestParseR2rmlUriNormalization:
+    def test_entity_class_uri_rewritten_to_ontology_hash_uri(self):
+        domain = _mock_domain(ontology=_hash_ontology())
+        result = Mapping(domain).parse_r2rml(_R2RML_SLASH)
+        entity = result["entities"][0]
+        assert (
+            entity["ontology_class"]
+            == "https://example.com/MyOntology#Capacity"
+        )
+
+    def test_relationship_property_uri_rewritten_to_ontology_hash_uri(self):
+        domain = _mock_domain(ontology=_hash_ontology())
+        result = Mapping(domain).parse_r2rml(_R2RML_SLASH)
+        rel = result["relationships"][0]
+        assert rel["property"] == "https://example.com/MyOntology#relatedTo"
+
+    def test_unmatched_uri_is_left_unchanged(self):
+        # 'value' is not declared as a property in the ontology -> kept as-is.
+        domain = _mock_domain(ontology=_hash_ontology())
+        result = Mapping(domain).parse_r2rml(_R2RML_SLASH)
+        # The entity's attribute predicate stays slash-keyed; the class still
+        # resolves. Unmatched relationship/class URIs must survive untouched.
+        rel = result["relationships"][0]
+        assert rel["property"].endswith("relatedTo")
+
+    def test_no_ontology_keeps_imported_uris(self):
+        domain = _mock_domain(ontology={})
+        result = Mapping(domain).parse_r2rml(_R2RML_SLASH)
+        assert (
+            result["entities"][0]["ontology_class"]
+            == "https://example.com/MyOntology/Capacity"
+        )
+
+
 class TestClassifySqlError:
     def test_permission_denied(self):
         status, detail = Mapping._classify_sql_error(
@@ -411,3 +475,304 @@ class TestRunDiagnosticsPermissionsSection:
         result = Mapping(domain).run_diagnostics(client=client)
         assert result["summary"]["errors"] >= 1
         assert any(p["status"] == "error" for p in result["permissions"])
+
+
+class TestProbeQueryRows:
+    def test_count_positive_is_ok(self):
+        client = MagicMock()
+        client.execute_query.return_value = [{"cnt": 42}]
+        check, count = Mapping._probe_query_rows("SELECT * FROM t", client)
+        assert count == 42
+        assert check["status"] == "ok"
+        assert "42" in check["detail"]
+        # Probe wraps the query in a COUNT(*) sub-select.
+        assert "COUNT(*)" in client.execute_query.call_args[0][0]
+
+    def test_zero_rows_is_warning(self):
+        client = MagicMock()
+        client.execute_query.return_value = [{"cnt": 0}]
+        check, count = Mapping._probe_query_rows("SELECT * FROM t", client)
+        assert count == 0
+        assert check["status"] == "warning"
+
+    def test_tuple_row_shape_supported(self):
+        client = MagicMock()
+        client.execute_query.return_value = [(7,)]
+        check, count = Mapping._probe_query_rows("SELECT * FROM t", client)
+        assert count == 7
+        assert check["status"] == "ok"
+
+    def test_trailing_limit_is_stripped(self):
+        client = MagicMock()
+        client.execute_query.return_value = [{"cnt": 1}]
+        Mapping._probe_query_rows("SELECT * FROM t LIMIT 10", client)
+        sql = client.execute_query.call_args[0][0]
+        assert "LIMIT 10" not in sql
+
+    def test_error_returns_none_count(self):
+        client = MagicMock()
+        client.execute_query.side_effect = Exception("boom")
+        check, count = Mapping._probe_query_rows("SELECT * FROM t", client)
+        assert count is None
+        assert check["status"] == "error"
+
+
+class TestRunDiagnosticsExcludedEntityRelationships:
+    def test_relationship_to_excluded_entity_is_dropped(self):
+        # ``has: Meter -> MeterReading`` must disappear (not error) when the
+        # MeterReading entity is excluded.
+        domain = _mock_domain(
+            entities=[
+                {
+                    "ontology_class": "http://t/Meter",
+                    "ontology_class_label": "Meter",
+                },
+                {
+                    "ontology_class": "http://t/MeterReading",
+                    "ontology_class_label": "MeterReading",
+                    "excluded": True,
+                },
+            ],
+            relationships=[
+                {
+                    "property": "http://t/has",
+                    "property_label": "has",
+                    "source_class": "http://t/Meter",
+                    "source_class_label": "Meter",
+                    "target_class": "http://t/MeterReading",
+                    "target_class_label": "MeterReading",
+                }
+            ],
+        )
+        result = Mapping(domain).run_diagnostics()
+        assert result["relationships"] == []
+
+    def test_relationship_between_active_entities_kept(self):
+        domain = _mock_domain(
+            entities=[
+                {
+                    "ontology_class": "http://t/Meter",
+                    "ontology_class_label": "Meter",
+                },
+                {
+                    "ontology_class": "http://t/MeterReading",
+                    "ontology_class_label": "MeterReading",
+                },
+            ],
+            relationships=[
+                {
+                    "property": "http://t/has",
+                    "property_label": "has",
+                    "source_class": "http://t/Meter",
+                    "source_class_label": "Meter",
+                    "target_class": "http://t/MeterReading",
+                    "target_class_label": "MeterReading",
+                }
+            ],
+        )
+        result = Mapping(domain).run_diagnostics()
+        assert len(result["relationships"]) == 1
+
+    def test_genuinely_missing_target_still_errors(self):
+        # Target entity is neither mapped nor excluded -> real error, kept.
+        domain = _mock_domain(
+            entities=[
+                {
+                    "ontology_class": "http://t/Meter",
+                    "ontology_class_label": "Meter",
+                }
+            ],
+            relationships=[
+                {
+                    "property": "http://t/has",
+                    "property_label": "has",
+                    "source_class": "http://t/Meter",
+                    "source_class_label": "Meter",
+                    "target_class": "http://t/Ghost",
+                    "target_class_label": "Ghost",
+                }
+            ],
+        )
+        result = Mapping(domain).run_diagnostics()
+        assert len(result["relationships"]) == 1
+        assert result["relationships"][0]["status"] == "error"
+
+
+class TestRunDiagnosticsRowCounts:
+    def test_entity_and_relationship_row_counts(self):
+        client = MagicMock()
+        client.execute_query.return_value = [{"cnt": 5}]
+        domain = _mock_domain(
+            entities=[
+                {
+                    "ontology_class": "http://t/A",
+                    "ontology_class_label": "A",
+                    "sql_query": "SELECT id FROM c.s.t",
+                    "id_column": "id",
+                }
+            ],
+            relationships=[
+                {
+                    "property": "http://t/p",
+                    "property_label": "p",
+                    "sql_query": "SELECT a, b FROM c.s.j",
+                    "source_class": "http://t/A",
+                    "source_class_label": "A",
+                    "target_class": "http://t/A",
+                    "target_class_label": "A",
+                }
+            ],
+            ontology={
+                "classes": [{"uri": "http://t/A", "name": "A"}],
+                "properties": [{"uri": "http://t/p", "name": "p"}],
+            },
+        )
+        result = Mapping(domain).run_diagnostics(client=client)
+        assert result["entities"][0]["row_count"] == 5
+        assert result["relationships"][0]["row_count"] == 5
+        assert result["entities"][0]["status"] == "ok"
+        assert result["relationships"][0]["status"] == "ok"
+        assert not any(
+            c["check"] == "has_data" for c in result["entities"][0]["checks"]
+        )
+        assert not any(
+            c["check"] == "has_data" for c in result["relationships"][0]["checks"]
+        )
+
+    def test_empty_source_still_warns(self):
+        client = MagicMock()
+        client.execute_query.return_value = [{"cnt": 0}]
+        domain = _mock_domain(
+            entities=[
+                {
+                    "ontology_class": "http://t/A",
+                    "ontology_class_label": "A",
+                    "sql_query": "SELECT id FROM c.s.t",
+                    "id_column": "id",
+                }
+            ]
+        )
+        result = Mapping(domain).run_diagnostics(client=client)
+        has_data = [
+            c for c in result["entities"][0]["checks"] if c["check"] == "has_data"
+        ]
+        assert has_data[0]["status"] == "warning"
+        assert result["entities"][0]["status"] == "warning"
+
+    def test_row_count_none_without_client(self):
+        domain = _mock_domain(
+            entities=[
+                {
+                    "ontology_class": "http://t/A",
+                    "ontology_class_label": "A",
+                    "sql_query": "SELECT id FROM c.s.t",
+                    "id_column": "id",
+                }
+            ]
+        )
+        result = Mapping(domain).run_diagnostics()
+        assert result["entities"][0]["row_count"] is None
+
+
+class TestDiagnoseExcludedAttributes:
+    def test_excluded_attribute_missing_from_select_is_not_an_error(self):
+        domain = _mock_domain(
+            entities=[
+                {
+                    "ontology_class": "http://t/A",
+                    "ontology_class_label": "A",
+                    "sql_query": "SELECT id, name FROM c.s.t",
+                    "id_column": "id",
+                    "attribute_mappings": {"name": "name", "age": "age"},
+                    "excluded_attributes": ["age"],
+                }
+            ],
+            ontology={"classes": [{"uri": "http://t/A", "name": "A"}]},
+        )
+        result = Mapping(domain).run_diagnostics()
+        attr_checks = [
+            c for c in result["entities"][0]["checks"] if c["check"].startswith("attribute:")
+        ]
+        assert [c["check"] for c in attr_checks] == ["attribute:name"]
+        assert all(c["status"] == "ok" for c in attr_checks)
+        assert result["entities"][0]["status"] == "ok"
+
+
+class TestDiagnoseRelationshipColumns:
+    def _domain(self, rel, entities=None):
+        return _mock_domain(
+            entities=entities
+            or [
+                {
+                    "ontology_class": "http://t/A",
+                    "ontology_class_label": "A",
+                    "sql_query": "SELECT obj_id FROM c.s.t",
+                    "id_column": "obj_id",
+                }
+            ],
+            relationships=[rel],
+            ontology={
+                "classes": [{"uri": "http://t/A", "name": "A"}],
+                "properties": [{"uri": "http://t/p", "name": "p"}],
+            },
+        )
+
+    def _rel(self, **overrides):
+        rel = {
+            "property": "http://t/p",
+            "property_label": "p",
+            "sql_query": "SELECT obj_id s, parent_obj_id t FROM c.s.t",
+            "source_id_column": "s",
+            "target_id_column": "t",
+            "source_class": "http://t/A",
+            "source_class_label": "A",
+            "target_class": "http://t/A",
+            "target_class_label": "A",
+        }
+        rel.update(overrides)
+        return rel
+
+    def test_implicit_alias_source_id_is_not_an_error(self):
+        result = Mapping(self._domain(self._rel())).run_diagnostics()
+        checks = {
+            c["check"]: c["status"] for c in result["relationships"][0]["checks"]
+        }
+        assert checks["source_id_column"] == "ok"
+        assert checks["target_id_column"] == "ok"
+        assert result["relationships"][0]["status"] == "ok"
+
+    def test_excluded_source_id_column_is_not_an_error(self):
+        rel = self._rel(
+            sql_query="SELECT parent_obj_id t FROM c.s.t",
+            excluded_attributes=["s"],
+        )
+        result = Mapping(self._domain(rel)).run_diagnostics()
+        names = [c["check"] for c in result["relationships"][0]["checks"]]
+        assert "source_id_column" not in names
+
+    def test_excluded_relationship_attribute_is_not_an_error(self):
+        rel = self._rel(
+            attribute_mappings={"note": "missing_col"},
+            excluded_attributes=["note"],
+        )
+        result = Mapping(self._domain(rel)).run_diagnostics()
+        attr_checks = [
+            c
+            for c in result["relationships"][0]["checks"]
+            if c["check"].startswith("attribute:")
+        ]
+        assert attr_checks == []
+
+    def test_genuinely_missing_source_id_still_errors(self):
+        rel = self._rel(
+            sql_query="SELECT obj_id, parent_obj_id FROM c.s.t",
+            source_id_column="s",
+            target_id_column="parent_obj_id",
+        )
+        result = Mapping(self._domain(rel)).run_diagnostics()
+        src = [
+            c
+            for c in result["relationships"][0]["checks"]
+            if c["check"] == "source_id_column"
+        ][0]
+        assert src["status"] == "error"

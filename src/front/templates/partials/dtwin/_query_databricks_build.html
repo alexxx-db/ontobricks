@@ -1,0 +1,104 @@
+<!-- Lakehouse triple-store build: ..._data as a Delta TABLE or a pass-through
+     VIEW over the gateway, per the domain's Materialization setting. -->
+<div class="content-section sync-content-section" id="databricksBuildRoot">
+
+    <div id="dbxBuildLoadingState" role="status" aria-live="polite">
+        <div class="ob-loading-spinner">
+            <span class="ob-spinner-label">Loading triple store information...</span>
+        </div>
+    </div>
+
+    <div id="dbxBuildLoadError" class="alert alert-danger d-none" role="alert">
+        <div class="d-flex align-items-center justify-content-between gap-3">
+            <span><i class="bi bi-exclamation-triangle me-1"></i>Could not load triple store information.</span>
+            <button type="button" class="btn btn-sm btn-outline-danger" id="dbxBuildLoadRetry">
+                <i class="bi bi-arrow-clockwise me-1"></i>Retry
+            </button>
+        </div>
+    </div>
+
+    <div id="dbxBuildContent" class="d-none">
+    <div class="section-header d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h4 class="mb-1"><i class="bi bi-fast-forward me-2"></i>Build</h4>
+            <p class="text-muted mb-0 small" id="dbxBuildSubtitle">Materialize mapped triples into a governed Delta table in Unity Catalog</p>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+            <span id="dbxBuildStatusText" class="text-muted small"></span>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="dbxBuildRefreshBtn">
+                <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+            </button>
+            {% set _dr = get_user_domain_role() %}
+            {% if _dr not in ('viewer', 'editor', 'none') %}
+            <button type="button" class="btn btn-sm btn-outline-secondary d-none" id="dbxAdjacencyRefreshBtn"
+                    title="Rebuild graph cache">
+                <i class="bi bi-diagram-3 me-1"></i>Refresh cache
+            </button>
+            {% else %}
+            <button type="button" class="btn btn-sm btn-outline-secondary d-none" id="dbxAdjacencyRefreshBtn" disabled
+                    title="Only builders and admins can refresh the graph cache">
+                <i class="bi bi-lock me-1"></i>Refresh cache
+            </button>
+            {% endif %}
+            {% include "partials/dtwin/_purge_inferences_button.html" %}
+            {% if _dr not in ('viewer', 'editor', 'none') %}
+            <button type="button" class="btn btn-sm btn-outline-primary" id="dbxBuildStartBtn" disabled>
+                <i class="bi bi-fast-forward me-1"></i>Build
+            </button>
+            {% else %}
+            <button type="button" class="btn btn-sm btn-outline-secondary" disabled title="Builders only">
+                <i class="bi bi-lock me-1"></i>Build
+            </button>
+            {% endif %}
+        </div>
+    </div>
+
+    <div id="dbxBuildProgressArea" class="mt-2 mb-3 d-none">
+        <div class="progress mb-2 ob-progress-md">
+            <div class="progress-bar progress-bar-striped progress-bar-animated" id="dbxBuildProgressBar" role="progressbar">0%</div>
+        </div>
+        <small class="text-muted" id="dbxBuildProgressStep"></small>
+    </div>
+
+    <div class="card d-none mb-3 timed-task-log-card" id="dbxBuildLogCard">
+        <div class="card-body">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+                <h6 class="card-title mb-0">
+                    <i class="bi bi-list-check me-1"></i>Building Lakehouse Graph
+                    <span id="dbxBuildLogBadge" class="badge bg-primary ms-1 d-none"></span>
+                </h6>
+                <div class="d-flex align-items-center gap-2">
+                    <small class="text-muted" id="dbxBuildLogTotal"></small>
+                    <button type="button" class="btn btn-outline-secondary btn-sm py-0 px-2"
+                            id="dbxBuildLogExport" title="Download the build log as a text file" disabled>
+                        <i class="bi bi-download me-1"></i>Export
+                    </button>
+                    <button type="button" class="btn btn-link btn-sm p-0 text-muted"
+                            id="dbxBuildLogHide" title="Hide log">
+                        <i class="bi bi-x-lg"></i>
+                    </button>
+                </div>
+            </div>
+            <p class="text-muted small mb-2" id="dbxBuildLogIntro">
+                Live progress of the build. Each row is one stage; details appear under the running stage.
+            </p>
+            <div id="dbxBuildLogList" class="sync-build-log"></div>
+        </div>
+    </div>
+
+    <div id="dbxBuildResultAlert" class="alert small mb-3 d-none" role="alert"></div>
+
+    <div class="alert alert-light border small mb-3">
+        <div class="d-flex align-items-center flex-wrap gap-2">
+            <strong id="dbxBuildDataTableLabel">Target Delta table</strong>
+            <span id="dbxBuildStorageBadge" class="badge dbx-storage-badge d-none"></span>
+        </div>
+        <div class="font-monospace mt-1" id="dbxBuildDataTable">—</div>
+        <div class="text-muted mt-1">Triple-Store Gateway: <span class="font-monospace" id="dbxBuildViewTable">—</span></div>
+        <div class="text-muted mt-1 d-none" id="dbxBuildStorageNote"></div>
+    </div>
+
+    <div id="dbxBuildReadinessCard" class="mb-3"></div>
+    <div id="dbxBuildStatusCard" class="mb-3"></div>
+    </div>
+</div>

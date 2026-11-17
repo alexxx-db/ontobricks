@@ -4,10 +4,14 @@ Parses RDFS (RDF Schema) files to extract classes and properties.
 RDFS is simpler than OWL and uses rdfs:Class instead of owl:Class.
 """
 
-from rdflib import Graph, RDF, RDFS
+from collections import Counter
+
+from rdflib import Graph, RDF, RDFS, Namespace
 from typing import List, Dict
 
 from back.core.errors import ValidationError
+
+SKOS = Namespace("http://www.w3.org/2004/02/skos/core#")
 
 
 class RDFSParser:
@@ -44,27 +48,31 @@ class RDFSParser:
         return extract_local_name(uri)
 
     def _get_base_uri(self) -> str:
-        """Try to determine the base URI from the graph.
+        """Return the namespace most declared classes and properties live in.
 
-        Returns:
-            Base URI string
+        Bound prefixes are not a reliable signal: rdflib pre-binds dozens of
+        well-known vocabularies (brick, dcat, ...) that the file never uses.
         """
-        # Try to find from namespace bindings
+        term_namespaces = Counter()
+        for term_type in (RDFS.Class, RDF.Property):
+            for term in self.graph.subjects(RDF.type, term_type):
+                uri = str(term)
+                if "#" in uri:
+                    term_namespaces[uri.rsplit("#", 1)[0] + "#"] += 1
+                elif "/" in uri:
+                    term_namespaces[uri.rsplit("/", 1)[0] + "/"] += 1
+        if term_namespaces:
+            return term_namespaces.most_common(1)[0][0]
+
+        subjects = {str(s) for s in self.graph.subjects()}
         for prefix, namespace in self.graph.namespaces():
             ns_str = str(namespace)
-            # Skip common prefixes
             if prefix in ["rdf", "rdfs", "owl", "xsd", "xml"]:
                 continue
-            if ns_str and (ns_str.endswith("#") or ns_str.endswith("/")):
+            if ns_str.endswith(("#", "/")) and any(
+                s.startswith(ns_str) for s in subjects
+            ):
                 return ns_str
-
-        # Try to extract from first class or property URI
-        for cls in self.graph.subjects(RDF.type, RDFS.Class):
-            uri = str(cls)
-            if "#" in uri:
-                return uri.rsplit("#", 1)[0] + "#"
-            elif "/" in uri:
-                return uri.rsplit("/", 1)[0] + "/"
 
         return "http://example.org/schema#"
 
@@ -107,46 +115,80 @@ class RDFSParser:
         except ImportError:
             pass
 
+        # Also handle SKOS ConceptSchemes — skos:Concept maps to class
+        for cls in self.graph.subjects(RDF.type, SKOS.Concept):
+            uri = str(cls)
+            if uri.startswith("_:") or uri in seen_uris:
+                continue
+            seen_uris.add(uri)
+            classes.append(self._extract_class_info(cls, uri))
+
+        # Last-resort fallback for alignment/loose files:
+        # collect any named URI that has an rdfs:label but no explicit type
+        if not classes:
+            _SKIP_NS = (
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                "http://www.w3.org/2000/01/rdf-schema#",
+                "http://www.w3.org/2002/07/owl#",
+                "http://www.w3.org/2001/XMLSchema#",
+                "http://www.w3.org/2004/02/skos/core#",
+            )
+            for subj in self.graph.subjects(RDFS.label, None):
+                uri = str(subj)
+                if uri.startswith("_:") or uri in seen_uris:
+                    continue
+                if any(uri.startswith(ns) for ns in _SKIP_NS):
+                    continue
+                seen_uris.add(uri)
+                classes.append(self._extract_class_info(subj, uri))
+
         return sorted(classes, key=lambda x: x["name"])
 
     def _extract_class_info(self, cls, uri: str) -> Dict[str, str]:
         """Extract information about a class.
 
-        Args:
-            cls: RDFLib class node
-            uri: Class URI
-
-        Returns:
-            Dict with class information
+        Handles rdfs:Class, owl:Class, and skos:Concept nodes.
         """
         name = self._extract_local_name(uri)
 
-        # Get label (try multiple languages, prefer English or no language tag)
+        # Label — try rdfs:label first, then skos:prefLabel (any language)
         label = None
         for lbl in self.graph.objects(cls, RDFS.label):
             lbl_str = str(lbl)
-            # Prefer label without language tag or English
-            if not hasattr(lbl, "language") or lbl.language in [None, "en"]:
+            if not hasattr(lbl, "language") or lbl.language in (None, "en"):
                 label = lbl_str
                 break
             if label is None:
                 label = lbl_str
 
-        # Get comment/description
+        if label is None:
+            for lbl in self.graph.objects(cls, SKOS.prefLabel):
+                lbl_str = str(lbl)
+                if not hasattr(lbl, "language") or lbl.language in (None, "en", "fr"):
+                    label = lbl_str
+                    break
+                if label is None:
+                    label = lbl_str
+
+        # Description — rdfs:comment, then skos:definition
         comment = None
         for cmt in self.graph.objects(cls, RDFS.comment):
             cmt_str = str(cmt)
-            if not hasattr(cmt, "language") or cmt.language in [None, "en"]:
+            if not hasattr(cmt, "language") or cmt.language in (None, "en"):
                 comment = cmt_str
                 break
             if comment is None:
                 comment = cmt_str
 
-        # Get parent class (subClassOf)
+        if comment is None:
+            for cmt in self.graph.objects(cls, SKOS.definition):
+                comment = str(cmt)
+                break
+
+        # Parent — rdfs:subClassOf first, then skos:broader
         parent = None
         for parent_cls in self.graph.objects(cls, RDFS.subClassOf):
             parent_uri = str(parent_cls)
-            # Skip blank nodes and Resource/Thing
             if (
                 not parent_uri.startswith("_:")
                 and not parent_uri.endswith("Resource")
@@ -155,12 +197,28 @@ class RDFSParser:
                 parent = self._extract_local_name(parent_uri)
                 break
 
+        if parent is None:
+            for broader in self.graph.objects(cls, SKOS.broader):
+                broader_uri = str(broader)
+                if not broader_uri.startswith("_:"):
+                    # Prefer the prefLabel of the broader concept for consistency
+                    broader_label = None
+                    for lbl in self.graph.objects(broader, SKOS.prefLabel):
+                        lbl_str = str(lbl)
+                        if not hasattr(lbl, "language") or lbl.language in (None, "en", "fr"):
+                            broader_label = lbl_str
+                            break
+                        if broader_label is None:
+                            broader_label = lbl_str
+                    parent = broader_label or self._extract_local_name(broader_uri)
+                    break
+
         return {
             "uri": uri,
-            "name": name,
+            "name": label or name,   # prefer human label as name for SKOS concepts
             "label": label or name,
             "description": comment or "",
-            "emoji": "",  # RDFS doesn't have icons
+            "emoji": "",
             "parent": parent or "",
         }
 
@@ -348,7 +406,7 @@ class RDFSParser:
         Returns:
             Dict with 'uri', 'label', 'comment', 'namespace'
         """
-        # Try to find ontology declaration (some RDFS files have this)
+        # Try to find OWL ontology declaration
         try:
             from rdflib import OWL
 
@@ -356,6 +414,33 @@ class RDFSParser:
                 return self._extract_ontology_info(onto)
         except ImportError:
             pass
+
+        # Try skos:ConceptScheme as vocabulary root
+        for scheme in self.graph.subjects(RDF.type, SKOS.ConceptScheme):
+            uri = str(scheme)
+            label = None
+            for lbl in self.graph.objects(scheme, RDFS.label):
+                label = str(lbl)
+                break
+            if label is None:
+                for lbl in self.graph.objects(scheme, SKOS.prefLabel):
+                    label = str(lbl)
+                    break
+            comment = None
+            for cmt in self.graph.objects(scheme, RDFS.comment):
+                comment = str(cmt)
+                break
+            if comment is None:
+                for cmt in self.graph.objects(scheme, SKOS.definition):
+                    comment = str(cmt)
+                    break
+            ns = uri if uri.endswith(("#", "/")) else uri + "#"
+            return {
+                "uri": uri,
+                "label": label or self._extract_local_name(uri) or "SKOS Vocabulary",
+                "comment": comment or "",
+                "namespace": ns,
+            }
 
         # Try to find a named graph or use base URI
         base_uri = self._get_base_uri()

@@ -2,7 +2,9 @@
 
 import pytest
 from unittest.mock import MagicMock
-from back.objects.domain import Domain
+from back.objects.domain import Domain, WorkspacePresence
+from back.core.errors import ConflictError, ValidationError
+from back.core.helpers import build_auto_base_uri
 
 
 def _mock_domain(
@@ -18,6 +20,7 @@ def _mock_domain(
         "description": "Desc",
         "author": "Author",
         "llm_endpoint": "",
+        "llm_endpoint_kind": "",
     }
     domain.triplestore = {"stats": {}}
     domain.current_version = "1"
@@ -80,6 +83,27 @@ class TestGetDomainStats:
         assert stats["entities"] == 1
 
 
+class TestWorkspacePresence:
+    def test_placeholder_name_without_content_is_unloaded(self):
+        domain = _mock_domain(name="NewDomain")
+        assert WorkspacePresence.is_loaded(domain) is False
+
+    def test_legacy_new_project_placeholder_is_unloaded(self):
+        domain = _mock_domain(name="NewProject")
+        assert WorkspacePresence.is_loaded(domain) is False
+
+    def test_custom_name_is_loaded(self):
+        domain = _mock_domain(name="TestDomain")
+        assert WorkspacePresence.is_loaded(domain) is True
+
+    def test_placeholder_with_entities_is_loaded(self):
+        domain = _mock_domain(
+            name="NewDomain",
+            classes=[{"name": "A", "uri": "http://t#A"}],
+        )
+        assert WorkspacePresence.is_loaded(domain) is True
+
+
 class TestSaveDomainInfo:
     def test_save_name(self):
         domain = _mock_domain()
@@ -87,10 +111,229 @@ class TestSaveDomainInfo:
         assert result["name"] == "New Name"
         domain.save.assert_called_once()
 
+    def test_save_domain_name_preserves_imported_ontology_label_and_language(self):
+        domain = _mock_domain(name="ImportedProject")
+        domain.ontology.update(
+            {"name": "Imported Ontology", "label_lang": "en"}
+        )
+
+        Domain(domain).save_domain_info({"name": "ImportedProject"})
+
+        assert domain.ontology["name"] == "Imported Ontology"
+        assert domain.ontology["label_lang"] == "en"
+
+    def test_save_llm_endpoint_kind(self):
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info(
+            {
+                "llm_endpoint": "main.ai.monclaudesonnetamoi",
+                "llm_endpoint_kind": "ai_gateway",
+            }
+        )
+        assert domain.info["llm_endpoint_kind"] == "ai_gateway"
+        assert result["llm_endpoint_kind"] == "ai_gateway"
+
+    def test_legacy_llm_endpoint_kind_is_inferred(self):
+        domain = _mock_domain()
+        domain.info["llm_endpoint"] = "databricks-claude-sonnet-4-5"
+        domain.info.pop("llm_endpoint_kind")
+
+        result = Domain(domain).get_domain_info()
+
+        assert result["info"]["llm_endpoint_kind"] == "serving"
+
+    def test_new_domain_rejects_spaces_and_special_chars(self):
+        """Unregistered domains must use CamelCase alphanumeric names only."""
+        domain = _mock_domain()
+        domain.domain_folder = ""
+        with pytest.raises(ValidationError, match="CamelCase alphanumeric"):
+            Domain(domain).save_domain_info({"name": "My Domain"})
+        with pytest.raises(ValidationError, match="CamelCase alphanumeric"):
+            Domain(domain).save_domain_info({"name": "WRFM - Shell"})
+        with pytest.raises(ValidationError, match="CamelCase alphanumeric"):
+            Domain(domain).save_domain_info({"name": "acme"})
+
+    def test_new_domain_accepts_camelcase_alphanumeric(self):
+        domain = _mock_domain()
+        domain.domain_folder = ""
+        result = Domain(domain).save_domain_info({"name": "PatientCare360"})
+        assert result["name"] == "PatientCare360"
     def test_save_base_uri(self):
         domain = _mock_domain()
         Domain(domain).save_domain_info({"base_uri": "http://new.org#"})
         assert domain.ontology["base_uri"] == "http://new.org#"
+
+    def test_auto_base_uri_generated_from_name(self):
+        """Auto mode (no custom URI) generates {default}/{Name}# — never empty."""
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info({"name": "AcmeSales"})
+        assert result["base_uri"].endswith("/AcmeSales#")
+        assert result["base_uri"] != "Unknown"
+        assert result["base_uri_auto"] is True
+
+    def test_shared_auto_base_uri_matches_domain_generation(self):
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info({"name": "ClaimsSales"})
+        assert result["base_uri"].endswith("/ClaimsSales#")
+        assert result["base_uri_auto"] is True
+        assert build_auto_base_uri(
+            "Claims Sales", "https://example.org"
+        ) == "https://example.org/Claims_Sales#"
+
+    def test_custom_base_uri_preserved_over_auto(self):
+        """A custom URI with base_uri_auto=False is kept verbatim."""
+        domain = _mock_domain()
+        Domain(domain).save_domain_info(
+            {"name": "AcmeSales", "base_uri": "http://acme.example/#", "base_uri_auto": False}
+        )
+        assert domain.ontology["base_uri"] == "http://acme.example/#"
+        assert domain.ontology["base_uri_auto"] is False
+
+    def test_empty_custom_base_uri_falls_back_to_generated(self):
+        """A blank custom URI is never stored — it regenerates from the name."""
+        domain = _mock_domain()
+        Domain(domain).save_domain_info(
+            {"name": "AcmeSales", "base_uri": "", "base_uri_auto": False}
+        )
+        assert domain.ontology["base_uri"].endswith("/AcmeSales#")
+
+    def test_auto_base_uri_sanitizes_spaces_in_domain_name(self):
+        """Domain names with spaces must not produce illegal IRI paths."""
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info({"name": "WRFM - Shell"})
+        assert " " not in result["base_uri"]
+        assert result["base_uri"].endswith("/WRFM_-_Shell#")
+
+    def test_custom_base_uri_with_spaces_is_sanitized(self):
+        domain = _mock_domain()
+        Domain(domain).save_domain_info(
+            {
+                "name": "WRFM",
+                "base_uri": "https://databricks-ontology.com/WRFM - Shell#",
+                "base_uri_auto": False,
+            }
+        )
+        assert " " not in domain.ontology["base_uri"]
+        assert "%20" in domain.ontology["base_uri"]
+
+    def test_save_review_quorum(self):
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info({"review_quorum": 3})
+        assert domain.info["review_quorum"] == 3
+        assert result["review_quorum"] == 3
+
+    def test_save_graph_backend(self):
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info(
+            {"graph_backend": "neo4j", "neo4j_connection": "Aura Prod"}
+        )
+        assert domain.info["graph_backend"] == "neo4j"
+        assert domain.info["neo4j_connection"] == "Aura Prod"
+        assert result["graph_backend"] == "neo4j"
+
+    def test_save_graph_backend_normalized(self):
+        domain = _mock_domain()
+        Domain(domain).save_domain_info(
+            {"graph_backend": "  NEO4J ", "neo4j_connection": "Aura Prod"}
+        )
+        assert domain.info["graph_backend"] == "neo4j"
+
+    def test_save_lakehouse_materialization(self):
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info(
+            {"graph_backend": "databricks", "lakehouse_materialization": "view"}
+        )
+        assert domain.info["lakehouse_materialization"] == "view"
+        assert result["lakehouse_materialization"] == "view"
+
+    def test_unknown_lakehouse_materialization_falls_back_to_table(self):
+        """An unrecognised mode must not silently stop materialising."""
+        domain = _mock_domain()
+        Domain(domain).save_domain_info(
+            {"graph_backend": "databricks", "lakehouse_materialization": "nope"}
+        )
+        assert domain.info["lakehouse_materialization"] == "table"
+
+    def test_lakehouse_materialization_defaults_to_table(self):
+        domain = _mock_domain()
+        result = Domain(domain).get_domain_info()
+        assert result["info"]["lakehouse_materialization"] == "table"
+
+    def test_review_quorum_clamped_to_minimum_one(self):
+        domain = _mock_domain()
+        Domain(domain).save_domain_info({"review_quorum": 0})
+        assert domain.info["review_quorum"] == 1
+
+    def test_review_quorum_invalid_falls_back_to_one(self):
+        domain = _mock_domain()
+        Domain(domain).save_domain_info({"review_quorum": "abc"})
+        assert domain.info["review_quorum"] == 1
+
+    def test_review_quorum_defaults_when_absent(self):
+        domain = _mock_domain()
+        result = Domain(domain).get_domain_info()
+        assert result["info"]["review_quorum"] == 1
+
+
+class TestSaveDomainInfoNoBackend:
+    """A "No Backend" (ontology-only) domain must persist with every graph MCP
+    tool force-disabled, whatever the client submitted, leaving only
+    ``describe_ontology`` exposed."""
+
+    def test_none_backend_force_disables_every_graph_tool(self):
+        from back.core.mcp_tools import MCP_GRAPH_TOOL_NAMES
+
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info({"graph_backend": "none"})
+
+        assert result["graph_backend"] == "none"
+        disabled = set(result["mcp_policy"].get("disabled_tools", []))
+        assert disabled == set(MCP_GRAPH_TOOL_NAMES)
+        # The persisted session policy matches the returned one.
+        assert set(domain.info["mcp_policy"]["disabled_tools"]) == set(
+            MCP_GRAPH_TOOL_NAMES
+        )
+
+    def test_none_backend_keeps_describe_ontology_enabled(self):
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info({"graph_backend": "none"})
+        assert "describe_ontology" not in result["mcp_policy"]["disabled_tools"]
+
+    def test_none_backend_overrides_a_client_that_enables_graph_tools(self):
+        """A stale/hand-crafted payload cannot re-expose the graph tools."""
+        from back.core.mcp_tools import MCP_GRAPH_TOOL_NAMES
+
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info(
+            {"graph_backend": "none", "mcp_policy": {"disabled_tools": []}}
+        )
+        assert set(result["mcp_policy"]["disabled_tools"]) == set(
+            MCP_GRAPH_TOOL_NAMES
+        )
+
+    def test_none_backend_preserves_context_policy(self):
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info(
+            {
+                "graph_backend": "none",
+                "mcp_policy": {"context": {"actions": "disabled"}},
+            }
+        )
+        assert result["mcp_policy"]["context"] == {"actions": "disabled"}
+
+    def test_none_backend_needs_no_neo4j_connection(self):
+        """The Neo4j-connection guard must not fire for a graphless domain."""
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info({"graph_backend": "none"})
+        assert result["graph_backend"] == "none"
+
+    def test_graph_backend_does_not_force_disable_tools(self):
+        """Relaxation is scoped to No Backend; a Lakebase domain is untouched."""
+        domain = _mock_domain()
+        result = Domain(domain).save_domain_info(
+            {"graph_backend": "lakebase", "mcp_policy": {}}
+        )
+        assert result["mcp_policy"].get("disabled_tools", []) == []
 
 
 class TestGetDomainTemplateData:
@@ -100,3 +343,191 @@ class TestGetDomainTemplateData:
         assert data["name"] == "Test"
         assert data["has_ontology"] is True
         assert data["has_mapping"] is False
+
+    def test_none_backend_is_exposed_to_the_template(self):
+        domain = _mock_domain()
+        domain.info["graph_backend"] = "none"
+        data = Domain(domain).get_domain_template_data()
+        assert data["graph_backend"] == "none"
+
+
+class TestAuditTrail:
+    def _svc(self, events, runs, configured=True, versions=("2", "1")):
+        svc = MagicMock()
+        svc.cfg.is_configured = configured
+        svc.list_review_events.return_value = events
+        svc.load_build_runs.return_value = runs
+        svc.list_versions_sorted.return_value = list(versions)
+        return svc
+
+    def test_merges_review_events_and_build_runs(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = "test_domain"
+        events = [{"action": "submitted", "comment": "go", "created_at": "t1"}]
+        runs = [{"id": 1, "status": "success", "started_at": "t2"}]
+        result = Domain(domain).audit_trail_result(
+            self._svc(events, runs), limit=10
+        )
+        assert result["success"] is True
+        assert result["domain_folder"] == "test_domain"
+        assert result["events"] == events
+        assert result["runs"] == runs
+
+    def test_returns_versions_for_dropdown(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = "test_domain"
+        domain.current_version = "2"
+        result = Domain(domain).audit_trail_result(
+            self._svc([], [], versions=("2", "1"))
+        )
+        assert result["versions"] == ["2", "1"]
+        assert result["current_version"] == "2"
+
+    def test_passes_folder_and_limit_to_store(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = "test_domain"
+        svc = self._svc([], [])
+        Domain(domain).audit_trail_result(svc, limit=42)
+        svc.list_review_events.assert_called_once_with("test_domain")
+        svc.load_build_runs.assert_called_once_with("test_domain", limit=42)
+
+    def test_requires_configured_registry(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = "test_domain"
+        with pytest.raises(ValidationError):
+            Domain(domain).audit_trail_result(self._svc([], [], configured=False))
+
+    def test_requires_saved_domain(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = ""
+        with pytest.raises(ValidationError):
+            Domain(domain).audit_trail_result(self._svc([], []))
+
+
+class TestListBuildRuns:
+    """The build-runs response backs the Runs page table only; the version
+    dropdown it used to feed is gone (see docs/superpowers/specs/
+    2026-08-02-runs-page-analytics-rows-design.md), so the payload must not
+    carry ``current_version`` / ``versions`` nor pay for the registry
+    round-trip that built them."""
+
+    def _svc(self, runs, configured=True):
+        svc = MagicMock()
+        svc.cfg.is_configured = configured
+        svc.load_build_runs.return_value = runs
+        return svc
+
+    def test_payload_has_no_version_dropdown_fields(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = "test_domain"
+        domain.current_version = "2"
+        runs = [{"id": 1, "status": "success", "started_at": "t1"}]
+        result = Domain(domain).list_build_runs_result(self._svc(runs))
+        assert result["success"] is True
+        assert result["domain_folder"] == "test_domain"
+        assert result["runs"] == runs
+        assert "current_version" not in result
+        assert "versions" not in result
+
+    def test_does_not_query_the_versions_registry(self):
+        """versions used to cost a list_versions_sorted round-trip on
+        every Runs page load; nothing consumes it now, so it must not be
+        called at all."""
+        domain = _mock_domain()
+        domain.uc_domain_folder = "test_domain"
+        svc = self._svc([])
+        Domain(domain).list_build_runs_result(svc)
+        svc.list_versions_sorted.assert_not_called()
+
+    def test_passes_version_and_limit_to_store(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = "test_domain"
+        svc = self._svc([])
+        Domain(domain).list_build_runs_result(svc, version="3", limit=42)
+        svc.load_build_runs.assert_called_once_with(
+            "test_domain", version="3", limit=42
+        )
+
+    def test_requires_configured_registry(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = "test_domain"
+        with pytest.raises(ValidationError):
+            Domain(domain).list_build_runs_result(self._svc([], configured=False))
+
+    def test_requires_saved_domain(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = ""
+        with pytest.raises(ValidationError):
+            Domain(domain).list_build_runs_result(self._svc([]))
+
+
+class TestGetVersionStatusAuthoritative:
+    """The lifecycle status is sourced from the registry, not the stale
+    in-session snapshot, so an out-of-band publish/reopen is reflected
+    without requiring a reload."""
+
+    def _svc(self, live_status, versions=("1",)):
+        svc = MagicMock()
+        svc.cfg.is_configured = True
+        svc.list_versions_sorted.return_value = list(versions)
+        svc.find_mcp_version.return_value = (None, {})
+        svc.get_version_status.return_value = live_status
+        return svc
+
+    def test_self_heals_session_from_registry(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = "test_domain"
+        domain.info["status"] = "DRAFT"  # stale snapshot
+        d = Domain(domain)
+        d.build_registry_service = MagicMock(
+            return_value=self._svc("PUBLISHED")
+        )
+        result = d.get_version_status(refresh=True)
+        assert result["status"] == "PUBLISHED"
+        assert domain.info["status"] == "PUBLISHED"
+        domain.save.assert_called()
+
+    def test_keeps_session_status_when_registry_silent(self):
+        domain = _mock_domain()
+        domain.uc_domain_folder = "test_domain"
+        domain.info["status"] = "IN-REVIEW"
+        d = Domain(domain)
+        d.build_registry_service = MagicMock(return_value=self._svc(None))
+        result = d.get_version_status(refresh=True)
+        assert result["status"] == "IN-REVIEW"
+
+
+class TestSaveDomainToUcLifecycleLock:
+    """``save_domain_to_uc`` must refuse to overwrite a version that is no
+    longer a DRAFT — the server-side mirror of the UI read-only gate."""
+
+    def _svc(self, live_status):
+        svc = MagicMock()
+        svc.cfg.is_configured = True
+        svc.get_version_status.return_value = live_status
+        svc.write_version.return_value = (True, "")
+        return svc
+
+    def test_rejects_overwrite_of_published(self):
+        domain = _mock_domain()
+        domain.export_for_save = MagicMock(return_value={"info": {}})
+        with pytest.raises(ConflictError):
+            Domain(domain).save_domain_to_uc(self._svc("PUBLISHED"))
+
+    def test_rejects_overwrite_of_in_review(self):
+        domain = _mock_domain()
+        domain.export_for_save = MagicMock(return_value={"info": {}})
+        with pytest.raises(ConflictError):
+            Domain(domain).save_domain_to_uc(self._svc("IN-REVIEW"))
+
+    def test_allows_overwrite_of_draft(self):
+        domain = _mock_domain()
+        domain.export_for_save = MagicMock(return_value={"info": {}})
+        domain.clear_change_flags = MagicMock()
+        domain.settings = {
+            "registry": {"catalog": "c", "schema": "s", "volume": "v"}
+        }
+        svc = self._svc("DRAFT")
+        result = Domain(domain).save_domain_to_uc(svc)
+        assert result["success"] is True
+        svc.write_version.assert_called_once()

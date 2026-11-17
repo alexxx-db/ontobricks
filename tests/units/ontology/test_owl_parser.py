@@ -100,6 +100,35 @@ TURTLE_WITH_AXIOMS = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
 :Individual owl:disjointWith :Company .
 """
 
+TURTLE_RESTRICTION_DATAPROPS = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix : <http://test.org/ontology#> .
+
+<http://test.org/ontology> a owl:Ontology .
+
+:RadioCell a owl:Class ;
+    rdfs:label "Radio Cell" ;
+    rdfs:subClassOf [
+        a owl:Restriction ;
+        owl:onProperty :cellId ;
+        owl:someValuesFrom xsd:string
+    ], [
+        a owl:Restriction ;
+        owl:onProperty :cellName ;
+        owl:someValuesFrom xsd:string
+    ] .
+
+:cellId a owl:DatatypeProperty ;
+    rdfs:label "cellId" ;
+    rdfs:range xsd:string .
+
+:cellName a owl:DatatypeProperty ;
+    rdfs:label "cellName" ;
+    rdfs:range xsd:string .
+"""
+
 
 class TestOntologyParserInit:
     def test_parse_turtle(self):
@@ -158,6 +187,24 @@ class TestGetClasses:
         assert classes["VIPCustomer"]["parent"] == "Customer"
         assert classes["Customer"]["parent"] == ""
 
+    def test_external_subclass_keeps_full_uri(self):
+        ttl = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix : <http://example.org/onto#> .
+:Customer a owl:Class ;
+    rdfs:subClassOf <http://example.org/other-onto#Party> .
+"""
+        classes = {c["name"]: c for c in OntologyParser(ttl).get_classes()}
+        assert classes["Customer"]["parent"] == "Party"
+        assert (
+            classes["Customer"]["parent_uri"]
+            == "http://example.org/other-onto#Party"
+        )
+
+    def test_class_without_parent_has_empty_parent_uri(self):
+        classes = {c["name"]: c for c in OntologyParser(SAMPLE_TURTLE).get_classes()}
+        assert classes["Customer"]["parent_uri"] == ""
+
     def test_data_properties_assigned(self):
         parser = OntologyParser(SAMPLE_TURTLE)
         classes = {c["name"]: c for c in parser.get_classes()}
@@ -165,11 +212,40 @@ class TestGetClasses:
         assert "firstName" in dp_names
         assert "lastName" in dp_names
 
+    def test_data_properties_from_restrictions_without_domain(self):
+        parser = OntologyParser(TURTLE_RESTRICTION_DATAPROPS)
+        classes = {c["name"]: c for c in parser.get_classes()}
+        dp_names = [dp["name"] for dp in classes["RadioCell"]["dataProperties"]]
+        assert "cellId" in dp_names
+        assert "cellName" in dp_names
+
     def test_sorted_by_name(self):
         parser = OntologyParser(SAMPLE_TURTLE)
         classes = parser.get_classes()
         names = [c["name"] for c in classes]
         assert names == sorted(names)
+
+    def test_alternate_labels_parsed_from_skos_altlabel(self):
+        """``alternate_labels`` (synonyms) are first-class ontology data,
+        serialized as ``skos:altLabel`` (task 4 review finding #4) — the
+        parser must read them back."""
+        turtle = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix : <http://test.org/ontology#> .
+
+:Carrier a owl:Class ;
+    rdfs:label "Carrier" ;
+    skos:altLabel "Shipper", "Hauler" .
+"""
+        parser = OntologyParser(turtle)
+        classes = {c["name"]: c for c in parser.get_classes()}
+        assert set(classes["Carrier"]["alternate_labels"]) == {"Shipper", "Hauler"}
+
+    def test_no_altlabel_yields_empty_list(self):
+        parser = OntologyParser(SAMPLE_TURTLE)
+        classes = {c["name"]: c for c in parser.get_classes()}
+        assert classes["Customer"]["alternate_labels"] == []
 
 
 class TestGetProperties:
@@ -192,6 +268,22 @@ class TestGetProperties:
         assert props["hasOrder"]["domain"] == "Customer"
         assert props["hasOrder"]["range"] == "Order"
 
+    def test_external_domain_and_range_keep_full_uris(self):
+        ttl = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix : <http://example.org/onto#> .
+:hasParty a owl:ObjectProperty ;
+    rdfs:domain <http://example.org/domain-onto#Account> ;
+    rdfs:range <http://example.org/other-onto#Party> .
+"""
+        props = {p["name"]: p for p in OntologyParser(ttl).get_properties()}
+        assert props["hasParty"]["domain"] == "Account"
+        assert props["hasParty"]["domain_uri"] == (
+            "http://example.org/domain-onto#Account"
+        )
+        assert props["hasParty"]["range"] == "Party"
+        assert props["hasParty"]["range_uri"] == "http://example.org/other-onto#Party"
+
 
 class TestGetOntologyInfo:
     def test_basic_info(self):
@@ -201,10 +293,57 @@ class TestGetOntologyInfo:
         assert info["label"] == "TestOntology"
         assert info["comment"] == "A test ontology"
 
+    def test_consumed_literals_keep_language_tags(self):
+        ttl = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix : <http://example.org/onto#> .
+<http://example.org/onto> a owl:Ontology ;
+    rdfs:label "Test Ontology"@en ;
+    rdfs:comment "Ontologie de test"@fr .
+:Customer a owl:Class ;
+    rdfs:label "Customer"@en ;
+    rdfs:comment "Client"@fr .
+:hasCustomer a owl:ObjectProperty ;
+    rdfs:label "has customer"@en ;
+    rdfs:comment "Relie un client"@fr .
+"""
+        parser = OntologyParser(ttl)
+        info = parser.get_ontology_info()
+        assert info["label"] == "Test Ontology"
+        assert info["label_lang"] == "en"
+        assert info["comment_lang"] == "fr"
+
+        ontology_class = parser.get_classes()[0]
+        assert ontology_class["label_lang"] == "en"
+        assert ontology_class["comment_lang"] == "fr"
+
+        ontology_property = parser.get_properties()[0]
+        assert ontology_property["label_lang"] == "en"
+        assert ontology_property["comment_lang"] == "fr"
+
     def test_namespace_has_separator(self):
         parser = OntologyParser(SAMPLE_TURTLE)
         info = parser.get_ontology_info()
         assert info["namespace"].endswith("#") or info["namespace"].endswith("/")
+
+    def test_missing_ontology_declaration_falls_back_to_default_uri(self):
+        """A file with no owl:Ontology header must not yield a "Unknown" uri.
+
+        Regression: the "Unknown" sentinel used to leak into the domain's
+        stored base_uri and show up on the Registry Browse page.
+        """
+        from shared.config.constants import DEFAULT_BASE_URI
+
+        classes_only = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix : <http://test.org/ontology#> .
+
+:Customer a owl:Class ; rdfs:label "Customer" .
+"""
+        info = OntologyParser(classes_only).get_ontology_info()
+        assert info["uri"] != "Unknown"
+        assert info["uri"] == DEFAULT_BASE_URI
+        assert info["namespace"] == DEFAULT_BASE_URI
 
 
 class TestGetConstraints:

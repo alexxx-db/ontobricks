@@ -17,7 +17,7 @@ in the gated ``tests/integration/`` suite.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock
 
 import pytest
@@ -51,6 +51,16 @@ class _InMemoryStore(RegistryStore):
         self._perms: Dict[str, Dict[str, Any]] = {}
         self._schedules: Dict[str, Dict[str, Any]] = {}
         self._history: Dict[str, List[ScheduleHistoryEntry]] = {}
+        self._build_runs: Dict[str, List[Dict[str, Any]]] = {}
+        self._graph_analytics: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._graph_analytics_runs: Dict[Tuple[str, str], List[Any]] = {}
+        # Stands in for ``computed_at`` so a cross-version read can order
+        # newest-first the way the real store's ORDER BY does.
+        self._graph_analytics_seq = 0
+        self._review_events: List[Dict[str, Any]] = []
+        self._change_events: List[Dict[str, Any]] = []
+        self._comments: List[Dict[str, Any]] = []
+        self._tasks: List[Dict[str, Any]] = []
         self._global: Dict[str, Any] = {}
         self._initialized = False
 
@@ -75,10 +85,38 @@ class _InMemoryStore(RegistryStore):
 
     def list_domains_with_metadata(self) -> Tuple[bool, List[DomainSummary], str]:
         ok, folders, msg = self.list_domain_folders()
-        return ok, [{"name": f, "versions": []} for f in folders], msg
+        result: List[DomainSummary] = []
+        for f in folders:
+            versions = []
+            description = ""
+            for (vf, vv), data in self._versions.items():
+                if vf != f:
+                    continue
+                info = data.get("info", {}) or {}
+                description = description or info.get("description", "")
+                versions.append(
+                    {"version": vv, "status": info.get("status", "DRAFT")}
+                )
+            result.append(
+                {"name": f, "description": description, "versions": versions}
+            )
+        return ok, result, msg
+
+    def get_version_status(self, folder: str, version: str):
+        data = self._versions.get((folder, version))
+        if data is None:
+            return None
+        return (data.get("info", {}) or {}).get("status")
 
     def domain_exists(self, folder: str) -> bool:
         return any(f == folder for (f, _) in self._versions.keys())
+
+    def get_domain_quorum(self, folder: str) -> int:
+        for (f, v), data in self._versions.items():
+            if f == folder:
+                info = data.get("info", {}) or {}
+                return max(1, int(info.get("review_quorum") or 1))
+        return 1
 
     def delete_domain(self, folder: str) -> List[str]:
         for key in [k for k in self._versions if k[0] == folder]:
@@ -109,6 +147,15 @@ class _InMemoryStore(RegistryStore):
         self._versions.pop((folder, version), None)
         return True, "ok"
 
+    def update_version_status(
+        self, folder: str, version: str, status: str
+    ) -> Tuple[bool, str]:
+        data = self._versions.get((folder, version))
+        if data is None:
+            return False, f"missing {folder}/{version}"
+        data.setdefault("info", {})["status"] = status
+        return True, "ok"
+
     def load_domain_permissions(self, folder: str) -> Dict[str, Any]:
         return dict(self._perms.get(folder, {"version": 1, "permissions": []}))
 
@@ -127,16 +174,299 @@ class _InMemoryStore(RegistryStore):
         self._schedules = {k: dict(v) for k, v in schedules.items()}
         return True, "ok"
 
-    def load_schedule_history(self, folder: str) -> List[ScheduleHistoryEntry]:
-        return list(self._history.get(folder, []))
+    def load_schedule_history(self, key: str) -> List[ScheduleHistoryEntry]:
+        return list(self._history.get(key, []))
 
     def append_schedule_history(
-        self, folder: str, entry: ScheduleHistoryEntry, *, max_entries: int = 50
+        self, key: str, entry: ScheduleHistoryEntry, *, max_entries: int = 50
     ) -> None:
-        bucket = self._history.setdefault(folder, [])
+        bucket = self._history.setdefault(key, [])
         bucket.append(dict(entry))
         if len(bucket) > max_entries:
             del bucket[: len(bucket) - max_entries]
+
+    def record_build_run(self, folder: str, entry: Dict[str, Any]) -> None:
+        runs = self._build_runs.setdefault(folder, [])
+        row = dict(entry)
+        row.setdefault("id", len(runs) + 1)
+        runs.append(row)
+
+    def load_build_runs(
+        self, folder: str, *, version=None, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        runs = [
+            dict(r)
+            for r in self._build_runs.get(folder, [])
+            if version is None or r.get("version") == version
+        ]
+        runs.reverse()  # newest-first
+        return runs[:limit]
+
+    def load_all_build_runs(
+        self, *, folder=None, limit: int = 25, offset: int = 0
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        rows = [
+            dict(r, domain=f)
+            for f, runs in self._build_runs.items()
+            if folder is None or f == folder
+            for r in runs
+        ]
+        # Mirrors the real ORDER BY started_at DESC, id DESC.
+        rows.sort(key=lambda r: (str(r.get("started_at", "")), r.get("id", 0)))
+        rows.reverse()
+        return rows[offset : offset + limit], len(rows)
+
+    def build_analytics(self, folder: str, *, version=None) -> Dict[str, Any]:
+        runs = [
+            r
+            for r in self._build_runs.get(folder, [])
+            if version is None or r.get("version") == version
+        ]
+        total = len(runs)
+        successes = [r for r in runs if r.get("status") == "success"]
+        durations = [float(r.get("duration_s", 0) or 0) for r in successes]
+        active = successes[-1] if successes else None
+        return {
+            "total_runs": total,
+            "success_runs": len(successes),
+            "failed_runs": total - len(successes),
+            "success_rate": (len(successes) / total) if total else 0.0,
+            "avg_duration_s": (sum(durations) / len(durations)) if durations else 0.0,
+            "min_duration_s": min(durations) if durations else 0.0,
+            "max_duration_s": max(durations) if durations else 0.0,
+            "last_triple_count": int(active.get("triple_count", 0)) if active else 0,
+            "active_build": dict(active) if active else None,
+            "per_version": [],
+        }
+
+    def save_graph_analytics(
+        self, folder: str, version: str, entry: Dict[str, Any]
+    ) -> None:
+        # UPSERT: one row per (folder, version) — only the last survives.
+        self._graph_analytics[(folder, version)] = dict(entry)
+
+    def load_graph_analytics(self, folder: str, version: str):
+        row = self._graph_analytics.get((folder, version))
+        return dict(row) if row is not None else None
+
+    def record_graph_analytics_run(
+        self, folder: str, version: str, entry: Dict[str, Any]
+    ) -> None:
+        # Append-only run history, tagged with a sequence number so reads
+        # can order newest-first across versions.
+        self._graph_analytics_seq += 1
+        row = dict(entry)
+        row.setdefault("version", version)
+        self._graph_analytics_runs.setdefault((folder, version), []).append(
+            (self._graph_analytics_seq, row)
+        )
+
+    def load_graph_analytics_runs(
+        self, folder: str, version: Optional[str] = None, *, limit: int = 100
+    ):
+        pairs = [
+            (seq, row)
+            for (f, v), entries in self._graph_analytics_runs.items()
+            if f == folder and (version is None or v == version)
+            for seq, row in entries
+        ]
+        pairs.sort(key=lambda p: p[0], reverse=True)
+        return [dict(row) for _, row in pairs[:limit]]
+
+    def load_all_graph_analytics_runs(
+        self, *, folder=None, limit: int = 25, offset: int = 0
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        pairs = [
+            (seq, dict(row, domain=f))
+            for (f, _v), entries in self._graph_analytics_runs.items()
+            if folder is None or f == folder
+            for seq, row in entries
+        ]
+        pairs.sort(key=lambda p: p[0], reverse=True)
+        rows = [row for _, row in pairs]
+        return rows[offset : offset + limit], len(rows)
+
+    def record_review_event(
+        self,
+        folder: str,
+        version: str,
+        actor: str,
+        action: str,
+        *,
+        from_status: str = "",
+        to_status: str = "",
+        comment: str = "",
+        meta=None,
+    ) -> Tuple[bool, str]:
+        self._review_events.append(
+            {
+                "id": str(len(self._review_events) + 1),
+                "folder": folder,
+                "version": version,
+                "actor": actor,
+                "action": action,
+                "from_status": from_status,
+                "to_status": to_status,
+                "comment": comment,
+                "meta": dict(meta or {}),
+                "created_at": f"2026-01-01T00:00:{len(self._review_events):02d}",
+            }
+        )
+        return True, "ok"
+
+    def list_review_events(
+        self, folder: str, version=None
+    ) -> List[Dict[str, Any]]:
+        return [
+            dict(e)
+            for e in self._review_events
+            if e["folder"] == folder
+            and (version is None or e["version"] == version)
+        ]
+
+    def list_all_review_events(self) -> List[Dict[str, Any]]:
+        return [dict(e) for e in self._review_events]
+
+    def record_change_events(
+        self,
+        folder: str,
+        version: str,
+        actor: str,
+        events: List[Dict[str, Any]],
+    ) -> Tuple[bool, str]:
+        for e in events or []:
+            self._change_events.append(
+                {
+                    "id": str(len(self._change_events) + 1),
+                    "folder": folder,
+                    "version": version,
+                    "actor": actor,
+                    "source": e.get("source") or "user",
+                    "action": e.get("action") or "",
+                    "entity_type": e.get("entity_type") or "",
+                    "entity_ref": e.get("entity_ref") or "",
+                    "summary": e.get("summary") or "",
+                    "meta": dict(e.get("meta") or {}),
+                    "occurred_at": e.get("ts")
+                    or f"2026-01-01T00:00:{len(self._change_events):02d}",
+                    "created_at": f"2026-01-01T00:00:{len(self._change_events):02d}",
+                }
+            )
+        return True, "ok"
+
+    def list_change_events(
+        self, folder: str, version=None, limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        rows = [
+            dict(e)
+            for e in self._change_events
+            if e["folder"] == folder
+            and (version is None or e["version"] == version)
+        ]
+        return rows[:limit]
+
+    def insert_comment(
+        self,
+        folder: str,
+        version: str,
+        *,
+        author: str,
+        body: str,
+        parent_id=None,
+    ):
+        row = {
+            "id": str(len(self._comments) + 1),
+            "folder": folder,
+            "version": version,
+            "parent_id": str(parent_id) if parent_id else "",
+            "author": author or "",
+            "body": body or "",
+            "resolved": False,
+            "created_at": f"2026-01-01T00:00:{len(self._comments):02d}",
+        }
+        self._comments.append(row)
+        return dict(row)
+
+    def list_comments(
+        self,
+        folder: str,
+        version=None,
+        *,
+        include_resolved: bool = True,
+    ) -> List[Dict[str, Any]]:
+        return [
+            dict(c)
+            for c in self._comments
+            if c["folder"] == folder
+            and (version is None or c["version"] == version)
+            and (include_resolved or not c["resolved"])
+        ]
+
+    def resolve_comment(
+        self, folder: str, comment_id: str, *, resolved: bool = True
+    ) -> Tuple[bool, str]:
+        for c in self._comments:
+            if c["folder"] == folder and c["id"] == str(comment_id):
+                c["resolved"] = resolved
+                return True, ""
+        return False, "Comment not found"
+
+    def insert_task(
+        self,
+        folder: str,
+        version: str,
+        *,
+        assignee: str,
+        created_by: str,
+        title: str,
+        description: str = "",
+        due_date=None,
+        comment_id=None,
+    ):
+        row = {
+            "id": str(len(self._tasks) + 1),
+            "folder": folder,
+            "version": version,
+            "assignee": assignee or "",
+            "created_by": created_by or "",
+            "title": title or "",
+            "description": description or "",
+            "status": "open",
+            "due_date": due_date or "",
+            "comment_id": str(comment_id) if comment_id else "",
+            "created_at": f"2026-01-01T00:00:{len(self._tasks):02d}",
+            "updated_at": f"2026-01-01T00:00:{len(self._tasks):02d}",
+        }
+        self._tasks.append(row)
+        return dict(row)
+
+    def list_tasks(self, folder: str, version=None) -> List[Dict[str, Any]]:
+        rows = [
+            dict(t)
+            for t in self._tasks
+            if t["folder"] == folder
+            and (version is None or t["version"] == version)
+        ]
+        rows.reverse()  # newest-first
+        return rows
+
+    def list_tasks_for_assignee(self, assignee: str) -> List[Dict[str, Any]]:
+        rows = [
+            dict(t)
+            for t in self._tasks
+            if t["assignee"].lower() == (assignee or "").lower()
+        ]
+        rows.reverse()
+        return rows
+
+    def update_task_status(
+        self, folder: str, task_id: str, status: str
+    ) -> Tuple[bool, str]:
+        for t in self._tasks:
+            if t["folder"] == folder and t["id"] == str(task_id):
+                t["status"] = status
+                return True, ""
+        return False, "Task not found"
 
     def load_global_config(self) -> Dict[str, Any]:
         return dict(self._global)
@@ -144,9 +474,6 @@ class _InMemoryStore(RegistryStore):
     def save_global_config(self, updates: Dict[str, Any]) -> Tuple[bool, str]:
         self._global.update(updates)
         return True, "ok"
-
-    def domain_folder_id(self, folder: str):
-        return folder
 
 
 # ---------------------------------------------------------------------
@@ -269,6 +596,19 @@ class TestStoreContract:
         ok, versions, _ = store.list_versions("a")
         assert ok and versions == ["2"]
 
+    def test_update_version_status_round_trip(self, store):
+        store.write_version("demo", "1", {"info": {"name": "demo"}})
+        ok, msg = store.update_version_status("demo", "1", "IN-REVIEW")
+        assert ok, msg
+        ok, got, _ = store.read_version("demo", "1")
+        assert ok
+        assert got["info"]["status"] == "IN-REVIEW"
+
+    def test_update_version_status_unknown_version(self, store):
+        ok, msg = store.update_version_status("ghost", "9", "PUBLISHED")
+        assert ok is False
+        assert msg
+
     def test_permissions_default_shape(self, store):
         out = store.load_domain_permissions("nobody")
         assert out == {"version": 1, "permissions": []}
@@ -288,6 +628,366 @@ class TestStoreContract:
         history = store.load_schedule_history("a")
         assert len(history) == 3
         assert [h["timestamp"] for h in history] == ["2", "3", "4"]
+
+    def test_build_runs_round_trip_newest_first(self, store):
+        for i in range(3):
+            store.record_build_run(
+                "demo",
+                {
+                    "version": "1",
+                    "build_kind": "session",
+                    "status": "success",
+                    "started_at": str(i),
+                    "duration_s": float(i),
+                    "triple_count": i * 10,
+                },
+            )
+        runs = store.load_build_runs("demo")
+        assert len(runs) == 3
+        # Newest-first (last recorded comes back first).
+        assert [r["started_at"] for r in runs] == ["2", "1", "0"]
+
+    def test_build_runs_filter_by_version(self, store):
+        store.record_build_run("demo", {"version": "1", "status": "success"})
+        store.record_build_run("demo", {"version": "2", "status": "success"})
+        store.record_build_run("demo", {"version": "2", "status": "error"})
+        v2 = store.load_build_runs("demo", version="2")
+        assert len(v2) == 2
+        assert all(r["version"] == "2" for r in v2)
+
+    def test_build_analytics_aggregates_and_active(self, store):
+        store.record_build_run(
+            "demo",
+            {"version": "1", "status": "success", "duration_s": 2.0,
+             "triple_count": 100, "started_at": "1"},
+        )
+        store.record_build_run(
+            "demo",
+            {"version": "1", "status": "error", "duration_s": 0.0,
+             "started_at": "2"},
+        )
+        store.record_build_run(
+            "demo",
+            {"version": "1", "status": "success", "duration_s": 4.0,
+             "triple_count": 200, "started_at": "3"},
+        )
+        a = store.build_analytics("demo")
+        assert a["total_runs"] == 3
+        assert a["success_runs"] == 2
+        assert a["failed_runs"] == 1
+        assert abs(a["success_rate"] - (2 / 3)) < 1e-9
+        assert abs(a["avg_duration_s"] - 3.0) < 1e-9
+        # Active build = latest successful run (triple_count=200).
+        assert a["active_build"] is not None
+        assert a["last_triple_count"] == 200
+
+    def test_build_analytics_empty_domain(self, store):
+        a = store.build_analytics("ghost")
+        assert a["total_runs"] == 0
+        assert a["active_build"] is None
+        assert a["success_rate"] == 0.0
+
+    def test_graph_analytics_missing_returns_none(self, store):
+        assert store.load_graph_analytics("demo", "1") is None
+
+    def test_graph_analytics_round_trip(self, store):
+        store.save_graph_analytics(
+            "demo",
+            "1",
+            {
+                "status": "completed",
+                "graph_name": "g_demo_v1",
+                "class_filter": ["http://x/Person"],
+                "stats": {"node_count": 42},
+                "top_pagerank": ["http://x/a"],
+                "result": {"nodes": {"http://x/a": {"degree": 0.5}}},
+                "duration_ms": 1234,
+                "computed_at": "2026-01-01T00:00:00",
+            },
+        )
+        row = store.load_graph_analytics("demo", "1")
+        assert row is not None
+        assert row["stats"]["node_count"] == 42
+        assert row["class_filter"] == ["http://x/Person"]
+        assert row["result"]["nodes"]["http://x/a"]["degree"] == 0.5
+
+    def test_graph_analytics_upsert_keeps_only_last(self, store):
+        store.save_graph_analytics(
+            "demo", "1", {"stats": {"node_count": 1}, "duration_ms": 10}
+        )
+        store.save_graph_analytics(
+            "demo", "1", {"stats": {"node_count": 2}, "duration_ms": 20}
+        )
+        row = store.load_graph_analytics("demo", "1")
+        assert row["stats"]["node_count"] == 2
+        assert row["duration_ms"] == 20
+
+    def test_graph_analytics_scoped_by_version(self, store):
+        store.save_graph_analytics("demo", "1", {"stats": {"node_count": 1}})
+        store.save_graph_analytics("demo", "2", {"stats": {"node_count": 9}})
+        assert store.load_graph_analytics("demo", "1")["stats"]["node_count"] == 1
+        assert store.load_graph_analytics("demo", "2")["stats"]["node_count"] == 9
+
+    def test_graph_analytics_runs_empty_by_default(self, store):
+        assert store.load_graph_analytics_runs("demo", "1") == []
+
+    def test_graph_analytics_runs_newest_first(self, store):
+        store.record_graph_analytics_run(
+            "demo", "1", {"status": "completed", "node_count": 1}
+        )
+        store.record_graph_analytics_run(
+            "demo", "1", {"status": "failed", "error": "boom"}
+        )
+        runs = store.load_graph_analytics_runs("demo", "1")
+        assert [r["status"] for r in runs] == ["failed", "completed"]
+        assert runs[0]["error"] == "boom"
+
+    def test_graph_analytics_runs_limit(self, store):
+        for i in range(5):
+            store.record_graph_analytics_run(
+                "demo", "1", {"status": "completed", "node_count": i}
+            )
+        runs = store.load_graph_analytics_runs("demo", "1", limit=2)
+        assert len(runs) == 2
+        assert runs[0]["node_count"] == 4
+
+    def test_graph_analytics_runs_scoped_by_version(self, store):
+        store.record_graph_analytics_run("demo", "1", {"node_count": 1})
+        store.record_graph_analytics_run("demo", "2", {"node_count": 9})
+        assert len(store.load_graph_analytics_runs("demo", "1")) == 1
+        assert store.load_graph_analytics_runs("demo", "2")[0]["node_count"] == 9
+
+    def test_graph_analytics_runs_span_versions_when_no_version_given(self, store):
+        """The Runs page shows every version at once, so omitting the
+        version must return the whole folder's history, newest-first."""
+        store.record_graph_analytics_run("demo", "1", {"node_count": 1})
+        store.record_graph_analytics_run("demo", "2", {"node_count": 2})
+        store.record_graph_analytics_run("demo", "1", {"node_count": 3})
+
+        runs = store.load_graph_analytics_runs("demo")
+
+        assert [r["node_count"] for r in runs] == [3, 2, 1]
+
+    def test_graph_analytics_runs_carry_their_version(self, store):
+        """With no filter the table interleaves versions, so each row has
+        to say which version it belongs to."""
+        store.record_graph_analytics_run("demo", "7", {"node_count": 1})
+        assert store.load_graph_analytics_runs("demo")[0]["version"] == "7"
+
+    def test_graph_analytics_runs_limit_applies_across_versions(self, store):
+        store.record_graph_analytics_run("demo", "1", {"node_count": 1})
+        store.record_graph_analytics_run("demo", "2", {"node_count": 2})
+        store.record_graph_analytics_run("demo", "3", {"node_count": 3})
+
+        runs = store.load_graph_analytics_runs("demo", limit=2)
+
+        assert [r["node_count"] for r in runs] == [3, 2]
+
+    def test_graph_analytics_runs_ignores_other_folders(self, store):
+        store.record_graph_analytics_run("demo", "1", {"node_count": 1})
+        store.record_graph_analytics_run("other", "1", {"node_count": 99})
+        assert [r["node_count"] for r in store.load_graph_analytics_runs("demo")] == [1]
+
+    # -- cross-domain, paginated reads (Settings → Automation → Runs) --
+    #
+    # The per-folder readers above answer "this domain's history". These
+    # answer "the whole registry's history, one page at a time", and return
+    # ``(page_rows, total_matching_rows)`` so the UI can render page counts
+    # without fetching everything.
+
+    def _seed_build_runs(self, store):
+        store.record_build_run("alpha", {"version": "1", "started_at": "1"})
+        store.record_build_run("beta", {"version": "1", "started_at": "2"})
+        store.record_build_run("alpha", {"version": "2", "started_at": "3"})
+
+    def test_all_build_runs_span_every_domain_newest_first(self, store):
+        self._seed_build_runs(store)
+
+        rows, total = store.load_all_build_runs()
+
+        assert total == 3
+        assert [r["started_at"] for r in rows] == ["3", "2", "1"]
+
+    def test_all_build_runs_rows_carry_their_domain(self, store):
+        self._seed_build_runs(store)
+
+        rows, _ = store.load_all_build_runs()
+
+        assert [r["domain"] for r in rows] == ["alpha", "beta", "alpha"]
+
+    def test_all_build_runs_scoped_to_one_domain(self, store):
+        self._seed_build_runs(store)
+
+        rows, total = store.load_all_build_runs(folder="alpha")
+
+        assert total == 2
+        assert {r["domain"] for r in rows} == {"alpha"}
+
+    def test_all_build_runs_total_ignores_limit_and_offset(self, store):
+        self._seed_build_runs(store)
+
+        rows, total = store.load_all_build_runs(limit=1, offset=1)
+
+        assert total == 3
+        assert len(rows) == 1
+
+    def test_all_build_runs_consecutive_pages_are_disjoint(self, store):
+        self._seed_build_runs(store)
+
+        first, _ = store.load_all_build_runs(limit=2, offset=0)
+        second, _ = store.load_all_build_runs(limit=2, offset=2)
+
+        assert [r["started_at"] for r in first + second] == ["3", "2", "1"]
+
+    def test_all_build_runs_offset_past_the_end_is_an_empty_page(self, store):
+        self._seed_build_runs(store)
+
+        rows, total = store.load_all_build_runs(offset=99)
+
+        assert rows == []
+        assert total == 3
+
+    def test_all_build_runs_unknown_domain_is_empty(self, store):
+        self._seed_build_runs(store)
+        assert store.load_all_build_runs(folder="ghost") == ([], 0)
+
+    def _seed_analytics_runs(self, store):
+        store.record_graph_analytics_run("alpha", "1", {"node_count": 1})
+        store.record_graph_analytics_run("beta", "1", {"node_count": 2})
+        store.record_graph_analytics_run("alpha", "2", {"node_count": 3})
+
+    def test_all_analytics_runs_span_every_domain_newest_first(self, store):
+        self._seed_analytics_runs(store)
+
+        rows, total = store.load_all_graph_analytics_runs()
+
+        assert total == 3
+        assert [r["node_count"] for r in rows] == [3, 2, 1]
+
+    def test_all_analytics_runs_rows_carry_their_domain(self, store):
+        self._seed_analytics_runs(store)
+
+        rows, _ = store.load_all_graph_analytics_runs()
+
+        assert [r["domain"] for r in rows] == ["alpha", "beta", "alpha"]
+
+    def test_all_analytics_runs_scoped_to_one_domain(self, store):
+        self._seed_analytics_runs(store)
+
+        rows, total = store.load_all_graph_analytics_runs(folder="alpha")
+
+        assert total == 2
+        assert [r["node_count"] for r in rows] == [3, 1]
+
+    def test_all_analytics_runs_total_ignores_limit_and_offset(self, store):
+        self._seed_analytics_runs(store)
+
+        rows, total = store.load_all_graph_analytics_runs(limit=1, offset=1)
+
+        assert total == 3
+        assert [r["node_count"] for r in rows] == [2]
+
+    def test_all_analytics_runs_consecutive_pages_are_disjoint(self, store):
+        self._seed_analytics_runs(store)
+
+        first, _ = store.load_all_graph_analytics_runs(limit=2, offset=0)
+        second, _ = store.load_all_graph_analytics_runs(limit=2, offset=2)
+
+        assert [r["node_count"] for r in first + second] == [3, 2, 1]
+
+    def test_all_analytics_runs_unknown_domain_is_empty(self, store):
+        self._seed_analytics_runs(store)
+        assert store.load_all_graph_analytics_runs(folder="ghost") == ([], 0)
+
+    def test_review_events_round_trip_oldest_first(self, store):
+        store.record_review_event(
+            "demo", "1", "alice@a.com", "submitted",
+            from_status="DRAFT", to_status="IN-REVIEW", comment="go",
+        )
+        store.record_review_event(
+            "demo", "1", "bob@a.com", "approved", comment="lgtm",
+        )
+        events = store.list_review_events("demo", "1")
+        assert [e["action"] for e in events] == ["submitted", "approved"]
+        assert events[0]["from_status"] == "DRAFT"
+        assert events[0]["to_status"] == "IN-REVIEW"
+        assert events[1]["actor"] == "bob@a.com"
+
+    def test_review_events_filter_by_version(self, store):
+        store.record_review_event("demo", "1", "a@a.com", "submitted")
+        store.record_review_event("demo", "2", "a@a.com", "submitted")
+        assert len(store.list_review_events("demo", "1")) == 1
+        assert len(store.list_review_events("demo")) == 2
+
+    def test_list_all_review_events_spans_domains(self, store):
+        store.record_review_event("demo", "1", "a@a.com", "submitted")
+        store.record_review_event("other", "1", "a@a.com", "submitted")
+        allev = store.list_all_review_events()
+        folders = {e["folder"] for e in allev}
+        assert folders == {"demo", "other"}
+
+    def test_comments_round_trip_oldest_first(self, store):
+        store.insert_comment(
+            "demo", "1", author="a@a.com", body="first",
+        )
+        store.insert_comment(
+            "demo", "1", author="b@a.com", body="second",
+        )
+        comments = store.list_comments("demo", "1")
+        assert [c["body"] for c in comments] == ["first", "second"]
+        assert comments[0]["resolved"] is False
+
+    def test_resolve_comment_flips_flag_and_filters(self, store):
+        c = store.insert_comment(
+            "demo", "1", author="a@a.com", body="hi",
+        )
+        ok, _ = store.resolve_comment("demo", c["id"], resolved=True)
+        assert ok
+        assert store.list_comments("demo", "1", include_resolved=False) == []
+        assert len(store.list_comments("demo", "1")) == 1
+
+    def test_resolve_unknown_comment_returns_false(self, store):
+        ok, msg = store.resolve_comment("demo", "999")
+        assert ok is False and msg
+
+    def test_tasks_round_trip_newest_first(self, store):
+        store.insert_task(
+            "demo", "1", assignee="x@a.com", created_by="a@a.com",
+            title="task one",
+        )
+        store.insert_task(
+            "demo", "1", assignee="y@a.com", created_by="a@a.com",
+            title="task two",
+        )
+        tasks = store.list_tasks("demo", "1")
+        assert [t["title"] for t in tasks] == ["task two", "task one"]
+        assert tasks[0]["status"] == "open"
+
+    def test_tasks_for_assignee_is_case_insensitive_and_cross_domain(self, store):
+        store.insert_task(
+            "demo", "1", assignee="X@a.com", created_by="a@a.com", title="t1",
+        )
+        store.insert_task(
+            "other", "1", assignee="x@a.com", created_by="a@a.com", title="t2",
+        )
+        store.insert_task(
+            "demo", "1", assignee="z@a.com", created_by="a@a.com", title="t3",
+        )
+        mine = store.list_tasks_for_assignee("x@a.com")
+        assert {t["title"] for t in mine} == {"t1", "t2"}
+        assert {t["folder"] for t in mine} == {"demo", "other"}
+
+    def test_update_task_status_round_trip(self, store):
+        t = store.insert_task(
+            "demo", "1", assignee="x@a.com", created_by="a@a.com", title="t",
+        )
+        ok, _ = store.update_task_status("demo", t["id"], "done")
+        assert ok
+        assert store.list_tasks("demo", "1")[0]["status"] == "done"
+
+    def test_update_unknown_task_returns_false(self, store):
+        ok, msg = store.update_task_status("demo", "999", "done")
+        assert ok is False and msg
 
     def test_table_row_counts_defaults_to_zero(self, store):
         # The base class returns zero for every requested table — only
@@ -313,11 +1013,13 @@ class _ScriptedCursor:
     """
 
     def __init__(self, script):
-        # script: list of dicts with keys: contains, fetchone, fetchall
+        # script: list of dicts with keys: contains, fetchone, fetchall,
+        # rowcount
         self._script = list(script)
         self.executed = []  # captured (sql, params) tuples
         self._next_one = None
         self._next_all = []
+        self.rowcount = 0
 
     def __enter__(self):
         return self
@@ -332,11 +1034,13 @@ class _ScriptedCursor:
                 entry["_used"] = True
                 self._next_one = entry.get("fetchone")
                 self._next_all = entry.get("fetchall", [])
+                self.rowcount = entry.get("rowcount", 0)
                 return
         # Default to "no row" so unscripted queries don't accidentally
         # return stale data from the previous script entry.
         self._next_one = None
         self._next_all = []
+        self.rowcount = 0
 
     def fetchone(self):
         return self._next_one
@@ -350,7 +1054,9 @@ class _ScriptedConn:
         self._cursor = cursor
         self.closed = False
 
-    def cursor(self):
+    def cursor(self, *args, **kwargs):
+        # Accept ``row_factory=dict_row`` (used by the list/insert paths)
+        # while staying compatible with the no-arg callers.
         return self._cursor
 
     def close(self):
@@ -871,3 +1577,474 @@ class TestFetchLakebaseRegistryTriplet:
 
         assert first == ("c1", "s1", "v1")
         assert second == ("c2", "s2", "v2")
+
+
+# ---------------------------------------------------------------------
+# Lakebase collaborative comments + tasks — real SQL code paths
+#
+# The in-memory fake above proves the *contract*; these tests drive the
+# concrete Lakebase implementation (row mappers, the lazy
+# ``_ensure_collab_tables`` short-circuit, and the rowcount-based
+# not-found handling) without a real Postgres, via the scripted cursor.
+# ---------------------------------------------------------------------
+
+
+from datetime import datetime  # noqa: E402
+
+
+def _collab_store(monkeypatch, cur):
+    """A Lakebase store whose ``_connect`` yields *cur* and whose collab
+    tables are already marked present (skips the lazy DDL probe).
+
+    Also stubs ``_require_psycopg`` so the tests pass without psycopg
+    installed: _ScriptedConn.cursor() already accepts and ignores the
+    ``row_factory`` kwarg, so (None, None) is a safe stub.
+    """
+    from contextlib import contextmanager
+    import back.objects.registry.store.lakebase.store as _store_mod
+
+    store = _make_lakebase_store(monkeypatch)
+    store._registry_id = "rid-1"          # skip registry-id resolution
+    store._collab_tables_ready = True     # skip the ensure/CREATE probe
+
+    @contextmanager
+    def fake_connect():
+        yield _ScriptedConn(cur)
+
+    monkeypatch.setattr(store, "_connect", fake_connect)
+    # Stub out the psycopg import guard — _ScriptedConn.cursor() ignores
+    # row_factory so None is a safe placeholder for dict_row.
+    monkeypatch.setattr(_store_mod, "_require_psycopg", lambda: (None, None))
+    return store
+
+
+class TestLakebaseCollab:
+    def test_ensure_collab_tables_short_circuits_when_present(self, monkeypatch):
+        from contextlib import contextmanager
+
+        store = _make_lakebase_store(monkeypatch)
+        store._registry_id = "rid-1"
+        cur = _ScriptedCursor(
+            [{"contains": "information_schema.tables", "fetchone": (1,)}]
+        )
+
+        @contextmanager
+        def fake_connect():
+            yield _ScriptedConn(cur)
+
+        monkeypatch.setattr(store, "_connect", fake_connect)
+
+        assert store._ensure_collab_tables() is True
+        assert store._collab_tables_ready is True
+        # Table already exists → must NOT issue any CREATE TABLE.
+        assert not any("CREATE TABLE" in s for s, _ in cur.executed)
+
+    def test_insert_comment_maps_returning_row(self, monkeypatch):
+        cur = _ScriptedCursor(
+            [
+                {
+                    "contains": "INSERT INTO",
+                    "fetchone": {
+                        "id": "c-1", "version": "2",
+                        "parent_id": None,
+                        "author": "a@a.com", "body": "rename",
+                        "resolved": False,
+                        "created_at": datetime(2026, 1, 1, 0, 0, 0),
+                    },
+                }
+            ]
+        )
+        store = _collab_store(monkeypatch, cur)
+        out = store.insert_comment(
+            "demo", "2", author="a@a.com", body="rename",
+        )
+        assert out["id"] == "c-1"
+        assert out["body"] == "rename"
+        assert out["folder"] == "demo"
+        assert out["resolved"] is False
+        assert out["created_at"].startswith("2026-01-01")
+
+    def test_insert_comment_returns_none_when_domain_missing(self, monkeypatch):
+        # No RETURNING row (unknown domain) → fetchone None → None.
+        cur = _ScriptedCursor([])
+        store = _collab_store(monkeypatch, cur)
+        assert store.insert_comment(
+            "ghost", "2", author="a@a.com", body="x",
+        ) is None
+
+    def test_list_comments_maps_rows_and_filters(self, monkeypatch):
+        cur = _ScriptedCursor(
+            [
+                {
+                    "contains": "FROM",
+                    "fetchall": [
+                        {
+                            "id": "c-1", "folder": "demo", "version": "2",
+                            "parent_id": None, "author": "a@a.com",
+                            "body": "hi", "resolved": False,
+                            "created_at": datetime(2026, 1, 1),
+                        }
+                    ],
+                }
+            ]
+        )
+        store = _collab_store(monkeypatch, cur)
+        rows = store.list_comments(
+            "demo", "2", include_resolved=False,
+        )
+        assert [c["body"] for c in rows] == ["hi"]
+        # The version + resolved filters must reach the SQL.
+        sql, params = cur.executed[-1]
+        assert "c.version = %s" in sql
+        assert "resolved = false" in sql
+        assert "2" in params
+
+    def test_resolve_comment_not_found_returns_false(self, monkeypatch):
+        cur = _ScriptedCursor([{"contains": "UPDATE", "rowcount": 0}])
+        store = _collab_store(monkeypatch, cur)
+        ok, msg = store.resolve_comment("demo", "c-9")
+        assert ok is False and msg == "Comment not found"
+
+    def test_resolve_comment_success(self, monkeypatch):
+        cur = _ScriptedCursor([{"contains": "UPDATE", "rowcount": 1}])
+        store = _collab_store(monkeypatch, cur)
+        ok, msg = store.resolve_comment("demo", "c-1", resolved=True)
+        assert ok is True and msg == ""
+        _, params = cur.executed[-1]
+        assert params[0] is True  # resolved flag forwarded
+
+    def test_insert_task_maps_returning_row(self, monkeypatch):
+        cur = _ScriptedCursor(
+            [
+                {
+                    "contains": "INSERT INTO",
+                    "fetchone": {
+                        "id": "t-1", "version": "2",
+                        "assignee": "bob@a.com", "created_by": "a@a.com",
+                        "title": "fix", "description": "", "status": "open",
+                        "due_date": None, "comment_id": "c-1",
+                        "created_at": datetime(2026, 1, 1),
+                        "updated_at": datetime(2026, 1, 1),
+                    },
+                }
+            ]
+        )
+        store = _collab_store(monkeypatch, cur)
+        out = store.insert_task(
+            "demo", "2", assignee="bob@a.com", created_by="a@a.com",
+            title="fix", comment_id="c-1",
+        )
+        assert out["id"] == "t-1"
+        assert out["assignee"] == "bob@a.com"
+        assert out["comment_id"] == "c-1"
+        assert out["status"] == "open"
+        assert out["due_date"] == ""
+
+    def test_list_tasks_for_assignee_maps_rows(self, monkeypatch):
+        cur = _ScriptedCursor(
+            [
+                {
+                    "contains": "lower(t.assignee) = lower(%s)",
+                    "fetchall": [
+                        {
+                            "id": "t-1", "folder": "demo", "version": "2",
+                            "assignee": "bob@a.com", "created_by": "a@a.com",
+                            "title": "fix", "description": "", "status": "open",
+                            "due_date": None, "comment_id": None,
+                            "created_at": datetime(2026, 1, 1),
+                            "updated_at": datetime(2026, 1, 1),
+                        }
+                    ],
+                }
+            ]
+        )
+        store = _collab_store(monkeypatch, cur)
+        rows = store.list_tasks_for_assignee("BOB@a.com")
+        assert [t["title"] for t in rows] == ["fix"]
+        assert rows[0]["folder"] == "demo"
+        _, params = cur.executed[-1]
+        assert params == ("rid-1", "BOB@a.com")
+
+    def test_update_task_status_not_found(self, monkeypatch):
+        cur = _ScriptedCursor([{"contains": "UPDATE", "rowcount": 0}])
+        store = _collab_store(monkeypatch, cur)
+        ok, msg = store.update_task_status("demo", "t-9", "done")
+        assert ok is False and msg == "Task not found"
+
+    def test_update_task_status_success(self, monkeypatch):
+        cur = _ScriptedCursor([{"contains": "UPDATE", "rowcount": 1}])
+        store = _collab_store(monkeypatch, cur)
+        ok, _ = store.update_task_status("demo", "t-1", "in_progress")
+        assert ok is True
+        sql, params = cur.executed[-1]
+        assert "SET status = %s" in sql
+        assert params[0] == "in_progress"
+
+
+# ---------------------------------------------------------------------
+# Lakebase graph-analytics run history — real SQL code path
+#
+# The in-memory fake above proves the *contract* (version=None spans
+# every version, version="x" scopes to it). These drive the concrete
+# Lakebase implementation to pin down the conditional ``r.version = %s``
+# predicate and, critically, the *order* of the bound params — a
+# reordered ``.append()`` would still "work" against the fake cursor
+# but would silently mis-bind params against a real Postgres query.
+# ---------------------------------------------------------------------
+
+
+def _graph_analytics_runs_store(monkeypatch, cur):
+    """A Lakebase store whose ``_connect`` yields *cur* and whose
+    graph-analytics-runs table is already marked present (skips the
+    lazy DDL probe). Mirrors ``_collab_store``.
+    """
+    from contextlib import contextmanager
+    import back.objects.registry.store.lakebase.store as _store_mod
+
+    store = _make_lakebase_store(monkeypatch)
+    store._registry_id = "rid-1"          # skip registry-id resolution
+    store._graph_analytics_runs_ready = True  # skip the ensure/CREATE probe
+
+    @contextmanager
+    def fake_connect():
+        yield _ScriptedConn(cur)
+
+    monkeypatch.setattr(store, "_connect", fake_connect)
+    monkeypatch.setattr(_store_mod, "_require_psycopg", lambda: (None, None))
+    return store
+
+
+class TestLakebaseGraphAnalyticsRunsSql:
+    def test_load_runs_without_version_omits_predicate(self, monkeypatch):
+        cur = _ScriptedCursor([{"contains": "FROM", "fetchall": []}])
+        store = _graph_analytics_runs_store(monkeypatch, cur)
+
+        store.load_graph_analytics_runs("demo", limit=50)
+
+        sql, params = cur.executed[-1]
+        assert "r.version = %s" not in sql
+        assert params == ("rid-1", "demo", 50)
+
+    def test_load_runs_with_version_appends_predicate_and_param_last(
+        self, monkeypatch
+    ):
+        cur = _ScriptedCursor([{"contains": "FROM", "fetchall": []}])
+        store = _graph_analytics_runs_store(monkeypatch, cur)
+
+        store.load_graph_analytics_runs("demo", "1", limit=50)
+
+        sql, params = cur.executed[-1]
+        assert "r.version = %s" in sql
+        assert params == ("rid-1", "demo", "1", 50)
+
+
+# ---------------------------------------------------------------------
+# Lakebase cross-domain, paginated run history — real SQL code path
+#
+# Same reasoning as the class above: the fake proves the contract, these
+# pin down the SQL. Two things can only break here — the ``d.folder``
+# predicate must vanish (not be bound to NULL) when no domain is
+# selected, and the page query and its COUNT must share one predicate,
+# or "Showing 1–25 of N" would quote an N from a different question.
+# ---------------------------------------------------------------------
+
+
+_BUILD_ROW = {
+    "id": 4,
+    "domain": "alpha",
+    "version": "2",
+    "build_kind": "session",
+    "status": "success",
+    "message": "",
+    "error": "",
+    "started_at": datetime(2026, 8, 4, 9, 0),
+    "finished_at": datetime(2026, 8, 4, 9, 1),
+    "duration_s": 60.0,
+    "triple_count": 10,
+    "entity_count": 2,
+    "relationship_count": 1,
+    "sql_chars": 100,
+    "graph_engine": "lakebase",
+    "sync_mode": "full",
+    "view_table": "",
+    "graph_name": "g",
+    "task_id": "t-1",
+    "phase_times": {},
+    "stats": {},
+}
+
+_ANALYTICS_ROW = {
+    "id": 9,
+    "domain": "beta",
+    "version": "1",
+    "status": "completed",
+    "class_filter": [],
+    "node_count": 5,
+    "edge_count": 4,
+    "connected_components": 1,
+    "avg_degree": 1.6,
+    "density": 0.2,
+    "duration_ms": 1200,
+    "task_id": "t-2",
+    "error": "",
+    "computed_at": datetime(2026, 8, 4, 9, 30),
+}
+
+
+def _paged(cur):
+    """The page query and the COUNT query out of a scripted cursor."""
+    page = next(s for s in cur.executed if "ORDER BY" in s[0])
+    count = next(s for s in cur.executed if "COUNT(*)" in s[0])
+    return page, count
+
+
+def _build_runs_store(monkeypatch, cur):
+    """Like ``_graph_analytics_runs_store`` but for ``build_runs``."""
+    from contextlib import contextmanager
+    import back.objects.registry.store.lakebase.store as _store_mod
+
+    store = _make_lakebase_store(monkeypatch)
+    store._registry_id = "rid-1"
+    store._build_runs_ready = True
+
+    @contextmanager
+    def fake_connect():
+        yield _ScriptedConn(cur)
+
+    monkeypatch.setattr(store, "_connect", fake_connect)
+    monkeypatch.setattr(_store_mod, "_require_psycopg", lambda: (None, None))
+    return store
+
+
+class TestLakebaseAllBuildRunsSql:
+    def _cursor(self, total=1, rows=None):
+        return _ScriptedCursor(
+            [
+                {"contains": "COUNT(*)", "fetchone": {"total": total}},
+                {"contains": "ORDER BY", "fetchall": rows or [dict(_BUILD_ROW)]},
+            ]
+        )
+
+    def test_without_folder_omits_the_folder_predicate(self, monkeypatch):
+        cur = self._cursor()
+        store = _build_runs_store(monkeypatch, cur)
+
+        store.load_all_build_runs(limit=25, offset=0)
+
+        (page_sql, page_params), _ = _paged(cur)
+        assert "d.folder = %s" not in page_sql
+        assert page_params == ("rid-1", 25, 0)
+
+    def test_with_folder_binds_it_before_limit_and_offset(self, monkeypatch):
+        cur = self._cursor()
+        store = _build_runs_store(monkeypatch, cur)
+
+        store.load_all_build_runs(folder="alpha", limit=10, offset=20)
+
+        (page_sql, page_params), _ = _paged(cur)
+        assert "d.folder = %s" in page_sql
+        assert page_params == ("rid-1", "alpha", 10, 20)
+
+    def test_count_shares_the_predicate_but_not_the_paging(self, monkeypatch):
+        cur = self._cursor()
+        store = _build_runs_store(monkeypatch, cur)
+
+        store.load_all_build_runs(folder="alpha", limit=10, offset=20)
+
+        _, (count_sql, count_params) = _paged(cur)
+        assert "d.folder = %s" in count_sql
+        assert "LIMIT" not in count_sql
+        assert count_params == ("rid-1", "alpha")
+
+    def test_total_comes_from_the_count_not_the_page_length(self, monkeypatch):
+        cur = self._cursor(total=137)
+        store = _build_runs_store(monkeypatch, cur)
+
+        rows, total = store.load_all_build_runs(limit=25)
+
+        assert len(rows) == 1
+        assert total == 137
+
+    def test_rows_carry_the_domain_folder(self, monkeypatch):
+        cur = self._cursor()
+        store = _build_runs_store(monkeypatch, cur)
+
+        rows, _ = store.load_all_build_runs()
+
+        assert rows[0]["domain"] == "alpha"
+        assert rows[0]["triple_count"] == 10
+
+    def test_missing_table_degrades_to_an_empty_page(self, monkeypatch):
+        cur = self._cursor()
+        store = _build_runs_store(monkeypatch, cur)
+        monkeypatch.setattr(store, "_ensure_build_runs_table", lambda: False)
+
+        assert store.load_all_build_runs() == ([], 0)
+
+
+class TestLakebaseAllAnalyticsRunsSql:
+    def _cursor(self, total=1, rows=None):
+        return _ScriptedCursor(
+            [
+                {"contains": "COUNT(*)", "fetchone": {"total": total}},
+                {"contains": "ORDER BY", "fetchall": rows or [dict(_ANALYTICS_ROW)]},
+            ]
+        )
+
+    def test_without_folder_omits_the_folder_predicate(self, monkeypatch):
+        cur = self._cursor()
+        store = _graph_analytics_runs_store(monkeypatch, cur)
+
+        store.load_all_graph_analytics_runs(limit=25, offset=0)
+
+        (page_sql, page_params), _ = _paged(cur)
+        assert "d.folder = %s" not in page_sql
+        assert page_params == ("rid-1", 25, 0)
+
+    def test_with_folder_binds_it_before_limit_and_offset(self, monkeypatch):
+        cur = self._cursor()
+        store = _graph_analytics_runs_store(monkeypatch, cur)
+
+        store.load_all_graph_analytics_runs(folder="beta", limit=50, offset=50)
+
+        (page_sql, page_params), _ = _paged(cur)
+        assert "d.folder = %s" in page_sql
+        assert page_params == ("rid-1", "beta", 50, 50)
+
+    def test_spans_every_version(self, monkeypatch):
+        """No version filter exists on the Runs page, so the SQL must not
+        grow one."""
+        cur = self._cursor()
+        store = _graph_analytics_runs_store(monkeypatch, cur)
+
+        store.load_all_graph_analytics_runs(folder="beta")
+
+        (page_sql, _), _ = _paged(cur)
+        assert "r.version = %s" not in page_sql
+
+    def test_total_comes_from_the_count_not_the_page_length(self, monkeypatch):
+        cur = self._cursor(total=42)
+        store = _graph_analytics_runs_store(monkeypatch, cur)
+
+        rows, total = store.load_all_graph_analytics_runs()
+
+        assert len(rows) == 1
+        assert total == 42
+
+    def test_rows_carry_the_domain_folder(self, monkeypatch):
+        cur = self._cursor()
+        store = _graph_analytics_runs_store(monkeypatch, cur)
+
+        rows, _ = store.load_all_graph_analytics_runs()
+
+        assert rows[0]["domain"] == "beta"
+        assert rows[0]["node_count"] == 5
+
+    def test_missing_table_degrades_to_an_empty_page(self, monkeypatch):
+        cur = self._cursor()
+        store = _graph_analytics_runs_store(monkeypatch, cur)
+        monkeypatch.setattr(
+            store, "_ensure_graph_analytics_runs_table", lambda: False
+        )
+
+        assert store.load_all_graph_analytics_runs() == ([], 0)

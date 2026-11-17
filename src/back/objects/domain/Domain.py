@@ -12,7 +12,7 @@ import os
 import re
 import threading
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from shared.config.settings import Settings
 from back.core.errors import (
@@ -27,10 +27,10 @@ from shared.config.constants import (
     DEFAULT_LOG_LEVEL,
     DEFAULT_GRAPH_NAME,
 )
+from shared.llm_target import normalize_llm_endpoint_kind
 from back.core.databricks import (
     DatabricksClient,
     MetadataService,
-    VolumeFileService,
     build_metadata_dict,
     extract_catalog_schema_from_full_name,
     get_catalog_schema_from_metadata,
@@ -38,14 +38,33 @@ from back.core.databricks import (
     validate_metadata,
 )
 from back.core.helpers import (
+    build_auto_base_uri,
     get_databricks_host_and_token,
+    resolve_app_registry_context,
+    resolve_default_base_uri,
     resolve_warehouse_id,
     run_blocking,
 )
 from back.core.logging import get_logger
+from back.core.mcp_tools import (
+    MCP_CONTEXT_FEATURES,
+    MCP_DOMAIN_TOOLS,
+    MCP_REGISTRY_TOOLS,
+    coerce_mcp_policy,
+    force_graphless_policy,
+)
 from back.objects.registry import RegistryService
 from back.objects.registry.registry_cache import invalidate_registry_cache
-from back.objects.session import sanitize_domain_folder
+from back.objects.registry.version_lifecycle import (
+    is_editable,
+    transition_capabilities,
+    version_deletion_capability,
+)
+from back.objects.session import (
+    global_config_service,
+    is_valid_domain_name,
+    sanitize_domain_folder,
+)
 from back.core.task_manager import get_task_manager
 from back.objects.domain._metadata_tasks import (
     run_metadata_load_task,
@@ -63,6 +82,76 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _column_name(col: Dict[str, Any]) -> str:
+    """Read a column's name, tolerating the ``col_name``/``name`` split.
+
+    Unity Catalog fetches produce ``name``; some stored metadata (and
+    ``DESCRIBE`` output) uses ``col_name``.
+    """
+    return col.get("col_name") or col.get("name", "")
+
+
+def _column_type(col: Dict[str, Any]) -> str:
+    """Read a column's data type, tolerating the ``data_type``/``type`` split."""
+    return col.get("data_type") or col.get("type", "")
+
+
+def compute_column_diff(
+    old_columns: Optional[List[Dict[str, Any]]],
+    new_columns: Optional[List[Dict[str, Any]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Compare two column lists and classify every column by what changed.
+
+    Returns ``{"added": [...], "removed": [...], "type_changed": [...],
+    "unchanged": [...]}``.  Each entry carries at least a ``name``; the
+    ``type_changed`` entries also carry ``old_type`` and ``new_type``.
+
+    A rename is reported as a removal plus an addition — the underlying
+    ``DESCRIBE`` output gives us no identity to correlate the two, and
+    guessing would produce confident-but-wrong previews.
+
+    Pure function: no I/O, no session access.  Shared by the metadata
+    refresh preview and the mapping schema-drift diagnostics.
+    """
+    old_by_name = {
+        name: col for col in (old_columns or []) if (name := _column_name(col))
+    }
+    new_by_name = {
+        name: col for col in (new_columns or []) if (name := _column_name(col))
+    }
+
+    diff: Dict[str, List[Dict[str, Any]]] = {
+        "added": [],
+        "removed": [],
+        "type_changed": [],
+        "unchanged": [],
+    }
+
+    for name, col in new_by_name.items():
+        if name not in old_by_name:
+            diff["added"].append({"name": name, "type": _column_type(col)})
+            continue
+        old_type = _column_type(old_by_name[name])
+        new_type = _column_type(col)
+        if old_type != new_type:
+            diff["type_changed"].append(
+                {"name": name, "old_type": old_type, "new_type": new_type}
+            )
+        else:
+            diff["unchanged"].append({"name": name, "type": new_type})
+
+    for name, col in old_by_name.items():
+        if name not in new_by_name:
+            diff["removed"].append({"name": name, "type": _column_type(col)})
+
+    return diff
+
+
+def has_column_changes(diff: Dict[str, List[Dict[str, Any]]]) -> bool:
+    """True when *diff* contains anything worth showing the user."""
+    return any(diff.get(key) for key in ("added", "removed", "type_changed"))
+
+
 def merge_table_metadata(
     old_table: dict,
     new_columns: list,
@@ -70,25 +159,35 @@ def merge_table_metadata(
     catalog: str,
     schema: str,
     table_name: str,
+    select_probe: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Merge freshly-fetched UC metadata into an existing table dict in-place.
 
     Preserves user-edited column comments that the UC schema has lost.
     Shared by :meth:`Domain.update_metadata_tables` and the async
     task variant in ``_metadata_tasks``.
+
+    When *select_probe* is provided (the dict returned by
+    :meth:`UnityCatalog.check_table_select_permission`), the table's
+    ``can_select`` / ``select_error`` fields are refreshed so the Data Assets
+    "Rights" column stops reporting *unknown* for tables loaded before the probe
+    existed.
     """
     old_table["full_name"] = f"{catalog}.{schema}.{table_name}"
     if table_comment:
         old_table["comment"] = table_comment
         old_table["description"] = table_comment
+    if select_probe is not None:
+        old_table["can_select"] = select_probe.get("can_select")
+        old_table["select_error"] = select_probe.get("error")
     if new_columns:
         old_column_comments: Dict[str, str] = {}
         for col in old_table.get("columns", []):
-            col_name = col.get("col_name") or col.get("name", "")
+            col_name = _column_name(col)
             if col.get("comment"):
                 old_column_comments[col_name] = col["comment"]
         for col in new_columns:
-            col_name = col.get("col_name") or col.get("name", "")
+            col_name = _column_name(col)
             if col_name in old_column_comments and not col.get("comment"):
                 col["comment"] = old_column_comments[col_name]
         old_table["columns"] = new_columns
@@ -145,6 +244,7 @@ class Domain:
         view_table = ".".join(p for p in parts if p)
         graph_name = f"{self._s.info.get('name', DEFAULT_GRAPH_NAME)}_V{_version}"
 
+        llm_endpoint = self._s.info.get("llm_endpoint", "")
         domain_info = {
             "name": self._s.info.get("name", "NewDomain"),
             "description": self._s.info.get("description", ""),
@@ -152,8 +252,35 @@ class Domain:
             "version": self._s.current_version,
             "base_uri": self._s.ontology.get("base_uri", ""),
             "base_uri_auto": self._s.ontology.get("base_uri_auto", None),
-            "llm_endpoint": self._s.info.get("llm_endpoint", ""),
+            "llm_endpoint": llm_endpoint,
+            "llm_endpoint_kind": (
+                normalize_llm_endpoint_kind(
+                    llm_endpoint,
+                    self._s.info.get("llm_endpoint_kind", ""),
+                )
+                if llm_endpoint
+                else ""
+            ),
             "mcp_enabled": self._s.info.get("mcp_enabled", False),
+            "status": self._s.info.get("status", "DRAFT"),
+            "review_quorum": self._s.info.get("review_quorum", 1),
+            "mcp_policy": coerce_mcp_policy(self._s.info.get("mcp_policy")),
+            "graph_backend": self._coerce_graph_backend(
+                self._s.info.get("graph_backend")
+            ),
+            "neo4j_connection": str(self._s.info.get("neo4j_connection", "") or "").strip(),
+            "lakehouse_materialization": self._coerce_lakehouse_materialization(
+                self._s.info.get("lakehouse_materialization")
+            ),
+            "graph_cache_enabled": self._coerce_graph_cache_enabled(
+                self._s.info.get("graph_cache_enabled")
+            ),
+            "graph_cache_state": self._coerce_graph_cache_state(
+                self._s.info.get("graph_cache_state"),
+                enabled=self._coerce_graph_cache_enabled(
+                    self._s.info.get("graph_cache_enabled")
+                ),
+            ),
             "view_table": view_table,
             "graph_name": graph_name,
         }
@@ -175,6 +302,7 @@ class Domain:
                 "table_name": delta.get("table_name", ""),
             },
             "stats": self.get_domain_stats(),
+            "precision_score": self._s.precision_score,
         }
 
     def get_domain_stats(self) -> Dict[str, int]:
@@ -248,7 +376,36 @@ class Domain:
         Returns:
             dict: Updated project info
         """
-        domain_name = data.get("name", self._s.info.get("name", "NewDomain"))
+        previous_domain_name = (self._s.info.get("name") or "").strip()
+        if "name" in data:
+            domain_name = (data.get("name") or "").strip()
+            # New domains (not yet registered) must use CamelCase alphanumeric
+            # names — no spaces or special characters.
+            if not (self._s.domain_folder or "") and not is_valid_domain_name(
+                domain_name
+            ):
+                raise ValidationError(
+                    "Domain name must be CamelCase alphanumeric only "
+                    "(letters and digits, no spaces or special characters), "
+                    "e.g. MyOntologyDomain",
+                )
+        else:
+            domain_name = self._s.info.get("name", "NewDomain")
+
+        llm_endpoint = data.get(
+            "llm_endpoint", self._s.info.get("llm_endpoint", "")
+        )
+        llm_endpoint_kind = (
+            normalize_llm_endpoint_kind(
+                llm_endpoint,
+                data.get(
+                    "llm_endpoint_kind",
+                    self._s.info.get("llm_endpoint_kind", ""),
+                ),
+            )
+            if llm_endpoint
+            else ""
+        )
 
         self._s.info.update(
             {
@@ -257,24 +414,78 @@ class Domain:
                     "description", self._s.info.get("description", "")
                 ),
                 "author": data.get("author", self._s.info.get("author", "")),
-                "llm_endpoint": data.get(
-                    "llm_endpoint", self._s.info.get("llm_endpoint", "")
-                ),
+                "llm_endpoint": llm_endpoint,
+                "llm_endpoint_kind": llm_endpoint_kind,
                 "mcp_enabled": data.get(
                     "mcp_enabled", self._s.info.get("mcp_enabled", False)
                 ),
+                "review_quorum": self._coerce_quorum(
+                    data.get(
+                        "review_quorum",
+                        self._s.info.get("review_quorum", 1),
+                    )
+                ),
+                "mcp_policy": coerce_mcp_policy(
+                    data.get(
+                        "mcp_policy",
+                        self._s.info.get("mcp_policy", {}),
+                    )
+                ),
+                "graph_backend": self._coerce_graph_backend(
+                    data.get(
+                        "graph_backend",
+                        self._s.info.get("graph_backend"),
+                    )
+                ),
+                "neo4j_connection": str(
+                    data.get(
+                        "neo4j_connection",
+                        self._s.info.get("neo4j_connection", ""),
+                    )
+                    or ""
+                ).strip(),
+                "lakehouse_materialization": self._coerce_lakehouse_materialization(
+                    data.get(
+                        "lakehouse_materialization",
+                        self._s.info.get("lakehouse_materialization"),
+                    )
+                ),
             }
         )
+        self._apply_graph_cache_save(data)
+        self._s.info.pop("neo4j_database", None)
 
-        self._s.ontology["name"] = domain_name.lower()
+        # Ontology-only ("No Backend") domains never expose graph tools: force
+        # every graph tool disabled regardless of what the client submitted.
+        from back.core.graphdb.GraphDBFactory import is_graphless_backend
 
-        # Update ontology base_uri if provided
-        base_uri = data.get("base_uri") or data.get("uri")
-        if base_uri:
-            self._s.ontology["base_uri"] = base_uri
+        if is_graphless_backend(self._s.info.get("graph_backend")):
+            self._s.info["mcp_policy"] = force_graphless_policy(
+                self._s.info.get("mcp_policy")
+            )
 
-        if "base_uri_auto" in data:
-            self._s.ontology["base_uri_auto"] = bool(data["base_uri_auto"])
+        if self._s.info.get("graph_backend") == "neo4j" and not str(
+            self._s.info.get("neo4j_connection") or ""
+        ).strip():
+            raise ValidationError(
+                "Select a Neo4j connection (Settings → Neo4j) when Graph Backend is Neo4j."
+            )
+
+        ontology_name = (self._s.ontology.get("name") or "").strip()
+        if not ontology_name or ontology_name.lower() == previous_domain_name.lower():
+            self._s.ontology["name"] = domain_name.lower()
+
+        # Resolve the ontology base URI. In auto mode (the default for a new
+        # domain) it is generated server-side from the configured default base
+        # URI domain + the domain name, so the URI is always created correctly
+        # even if the browser never computed it. A custom URI is preserved; an
+        # empty custom URI falls back to the generated one (never stored empty).
+        provided = (data.get("base_uri") or data.get("uri") or "").strip()
+        auto = bool(data.get("base_uri_auto", not provided))
+        self._s.ontology["base_uri"] = self._resolve_base_uri(
+            domain_name, provided, auto=auto
+        )
+        self._s.ontology["base_uri_auto"] = auto
 
         # Update version separately
         if data.get("version"):
@@ -290,8 +501,149 @@ class Domain:
             "base_uri": self._s.ontology.get("base_uri", ""),
             "base_uri_auto": self._s.ontology.get("base_uri_auto", None),
             "llm_endpoint": self._s.info.get("llm_endpoint", ""),
+            "llm_endpoint_kind": self._s.info.get("llm_endpoint_kind", ""),
             "mcp_enabled": self._s.info.get("mcp_enabled", False),
+            "review_quorum": self._s.info.get("review_quorum", 1),
+            "mcp_policy": coerce_mcp_policy(self._s.info.get("mcp_policy")),
+            "graph_backend": self._coerce_graph_backend(
+                self._s.info.get("graph_backend")
+            ),
+            "neo4j_connection": str(self._s.info.get("neo4j_connection", "") or "").strip(),
+            "lakehouse_materialization": self._coerce_lakehouse_materialization(
+                self._s.info.get("lakehouse_materialization")
+            ),
+            "graph_cache_enabled": self._coerce_graph_cache_enabled(
+                self._s.info.get("graph_cache_enabled")
+            ),
+            "graph_cache_state": self._coerce_graph_cache_state(
+                self._s.info.get("graph_cache_state"),
+                enabled=self._coerce_graph_cache_enabled(
+                    self._s.info.get("graph_cache_enabled")
+                ),
+            ),
         }
+
+    @staticmethod
+    def _coerce_quorum(raw: Any) -> int:
+        """Normalise a quorum value to an integer >= 1."""
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
+    def _coerce_graph_backend(raw: Any) -> str:
+        """Normalise the per-domain graph backend (default ``lakebase``)."""
+        from back.core.graphdb.GraphDBFactory import normalize_graph_backend
+
+        return normalize_graph_backend(raw if isinstance(raw, str) else None)
+
+    @staticmethod
+    def _coerce_lakehouse_materialization(raw: Any) -> str:
+        """Normalise the Lakehouse materialization mode (default ``table``)."""
+        from back.core.graphdb.GraphDBFactory import (
+            normalize_lakehouse_materialization,
+        )
+
+        return normalize_lakehouse_materialization(
+            raw if isinstance(raw, str) else None
+        )
+
+    @staticmethod
+    def _coerce_graph_cache_enabled(raw: Any) -> bool:
+        from back.core.graphdb.search_cache import normalize_graph_cache_enabled
+
+        return normalize_graph_cache_enabled(raw)
+
+    @staticmethod
+    def _coerce_graph_cache_state(raw: Any, *, enabled: bool) -> str:
+        from back.core.graphdb.search_cache import (
+            GRAPH_CACHE_STATE_READY,
+            normalize_graph_cache_state,
+        )
+
+        return normalize_graph_cache_state(
+            raw, enabled=enabled, default_when_missing=GRAPH_CACHE_STATE_READY
+        )
+
+    def _apply_graph_cache_save(self, data: Dict[str, Any]) -> None:
+        from back.core.graphdb.search_cache import (
+            GRAPH_CACHE_STATE_READY,
+            normalize_graph_cache_enabled,
+            normalize_graph_cache_state,
+            state_after_enabled_change,
+        )
+
+        previous = normalize_graph_cache_enabled(
+            self._s.info.get("graph_cache_enabled")
+        )
+        if "graph_cache_enabled" in data:
+            enabled = normalize_graph_cache_enabled(data.get("graph_cache_enabled"))
+        else:
+            enabled = previous
+        if "graph_cache_enabled" in data and enabled != previous:
+            state = state_after_enabled_change(
+                previous_enabled=previous, enabled=enabled
+            )
+        else:
+            state = normalize_graph_cache_state(
+                self._s.info.get("graph_cache_state"),
+                enabled=enabled,
+                default_when_missing=GRAPH_CACHE_STATE_READY,
+            )
+        self._s.info["graph_cache_enabled"] = enabled
+        self._s.info["graph_cache_state"] = state
+
+    @staticmethod
+    def _sanitize_base_uri(uri: str) -> str:
+        """Percent-encode illegal IRI characters (e.g. spaces) in a base URI.
+
+        Preserves a trailing ``#`` or ``/`` separator used by ontology namespaces.
+        """
+        if not uri:
+            return uri
+        raw = str(uri).strip()
+        ends_hash = raw.endswith("#")
+        ends_slash = (not ends_hash) and raw.endswith("/")
+        parts = urlsplit(raw)
+        safe = "/:@-._~!$&'()*+,;=%"
+        out = urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                quote(parts.path, safe=safe),
+                parts.query,
+                quote(parts.fragment, safe=safe),
+            )
+        )
+        if ends_hash and not out.endswith("#"):
+            return out + "#"
+        if ends_slash and not out.endswith("/"):
+            return out + "/"
+        return out
+
+    def _resolve_base_uri(
+        self, domain_name: str, provided: str = "", *, auto: bool = True
+    ) -> str:
+        """Return the effective ontology base URI for ``domain_name``.
+
+        Mirrors the frontend ``updateAutoBaseUri`` (``{default}/{Name}#``):
+        a custom (non-auto) value is kept (after IRI sanitization), while auto
+        mode — or an empty custom value — is generated from the globally
+        configured default base URI domain and a sanitized domain name.
+        Guarantees a non-empty, well-formed URI so a new domain never persists
+        an empty or sentinel base_uri.
+        """
+        if not auto and provided:
+            return self._sanitize_base_uri(provided)
+        try:
+            default_domain = resolve_default_base_uri(self._s, self._settings)
+        except Exception as exc:  # noqa: BLE001 — never fail a save on URI gen
+            logger.debug("default base URI resolve failed: %s", exc)
+            default_domain = ""
+        return self._sanitize_base_uri(
+            build_auto_base_uri(domain_name, default_domain)
+        )
 
     def get_domain_template_data(self) -> Dict[str, Any]:
         """Get project data for template rendering.
@@ -313,7 +665,31 @@ class Domain:
             "version": self._s.current_version,
             "author": self._s.info.get("author", ""),
             "llm_endpoint": self._s.info.get("llm_endpoint", ""),
+            "llm_endpoint_kind": self._s.info.get("llm_endpoint_kind", ""),
             "mcp_enabled": self._s.info.get("mcp_enabled", False),
+            "review_quorum": self._s.info.get("review_quorum", 1),
+            "mcp_policy": coerce_mcp_policy(self._s.info.get("mcp_policy")),
+            "graph_backend": self._coerce_graph_backend(
+                self._s.info.get("graph_backend")
+            ),
+            "neo4j_connection": str(self._s.info.get("neo4j_connection", "") or "").strip(),
+            "lakehouse_materialization": self._coerce_lakehouse_materialization(
+                self._s.info.get("lakehouse_materialization")
+            ),
+            "graph_cache_enabled": self._coerce_graph_cache_enabled(
+                self._s.info.get("graph_cache_enabled")
+            ),
+            "graph_cache_state": self._coerce_graph_cache_state(
+                self._s.info.get("graph_cache_state"),
+                enabled=self._coerce_graph_cache_enabled(
+                    self._s.info.get("graph_cache_enabled")
+                ),
+            ),
+            # Catalog for the MCP tab, so the template never restates the
+            # tool / context lists that live in back.core.mcp_tools.
+            "mcp_domain_tools": list(MCP_DOMAIN_TOOLS),
+            "mcp_registry_tools": sorted(MCP_REGISTRY_TOOLS),
+            "mcp_context_features": list(MCP_CONTEXT_FEATURES),
             "delta": delta,
             "has_ontology": len(self._s.get_classes()) > 0,
             "has_mapping": len(self._s.get_entity_mappings()) > 0,
@@ -394,6 +770,74 @@ class Domain:
         """Build a RegistryService from the current domain session."""
         return RegistryService.from_context(self._s, self._require_settings())
 
+    def list_build_runs_result(
+        self,
+        svc: RegistryService,
+        *,
+        version: Optional[str] = None,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        """List recorded build runs for the loaded domain (newest-first)."""
+        try:
+            if not svc.cfg.is_configured:
+                raise ValidationError("Registry not configured")
+            folder = self._s.uc_domain_folder
+            if not folder:
+                raise ValidationError("Domain not saved to registry")
+            runs = svc.load_build_runs(folder, version=version, limit=limit)
+            return {
+                "success": True,
+                "domain_folder": folder,
+                "version": version,
+                "runs": runs,
+            }
+        except OntoBricksError:
+            raise
+        except Exception as e:
+            logger.exception("List build runs failed: %s", e)
+            raise InfrastructureError(
+                "Failed to load build runs", detail=str(e)
+            ) from e
+
+    def audit_trail_result(
+        self,
+        svc: RegistryService,
+        *,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """Unified activity feed for the loaded domain (all versions).
+
+        Merges three registry streams so the frontend can interleave them
+        into one timeline: review/validation decisions (status switches
+        with their comments), the build-run history (runs + results), and
+        the ontology/mapping change audit (who changed what, and when).
+        All streams (plus the available ``versions`` list) are returned
+        raw; the UI sorts and filters by version client-side, defaulting
+        the version dropdown to ``current_version``.
+        """
+        try:
+            if not svc.cfg.is_configured:
+                raise ValidationError("Registry not configured")
+            folder = self._s.uc_domain_folder
+            if not folder:
+                raise ValidationError("Domain not saved to registry")
+            return {
+                "success": True,
+                "domain_folder": folder,
+                "current_version": self._s.current_version,
+                "versions": svc.list_versions_sorted(folder),
+                "events": svc.list_review_events(folder),
+                "runs": svc.load_build_runs(folder, limit=limit),
+                "changes": svc.list_change_events(folder, limit=limit),
+            }
+        except OntoBricksError:
+            raise
+        except Exception as e:
+            logger.exception("Audit trail failed: %s", e)
+            raise InfrastructureError(
+                "Failed to load audit trail", detail=str(e)
+            ) from e
+
     async def _bridge_domain_for_entity_uri(self, entity_uri: str) -> Optional[str]:
         """Resolve which registry domain folder owns *entity_uri* (async)."""
         svc = self.build_registry_service()
@@ -440,12 +884,21 @@ class Domain:
         self,
         entity_uri: str,
         bridge_domain: Optional[str] = None,
+        domain_switched: bool = False,
     ) -> str:
-        """Build ``/dtwin/?section=sigmagraph&focus=...`` URL for entity URI resolution."""
+        """Build ``/dtwin/?section=sigmagraph&focus=...`` URL for entity URI resolution.
+
+        ``domain_switched=True`` adds ``&domain_switched=1`` so the navbar can
+        bust its sessionStorage ``/navbar/state`` cache after a server-side
+        domain load (cross-domain bridges). ``bridge_domain`` is the client
+        fallback when the server could not switch the session.
+        """
         encoded = quote(entity_uri, safe="")
         target = f"/dtwin/?section=sigmagraph&focus={encoded}"
         if bridge_domain:
             target += f"&domain={quote(bridge_domain, safe='')}"
+        if domain_switched:
+            target += "&domain_switched=1"
         logger.info("Resolving entity URI %s -> %s", entity_uri, target)
         return target
 
@@ -457,7 +910,8 @@ class Domain:
         """Resolve owning domain, switch session when needed, return redirect URL path/query.
 
         Used by the ``/resolve`` HTML routes: cross-domain bridges load the target
-        domain server-side; the redirect omits ``&domain=`` when the switch succeeds.
+        domain server-side; the redirect omits ``&domain=`` when the switch succeeds
+        and sets ``domain_switched=1`` so the client invalidates the navbar cache.
         """
         target_domain = domain_hint
         if not target_domain:
@@ -466,7 +920,9 @@ class Domain:
         if target_domain:
             switched = await self._switch_domain_if_needed_for_resolve(target_domain)
             if switched:
-                return self._build_resolve_entity_redirect_url(entity_uri)
+                return self._build_resolve_entity_redirect_url(
+                    entity_uri, domain_switched=True
+                )
 
         return self._build_resolve_entity_redirect_url(
             entity_uri,
@@ -502,7 +958,32 @@ class Domain:
             ok, versions, msg = svc.list_versions(domain_name)
             if not ok:
                 raise InfrastructureError("Failed to list domain versions", detail=msg)
-            return {"success": True, "versions": versions}
+            # Best-effort per-version lifecycle status, so callers (e.g. the
+            # Load-Domain modal) can label versions DRAFT / IN-REVIEW /
+            # PUBLISHED. Sourced from the cached domain metadata; never fatal.
+            version_status: Dict[str, str] = {}
+            try:
+                ok2, details, _ = svc.list_domain_details_cached()
+                if ok2:
+                    for d in details:
+                        if d.get("name") != domain_name:
+                            continue
+                        for v in d.get("versions", []) or []:
+                            if isinstance(v, dict) and v.get("version"):
+                                version_status[str(v["version"])] = (
+                                    v.get("status") or "DRAFT"
+                                )
+                        break
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "version status lookup failed for %s", domain_name,
+                    exc_info=True,
+                )
+            return {
+                "success": True,
+                "versions": versions,
+                "version_status": version_status,
+            }
         except OntoBricksError:
             raise
         except Exception as e:
@@ -511,8 +992,14 @@ class Domain:
                 "Failed to list domain versions", detail=str(e)
             ) from e
 
-    def list_version_details(self, svc: RegistryService) -> Dict[str, Any]:
-        """List all versions with their description and mcp_enabled flag.
+    def list_version_details(
+        self,
+        svc: RegistryService,
+        *,
+        user_role: str = "",
+        user_domain_role: str = "",
+    ) -> Dict[str, Any]:
+        """List all versions with card metadata and allowed actions.
 
         Reads each version JSON from the registry to extract per-version metadata.
         """
@@ -537,31 +1024,67 @@ class Domain:
 
             for ver in sorted_versions:
                 ok, data, _msg = svc.read_version(folder, ver)
+                is_active = ver == latest
+                is_current = ver == self._s.current_version
                 if not ok:
-                    details.append(
-                        {
-                            "version": ver,
-                            "description": "",
-                            "mcp_enabled": False,
-                            "is_active": ver == latest,
-                            "is_current": ver == self._s.current_version,
-                            "error": _msg,
-                        }
+                    detail = {
+                        "version": ver,
+                        "description": "",
+                        "mcp_enabled": False,
+                        "status": "DRAFT",
+                        "author": "",
+                        "last_update": "",
+                        "last_build": "",
+                        "is_active": is_active,
+                        "is_current": is_current,
+                        "transitions": [],
+                        "error": _msg,
+                    }
+                    detail.update(
+                        version_deletion_capability(
+                            user_role=user_role,
+                            status="DRAFT",
+                            is_loaded=is_current,
+                            is_latest=is_active,
+                            version_count=len(sorted_versions),
+                        )
                     )
+                    detail["can_delete"] = False
+                    detail["delete_block_reason"] = (
+                        "Version metadata could not be read."
+                    )
+                    details.append(detail)
                     continue
 
                 info = data.get("info", {})
-                details.append(
-                    {
-                        "version": ver,
-                        "description": info.get("description", ""),
-                        "mcp_enabled": info.get("mcp_enabled", False),
-                        "author": info.get("author", ""),
-                        "last_update": info.get("last_update", ""),
-                        "is_active": ver == latest,
-                        "is_current": ver == self._s.current_version,
-                    }
+                status = (info.get("status") or "DRAFT").upper()
+                detail = {
+                    "version": ver,
+                    "description": info.get("description", ""),
+                    "mcp_enabled": info.get("mcp_enabled", False),
+                    "status": status,
+                    "author": info.get("author", ""),
+                    "last_update": info.get("last_update", ""),
+                    "last_build": info.get("last_build", ""),
+                    "is_active": is_active,
+                    "is_current": is_current,
+                    "transitions": transition_capabilities(
+                        status,
+                        user_role=user_role,
+                        user_domain_role=user_domain_role,
+                        last_build=info.get("last_build", "") or "",
+                        has_ontology=svc.version_document_has_ontology(data, ver),
+                    ),
+                }
+                deletion = version_deletion_capability(
+                    user_role=user_role,
+                    status=status,
+                    is_loaded=is_current,
+                    is_latest=is_active,
+                    version_count=len(sorted_versions),
                 )
+                detail.update(deletion)
+                details.append(detail)
 
             return {
                 "success": True,
@@ -577,73 +1100,79 @@ class Domain:
                 "List version details failed", detail=str(e)
             ) from e
 
-    def set_version_mcp(
-        self, svc: RegistryService, version: str, enabled: bool
+    def save_domain_to_uc(
+        self, svc: RegistryService, *, actor_email: str = ""
     ) -> Dict[str, Any]:
-        """Toggle the ``mcp_enabled`` flag for a single version.
+        """Save domain into the registry Volume under /domains/<name>/V{ver}/V{ver}.json.
 
-        Only one version may have ``mcp_enabled=True`` at a time.  When
-        *enabled* is ``True`` any other version that currently has the flag
-        is updated to ``False`` first.
+        ``actor_email`` (when provided) enables a defence-in-depth
+        single-editor lock re-check: an overwrite by anyone other than the
+        live lock holder is refused, mirroring the authoritative
+        :class:`PermissionMiddleware` edit gate.
         """
-        try:
-            folder = self._s.uc_domain_folder
-            if not folder:
-                raise ValidationError("Domain not saved to registry")
-
-            sorted_versions = svc.list_versions_sorted(folder)
-            if version not in sorted_versions:
-                raise NotFoundError(f"Version {version} not found")
-
-            if enabled:
-                for ver in sorted_versions:
-                    if ver == version:
-                        continue
-                    ok, data, _ = svc.read_version(folder, ver)
-                    if not ok:
-                        continue
-                    info = data.get("info", {})
-                    if info.get("mcp_enabled"):
-                        info["mcp_enabled"] = False
-                        data["info"] = info
-                        svc.write_version(folder, ver, json.dumps(data))
-
-            ok, data, msg = svc.read_version(folder, version)
-            if not ok:
-                if msg and "not found" in msg.lower():
-                    raise NotFoundError(msg)
-                raise InfrastructureError(
-                    "Failed to read domain version from registry", detail=msg
-                )
-
-            data.setdefault("info", {})["mcp_enabled"] = enabled
-            svc.write_version(folder, version, json.dumps(data))
-
-            if version == self._s.current_version:
-                self._s.info["mcp_enabled"] = enabled
-
-            return {"success": True, "version": version, "mcp_enabled": enabled}
-        except OntoBricksError:
-            raise
-        except Exception as e:
-            logger.exception("set_version_mcp failed: %s", e)
-            raise InfrastructureError("set_version_mcp failed", detail=str(e)) from e
-
-    def save_domain_to_uc(self, svc: RegistryService) -> Dict[str, Any]:
-        """Save domain into the registry Volume under /domains/<name>/V{ver}/V{ver}.json."""
         try:
             c = svc.cfg
             if not c.is_configured:
                 raise ValidationError("Registry not configured. Go to Settings.")
 
-            folder = sanitize_domain_folder(self._s.info.get("name", "untitled_domain"))
+            raw_name = self._s.info.get("name", "untitled_domain")
+            folder = sanitize_domain_folder(raw_name)
             is_new_domain = not self._s.domain_folder
+            if is_new_domain and not is_valid_domain_name((raw_name or "").strip()):
+                raise ValidationError(
+                    "Domain name must be CamelCase alphanumeric only "
+                    "(letters and digits, no spaces or special characters), "
+                    "e.g. MyOntologyDomain",
+                )
             if is_new_domain and svc.domain_exists(folder):
                 raise ConflictError(
                     f'A domain named "{folder}" already exists in the registry. Please choose a different name.',
                 )
             version = self._s.current_version or "1"
+            # Lifecycle lock: never overwrite a version that is no longer a
+            # DRAFT. Mirrors ``CommentService._require_writable`` so the
+            # published (or in-review) artifact is protected on the server
+            # even when the UI read-only gate is bypassed — e.g. a stale
+            # session or a direct API call. Absent version (None) means a
+            # brand-new version row, which is always writable.
+            if not is_new_domain:
+                live_status = svc.get_version_status(folder, version)
+                if live_status and not is_editable(live_status):
+                    raise ConflictError(
+                        f"Version {version} is {live_status} (read-only). "
+                        f"Reopen it to DRAFT before saving changes."
+                    )
+                # Defence-in-depth single-editor lock re-check: refuse an
+                # overwrite by anyone other than the current lock holder
+                # (the authoritative gate lives in PermissionMiddleware).
+                if actor_email:
+                    get_lock = getattr(svc.store, "get_edit_lock", None)
+                    lock = get_lock(folder, version) if get_lock else None
+                    if lock:
+                        holder = lock.get("holder_email") or ""
+                        if (
+                            holder
+                            and holder.lower() != actor_email.lower()
+                        ):
+                            raise ConflictError(
+                                f"Version {version} is being edited by "
+                                f"{lock.get('holder_name') or holder}; you "
+                                "have read-only access. Take over editing "
+                                "to make changes."
+                            )
+            # Guarantee a well-formed base URI at persist time even if Domain
+            # → General was never saved (auto-generate from the domain name),
+            # so the Registry Browse "URI" column is never empty/"Unknown".
+            if not (self._s.ontology.get("base_uri") or "").strip():
+                self._s.ontology["base_uri"] = self._resolve_base_uri(
+                    self._s.info.get("name", ""), auto=True
+                )
             export_data = self._s.export_for_save()
+            # A brand-new domain always starts as DRAFT; an overwrite of an
+            # existing version preserves whatever status the session carries.
+            if is_new_domain:
+                export_data.setdefault("info", {})["status"] = "DRAFT"
+                self._s.info["status"] = "DRAFT"
             content = json.dumps(export_data, indent=2)
             ok, message = svc.write_version(folder, version, content)
 
@@ -657,6 +1186,23 @@ class Domain:
                     reg_settings["schema"] = c.schema
                 if not reg_settings.get("volume"):
                     reg_settings["volume"] = c.volume
+                # Flush the buffered ontology/mapping change-audit events
+                # (who / what / when) into the registry now that the domain
+                # row is guaranteed to exist. Best-effort: an audit-log
+                # failure must never roll back a successful save.
+                try:
+                    events = self._s.drain_change_log()
+                    if events:
+                        svc.record_change_events(
+                            folder, version, actor_email, events
+                        )
+                except Exception as audit_exc:  # noqa: BLE001
+                    logger.warning(
+                        "Change-audit flush failed for %s/%s: %s",
+                        folder,
+                        version,
+                        audit_exc,
+                    )
                 self._s.save()
                 clear_version_status_cache()
                 invalidate_registry_cache()
@@ -754,8 +1300,12 @@ class Domain:
             ts_stats.pop("dt_existence", None)
             self._s.triplestore.pop("_ts_cache_timestamp", None)
             self._s.save()
-            status = "Latest" if is_latest else "Read-only"
-            msg = f"Domain loaded: {domain_name} v{version} ({status})"
+            # Editability is driven by lifecycle status (DRAFT), not by
+            # whether this is the latest version: an older DRAFT version is
+            # still fully editable.
+            lifecycle = (self._s.info.get("status") or "DRAFT").upper()
+            label = "editable" if lifecycle == "DRAFT" else f"{lifecycle}, read-only"
+            msg = f"Domain loaded: {domain_name} v{version} ({label})"
             return {
                 "success": True,
                 "message": msg,
@@ -797,7 +1347,11 @@ class Domain:
             parts = current_version.split(".")
             new_version = str(int(parts[0]) + 1) if parts else "2"
             self._s.current_version = new_version
+            # New versions always start their lifecycle as DRAFT, regardless
+            # of the status of the version they were branched from.
+            self._s.info["status"] = "DRAFT"
             export_data = self._s.export_for_save()
+            export_data.setdefault("info", {})["status"] = "DRAFT"
             exported_entities = len(
                 export_data.get("versions", {})
                 .get(new_version, {})
@@ -879,6 +1433,7 @@ class Domain:
 
             available_versions: List[str] = []
             active_version: Optional[str] = None
+            live_status: Optional[str] = None
             if has_registry:
                 try:
                     svc = self.build_registry_service()
@@ -886,6 +1441,7 @@ class Domain:
                     available_versions = svc.list_versions_sorted(folder)
                     mcp_ver, _ = svc.find_mcp_version(folder)
                     active_version = mcp_ver
+                    live_status = svc.get_version_status(folder, version)
                 except Exception as e:
                     logger.warning("Could not fetch versions from UC: %s", e)
                     available_versions = [version]
@@ -900,12 +1456,29 @@ class Domain:
             # is exposed separately via ``active_version`` so the Cockpit
             # tile can show what's actually live on the API/MCP surface.
             is_active = is_latest
+            # Lifecycle status is authoritative from the registry: a
+            # transition performed out-of-band (e.g. a publish in another
+            # session) must be reflected without a manual reload. Self-heal
+            # the in-session snapshot so the navbar badge and the read-only
+            # gate stay consistent with reality.
+            status = self._s.info.get("status", "DRAFT")
+            if live_status and live_status != status:
+                status = live_status
+                self._s.info["status"] = live_status
+                try:
+                    self._s.save()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "version status self-heal save failed: %s", exc
+                    )
             result = {
                 "success": True,
                 "version": version,
                 "is_active": is_active,
                 "is_latest": is_latest,
                 "active_version": active_version,
+                "published_version": active_version,
+                "status": status,
                 "available_versions": available_versions,
                 "has_registry": has_registry,
                 "registry": (
@@ -1044,16 +1617,17 @@ class Domain:
                 raise ValidationError("No views exist")
             if view_name not in design_layout["views"]:
                 raise NotFoundError(f'View "{view_name}" not found')
-            if len(design_layout["views"]) <= 1:
-                raise ValidationError("Cannot delete the last view")
             del design_layout["views"][view_name]
+            # Deleting the last view is allowed: the UI falls back to the empty
+            # state (current_view becomes None) until a new view is created.
+            remaining = list(design_layout["views"].keys())
             if design_layout.get("current_view") == view_name:
-                design_layout["current_view"] = list(design_layout["views"].keys())[0]
+                design_layout["current_view"] = remaining[0] if remaining else None
             self._s._data["design_layout"] = design_layout
             self._s.save()
             return {
                 "success": True,
-                "views": list(design_layout["views"].keys()),
+                "views": remaining,
                 "current_view": design_layout["current_view"],
             }
         except OntoBricksError:
@@ -1188,11 +1762,10 @@ class Domain:
                 "session-debug is only available when LOG_LEVEL=DEBUG"
             )
         data = self._s._data.copy()
-        if "databricks" in data:
-            db = data["databricks"].copy()
-            if db.get("token"):
-                db["token"] = "***MASKED***"
-            data["databricks"] = db
+        db = (data.get("settings") or {}).get("databricks") or {}
+        if db.get("token"):
+            masked = {**db, "token": "***MASKED***"}
+            data["settings"] = {**data["settings"], "databricks": masked}
         if "generated" in data:
             gen = data["generated"].copy()
             if gen.get("owl") and len(gen["owl"]) > 500:
@@ -1219,6 +1792,18 @@ class Domain:
     # Unity Catalog metadata
     # -------------------------------------------------------------------
 
+    def _data_assets_import_limit(self) -> int:
+        """Effective Settings → Global data-assets import cap (default 40)."""
+        try:
+            st = self._require_settings()
+            host, token, registry_cfg = resolve_app_registry_context(st)
+            return global_config_service.get_data_assets_import_limit(
+                host, token, registry_cfg
+            )
+        except Exception:
+            logger.debug("Falling back to default data-assets import limit", exc_info=True)
+            return MetadataService.DEFAULT_DATA_ASSETS_IMPORT_LIMIT
+
     def get_metadata_response(self) -> Dict[str, Any]:
         metadata = self._s.catalog_metadata
         has_meta = check_has_metadata(metadata)
@@ -1244,24 +1829,85 @@ class Domain:
                     "Databricks not configured. Please configure connection in Settings.",
                 )
             client = DatabricksClient(host=host, token=token, warehouse_id=warehouse_id)
-            tables = await run_blocking(client.get_tables, catalog, schema)
+            # Typed listing so metric views/views are distinguishable from tables.
+            listing = await run_blocking(
+                client.list_tables_and_views, catalog, schema
+            )
+            type_by_name = {
+                r["name"]: r.get("table_type", "") for r in listing if r.get("name")
+            }
+            tables = sorted(type_by_name.keys())
             existing_metadata = self._s.catalog_metadata
             existing_table_names = set()
             if existing_metadata and existing_metadata.get("tables"):
                 existing_table_names = {t["name"] for t in existing_metadata["tables"]}
             table_list = []
-            for table_name in sorted(tables):
+            for table_name in tables:
                 table_list.append(
                     {
                         "name": table_name,
+                        "object_kind": client.catalog.object_kind_for_table_type(
+                            type_by_name.get(table_name, "")
+                        ),
                         "already_loaded": table_name in existing_table_names,
                     }
                 )
+
+            # Permission probes ------------------------------------------------
+            permissions: Dict[str, Any] = {
+                "can_list_tables": len(tables) > 0,
+                "can_select": None,        # None = unknown (no tables to probe)
+                "select_error": None,
+                "hidden_table_count": None,
+                "permission_warning": None,
+            }
+            if not tables:
+                # SHOW TABLES returned nothing — check if tables actually exist
+                hidden = await run_blocking(client.probe_schema_has_tables, catalog, schema)
+                if hidden > 0:
+                    permissions["hidden_table_count"] = hidden
+                    permissions["can_list_tables"] = False
+                    permissions["can_select"] = False
+                    permissions["permission_warning"] = (
+                        f"SHOW TABLES returned no results but "
+                        f"{catalog}.information_schema.tables reports {hidden} table(s). "
+                        "Grant SELECT (and USE CATALOG / USE SCHEMA) on the tables to "
+                        "the app service principal."
+                    )
+            else:
+                # Probe SELECT on a non-metric-view source. Metric views cannot
+                # be queried with SELECT * and would false-fail this schema probe.
+                probe_table = next(
+                    (
+                        row["name"]
+                        for row in table_list
+                        if row.get("object_kind") != "metric_view"
+                    ),
+                    None,
+                )
+                if probe_table:
+                    select_result = await run_blocking(
+                        client.check_table_select_permission,
+                        catalog,
+                        schema,
+                        probe_table,
+                    )
+                    permissions["can_select"] = select_result["can_select"]
+                    if not select_result["can_select"]:
+                        permissions["select_error"] = select_result["error"]
+                        permissions["permission_warning"] = (
+                            f"The service principal can list tables in {catalog}.{schema} "
+                            "but cannot SELECT from them. "
+                            "Grant SELECT on the tables (or the schema) to the app service principal."
+                        )
+
             return {
                 "success": True,
                 "tables": table_list,
                 "total_count": len(tables),
                 "existing_count": len(existing_table_names),
+                "import_limit": self._data_assets_import_limit(),
+                "permissions": permissions,
             }
         except OntoBricksError:
             raise
@@ -1287,16 +1933,21 @@ class Domain:
                 )
             service = MetadataService(host=host, token=token, warehouse_id=warehouse_id)
             existing_metadata = self._s.catalog_metadata
+            import_limit = self._data_assets_import_limit()
             if selected_tables is not None:
                 success, message, metadata = service.load_selected_tables(
                     catalog=catalog,
                     schema=schema,
                     table_names=selected_tables,
                     existing_metadata=existing_metadata,
+                    import_limit=import_limit,
                 )
             else:
                 success, message, metadata = service.load_schema_metadata(
-                    catalog=catalog, schema=schema, existing_metadata=existing_metadata
+                    catalog=catalog,
+                    schema=schema,
+                    existing_metadata=existing_metadata,
+                    import_limit=import_limit,
                 )
             if not success:
                 raise InfrastructureError(
@@ -1321,6 +1972,59 @@ class Domain:
                 "Initialize metadata failed", detail=str(e)
             ) from e
 
+    def _table_identifiers(self, tables: List[Dict[str, Any]]) -> List[str]:
+        """Best available identifier per metadata table (``full_name``, else name)."""
+        return [t.get("full_name") or t.get("name", "") for t in tables if t]
+
+    def get_removal_impact(self, table_names: List[str]) -> Dict[str, Any]:
+        """Report which mappings would be orphaned by removing *table_names*.
+
+        Returns ``{"success": True, "impact": {table: [referrer, ...]},
+        "affected_table_count": n, "affected_mapping_count": m}``.  An empty
+        ``impact`` means the removal breaks nothing.
+
+        Read-only — this only informs the confirmation dialog; the removal
+        itself still goes through :meth:`save_metadata_tables` /
+        :meth:`clear_metadata`.
+        """
+        from back.objects.mapping import Mapping
+
+        impact = Mapping(self._s).find_mappings_referencing(table_names or [])
+        return {
+            "success": True,
+            "impact": impact,
+            "affected_table_count": len(impact),
+            "affected_mapping_count": len(
+                {ref for refs in impact.values() for ref in refs}
+            ),
+        }
+
+    def _invalidate_on_removal(self, removed: List[str]) -> Dict[str, List[str]]:
+        """Drop generated artefacts when a removal orphaned live mappings.
+
+        Removing a data asset that mappings still point at leaves the cached
+        R2RML/SQL describing tables the domain no longer knows about, so it
+        must not survive the removal.  Returns the impact map so callers can
+        report it.  No-op when nothing referenced the removed tables.
+        """
+        if not removed:
+            return {}
+        impact = self.get_removal_impact(removed)["impact"]
+        if not impact:
+            return {}
+        self._s.clear_generated_content()
+        self._s.record_change(
+            "metadata_table_removed",
+            entity_type="metadata_table",
+            entity_ref=", ".join(sorted(impact)),
+            summary=(
+                f"Removed {len(impact)} data asset(s) still referenced by "
+                f"{len({r for refs in impact.values() for r in refs})} mapping(s)"
+            ),
+            meta={"impact": impact},
+        )
+        return impact
+
     def save_metadata_tables(self, tables: List[Dict[str, Any]]) -> Dict[str, Any]:
         try:
             existing_metadata = self._s.catalog_metadata
@@ -1339,12 +2043,22 @@ class Domain:
             is_valid, error_msg = validate_metadata(metadata)
             if not is_valid:
                 raise ValidationError(error_msg)
+            kept = set(self._table_identifiers(tables))
+            removed = [
+                ident
+                for ident in self._table_identifiers(
+                    existing_metadata.get("tables", [])
+                )
+                if ident and ident not in kept
+            ]
             self._s._data["domain"]["metadata"] = metadata
+            impact = self._invalidate_on_removal(removed)
             self._s.save()
             return {
                 "success": True,
                 "message": f"Saved metadata with {len(tables)} tables",
                 "metadata": metadata,
+                "impact": impact,
             }
         except OntoBricksError:
             raise
@@ -1353,9 +2067,13 @@ class Domain:
             raise InfrastructureError("Save metadata failed", detail=str(e)) from e
 
     def clear_metadata(self) -> Dict[str, Any]:
+        removed = self._table_identifiers(
+            self._s.catalog_metadata.get("tables", [])
+        )
         self._s._data["domain"]["metadata"] = {}
+        impact = self._invalidate_on_removal(removed)
         self._s.save()
-        return {"success": True, "message": "Metadata cleared"}
+        return {"success": True, "message": "Metadata cleared", "impact": impact}
 
     def update_table_data_source(
         self,
@@ -1392,7 +2110,7 @@ class Domain:
         noun = "table" if updated == 1 else "tables"
         return {
             "success": True,
-            "message": f"Updated data source for {updated} {noun} to {target}",
+            "message": f"Updated data asset for {updated} {noun} to {target}",
             "tables_updated": updated,
         }
 
@@ -1551,6 +2269,7 @@ class Domain:
                     schema,
                     selected_tables,
                     existing_metadata,
+                    self._data_assets_import_limit(),
                 ),
                 daemon=True,
             )
@@ -1569,10 +2288,10 @@ class Domain:
         table_names: Optional[List[str]],
     ) -> Dict[str, Any]:
         try:
-            existing_metadata = self._s.catalog_metadata
-            if not existing_metadata or not existing_metadata.get("tables"):
+            live_metadata = self._s.catalog_metadata
+            if not live_metadata or not live_metadata.get("tables"):
                 raise ValidationError("No metadata loaded to update")
-            catalog, schema = get_catalog_schema_from_metadata(existing_metadata)
+            catalog, schema = get_catalog_schema_from_metadata(live_metadata)
             if not catalog or not schema:
                 raise ValidationError(
                     "Cannot determine catalog/schema from table full_names"
@@ -1584,6 +2303,12 @@ class Domain:
                 raise ValidationError(
                     "Databricks not configured. Please configure connection in Settings.",
                 )
+            # Deep-copy before handing off to the background thread: it must
+            # merge into an isolated snapshot, never the live session dict,
+            # so a diff the user discards leaves the session untouched — the
+            # only path allowed to mutate session state is the explicit
+            # POST /domain/metadata/save the browser sends on "Apply".
+            existing_metadata = copy.deepcopy(live_metadata)
             existing_tables = {
                 t["name"]: t for t in existing_metadata.get("tables", [])
             }
@@ -1674,11 +2399,20 @@ class Domain:
                 raise ValidationError("No tables found to update")
             updated_count = 0
             errors: List[str] = []
+            diff: Dict[str, Any] = {}
             for table_name in tables_to_update:
                 try:
                     logger.debug("Metadata update: updating table: %s", table_name)
                     old_table = existing_tables[table_name]
-                    new_columns = client.get_table_columns(catalog, schema, table_name)
+                    kind = old_table.get("object_kind") or "table"
+                    if kind == "metric_view":
+                        new_columns = client.get_metric_view_columns_with_roles(
+                            catalog, schema, table_name
+                        )
+                    else:
+                        new_columns = client.get_table_columns(
+                            catalog, schema, table_name
+                        )
                     logger.debug(
                         "Metadata update: got %s columns for %s",
                         len(new_columns) if new_columns else 0,
@@ -1690,6 +2424,20 @@ class Domain:
                     logger.debug(
                         "Metadata update: table comment from UC: %s", table_comment
                     )
+                    select_probe = client.check_table_select_permission(
+                        catalog,
+                        schema,
+                        table_name,
+                        object_kind=kind,
+                        columns=new_columns,
+                    )
+                    # Snapshot before the merge — merge_table_metadata replaces
+                    # old_table["columns"] in place.
+                    table_diff = compute_column_diff(
+                        old_table.get("columns", []), new_columns
+                    )
+                    if has_column_changes(table_diff):
+                        diff[table_name] = table_diff
                     merge_table_metadata(
                         old_table,
                         new_columns,
@@ -1697,6 +2445,7 @@ class Domain:
                         catalog,
                         schema,
                         table_name,
+                        select_probe=select_probe,
                     )
                     updated_count += 1
                     logger.debug("Metadata update: successfully updated %s", table_name)
@@ -1719,6 +2468,7 @@ class Domain:
                 "total_count": len(tables_to_update),
                 "errors": errors,
                 "metadata": existing_metadata,
+                "diff": diff,
             }
         except OntoBricksError:
             raise
@@ -1730,32 +2480,21 @@ class Domain:
     # Project documents (volume path helper for routes)
     # -------------------------------------------------------------------
 
-    def get_documents_volume_path(self) -> Optional[str]:
-        """Return /Volumes/.../domains/<folder>/V<ver>/documents base path, or None if UC is not configured."""
-        path = self._s.uc_version_path
-        if not path:
-            return None
-        return f"{path}/documents"
+    def count_documents(self, settings: Settings) -> Optional[int]:
+        """Count the domain's Knowledge Store documents (Lakebase corpus).
 
-    def count_documents_in_volume(self, settings: Settings) -> Optional[int]:
-        """Count files under the project documents volume path.
-
-        Returns ``0`` when there is no UC project path or the folder is missing.
-        Returns ``None`` when credentials are missing or listing fails.
+        Returns ``0`` when the domain is not saved to a registry yet, and
+        ``None`` when the store is unreachable.
         """
-        base_path = self.get_documents_volume_path()
-        if not base_path:
+        folder = (self._s.uc_domain_folder or self._s.domain_folder or "").strip()
+        if not folder:
             return 0
-        host, token = get_databricks_host_and_token(self._s, settings)
-        if not host or not token:
+        version = str(self._s.current_version or "1")
+        try:
+            from back.objects.registry import RegistryService
+
+            store = RegistryService.from_context(self._s, settings).store
+            return store.count_documents(folder, version)
+        except Exception as exc:  # noqa: BLE001 — cockpit best-effort
+            logger.warning("count_documents: store unavailable: %s", exc)
             return None
-        uc = VolumeFileService(host=host, token=token)
-        success, items, message = uc.list_directory(base_path)
-        if not success and "not found" in message.lower():
-            return 0
-        if not success:
-            logger.warning(
-                "count_documents_in_volume: list failed for %s: %s", base_path, message
-            )
-            return None
-        return len(items)

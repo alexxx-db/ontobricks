@@ -25,12 +25,57 @@
         return prefix + (value || '' + Math.random()).replace(/[^a-zA-Z0-9_-]/g, '_');
     }
 
+    function _countBadge(rowCount) {
+        if (rowCount === null || rowCount === undefined) return '';
+        var n = Number(rowCount);
+        var label = n.toLocaleString() + (n === 1 ? ' row' : ' rows');
+        var cls = n > 0 ? 'diag-count-badge' : 'diag-count-badge diag-count-empty';
+        return '<span class="' + cls + '" title="Rows returned by the source query">' +
+            '<i class="bi bi-table"></i> ' + _escapeHtml(label) + '</span>';
+    }
+
+    function _isDrift(check) {
+        return (check.check || '').indexOf('schema_drift:') === 0;
+    }
+
+    /**
+     * Header badge counting bound columns that vanished from the source table.
+     * Distinct from a plain warning: the mapping is fine, the upstream moved.
+     */
+    function _driftBadge(checks) {
+        var n = (checks || []).filter(_isDrift).length;
+        if (!n) return '';
+        return '<span class="badge bg-warning text-dark ms-2" ' +
+            'title="Bound column(s) no longer exist in the source table">' +
+            '<i class="bi bi-database-exclamation"></i> ' + n + ' drifted</span>';
+    }
+
+    function _issueChecks(checks) {
+        return (checks || []).filter(function (c) {
+            return c.status && c.status !== 'ok';
+        });
+    }
+
+    function _hasIssues(item) {
+        return item.status === 'error' || item.status === 'warning' ||
+            _issueChecks(item.checks).length > 0;
+    }
+
     function _renderChecks(checks) {
-        if (!checks || !checks.length) return '';
-        var rows = checks.map(function (c) {
-            return '<tr class="diag-check-row diag-check-' + c.status + '">' +
-                '<td class="diag-check-icon">' + _icon(c.status) + '</td>' +
-                '<td class="diag-check-name">' + _escapeHtml(c.check) + '</td>' +
+        var issues = _issueChecks(checks);
+        if (!issues.length) return '';
+        var rows = issues.map(function (c) {
+            var drift = _isDrift(c);
+            var icon = drift
+                ? '<i class="bi bi-database-exclamation text-warning"></i>'
+                : _icon(c.status);
+            var name = drift
+                ? c.check.replace('schema_drift:', '') + ' (schema drift)'
+                : c.check;
+            return '<tr class="diag-check-row diag-check-' + c.status +
+                    (drift ? ' diag-check-drift' : '') + '">' +
+                '<td class="diag-check-icon">' + icon + '</td>' +
+                '<td class="diag-check-name">' + _escapeHtml(name) + '</td>' +
                 '<td class="diag-check-detail">' + _escapeHtml(c.detail) + '</td>' +
                 '</tr>';
         });
@@ -48,10 +93,12 @@
                 '<span class="diag-item-status">' + _icon(ent.status) + '</span>' +
                 '<span class="diag-item-label">' + _escapeHtml(ent.label) + '</span>' +
                 '<span class="diag-item-meta text-muted small ms-3">' + _escapeHtml(sourceDisplay) + '</span>' +
+                _driftBadge(ent.checks) +
+                _countBadge(ent.row_count) +
                 '<i class="bi bi-chevron-down diag-chevron ms-auto"></i>' +
             '</div>' +
             '<div id="' + id + '" class="collapse diag-item-body">' +
-                '<div class="diag-detail-row"><strong>Class URI:</strong> ' + _escapeHtml(ent.ontology_class) + '</div>' +
+                '<div class="diag-detail-row"><strong>Entity URI:</strong> ' + _escapeHtml(ent.ontology_class) + '</div>' +
                 '<div class="diag-detail-row"><strong>Source:</strong> <code>' + _escapeHtml(ent.source) + '</code></div>' +
                 '<div class="diag-detail-row"><strong>Available columns:</strong> ' + _escapeHtml(colsStr) + '</div>' +
                 _renderChecks(ent.checks) +
@@ -105,6 +152,8 @@
                 '<span class="diag-item-meta text-muted small ms-3">' +
                     _escapeHtml(rel.source_class || '') + ' → ' + _escapeHtml(rel.target_class || '') +
                 '</span>' +
+                _driftBadge(rel.checks) +
+                _countBadge(rel.row_count) +
                 '<i class="bi bi-chevron-down diag-chevron ms-auto"></i>' +
             '</div>' +
             '<div id="' + id + '" class="collapse diag-item-body">' +
@@ -151,21 +200,21 @@
             document.getElementById('diagWarningCount').textContent = summary.warnings || 0;
             document.getElementById('diagErrorCount').textContent = summary.errors || 0;
 
-            var entities = data.entities || [];
-            var rels = data.relationships || [];
-            var perms = data.permissions || [];
+            var entities = (data.entities || []).filter(_hasIssues);
+            var rels = (data.relationships || []).filter(_hasIssues);
+            var perms = (data.permissions || []).filter(_hasIssues);
 
             document.getElementById('diagEntitiesBody').innerHTML =
-                entities.map(_renderEntityRow).join('') || '<p class="text-muted p-3">No entity mappings found.</p>';
+                entities.map(_renderEntityRow).join('') || '<p class="text-muted p-3">No entity mapping issues.</p>';
             _updateBadge('diagEntityBadge', entities);
 
             document.getElementById('diagRelationshipsBody').innerHTML =
-                rels.map(_renderRelRow).join('') || '<p class="text-muted p-3">No relationship mappings found.</p>';
+                rels.map(_renderRelRow).join('') || '<p class="text-muted p-3">No relationship mapping issues.</p>';
             _updateBadge('diagRelBadge', rels);
 
             document.getElementById('diagPermissionsBody').innerHTML =
                 perms.map(_renderPermissionRow).join('') ||
-                '<p class="text-muted p-3">No source tables to verify.</p>';
+                '<p class="text-muted p-3">No source table permission issues.</p>';
             _updateBadge('diagPermBadge', perms);
 
             _showSection('diagKpiTiles', true);

@@ -1,6 +1,6 @@
 /**
  * OntoBricks - query-sigmagraph.css
- * Sigma.js Knowledge Graph view layout
+ * Sigma.js Graph Viewer view layout
  */
 
 /* Strip padding from the sidebar-content wrapper so the graph fills it edge-to-edge */
@@ -10,13 +10,12 @@
 }
 
 #sigmagraph-section.active {
-    height: 100%;
-    max-height: 100%;
+    flex: 1 1 0;
+    min-height: 0;
     overflow: hidden;
     display: flex;
     flex-direction: column;
-    padding: 1rem;
-    padding-bottom: 0;
+    padding: 0 0.5rem;
 }
 
 #sigmagraph-section > .visualization-layout {
@@ -32,6 +31,7 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    min-height: 0;
     min-width: 300px;
 }
 
@@ -48,6 +48,7 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    min-height: 0;
     margin-bottom: 0;
 }
 
@@ -66,28 +67,105 @@
 
 #sgContainer {
     flex: 1 1 0%;
-    min-height: 300px;
+    min-height: 0;
+    overflow: hidden;
     position: relative;
 }
 
-.sg-expand-spinner {
+.sg-loading-overlay {
     position: absolute;
-    top: 0.75rem;
-    right: 0.75rem;
-    z-index: 1050;
-    display: inline-flex;
+    inset: 0;
+    z-index: 20;
+    display: none;
     align-items: center;
-    padding: 0.4rem 0.75rem;
-    background: rgba(255, 255, 255, 0.95);
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    border-radius: 0.5rem;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-    pointer-events: none;
-    backdrop-filter: blur(4px);
+    justify-content: center;
+    background: var(--db-surface-warm);
+    pointer-events: auto;
 }
 
-.ob-version-badge {
-    font-size: 0.65rem;
+.sg-loading-overlay.is-active {
+    display: flex;
+}
+
+#sgContainer[aria-busy="true"] {
+    visibility: hidden;
+}
+
+.sg-search-timing {
+    position: absolute;
+    left: 0.5rem;
+    bottom: 0.5rem;
+    z-index: 5;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.3rem 0.55rem;
+    border: 1px solid var(--db-border);
+    border-radius: var(--db-radius-control);
+    background: var(--db-text);
+    color: var(--db-surface-warm);
+    font-family: inherit;
+    font-size: 0.7rem;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.sg-search-timing:hover {
+    background: var(--db-primary-darker);
+}
+
+.sg-search-timing:focus-visible {
+    outline: 2px solid transparent;
+    box-shadow: var(--db-focus-ring);
+}
+
+.sg-search-timing-details {
+    position: absolute;
+    left: 0.5rem;
+    bottom: 2.6rem;
+    z-index: 6;
+    width: min(15rem, calc(100% - 1rem));
+    padding: 0.75rem;
+    border: 1px solid var(--db-border);
+    border-radius: var(--db-radius-card);
+    background: var(--db-surface-warm);
+    color: var(--db-text);
+    box-shadow: var(--db-shadow-md);
+}
+
+.sg-search-timing-details[hidden] {
+    display: none;
+}
+
+.sg-search-timing-heading {
+    margin-bottom: 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.sg-search-timing-details dl {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.4rem 0.75rem;
+    margin: 0;
+    font-size: 0.75rem;
+}
+
+.sg-search-timing-details dt,
+.sg-search-timing-details dd {
+    margin: 0;
+}
+
+.sg-search-timing-details dt {
+    color: var(--db-text-secondary);
+    font-weight: 400;
+}
+
+.sg-search-timing-details dd {
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
 }
 
 .sg-compact-select {
@@ -108,6 +186,7 @@
     width: 320px;
     min-width: 200px;
     max-width: 50%;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -118,6 +197,7 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    min-height: 0;
     margin-bottom: 0;
 }
 
@@ -128,29 +208,9 @@
     min-height: 0;
 }
 
-/* Tabbed panel */
+/* The shared compact tab rail owns all visual states. */
 .sg-panel-tabs {
-    border-bottom: 1px solid #dee2e6;
-}
-
-.sg-panel-tabs .nav-link {
-    font-size: 0.78rem;
-    padding: 0.45rem 0.7rem;
-    color: #6c757d;
-    border: none;
-    border-bottom: 2px solid transparent;
-    border-radius: 0;
-}
-
-.sg-panel-tabs .nav-link:hover {
-    color: #495057;
-    border-bottom-color: #dee2e6;
-}
-
-.sg-panel-tabs .nav-link.active {
-    color: #0d6efd;
-    border-bottom-color: #0d6efd;
-    background: transparent;
+    flex-shrink: 0;
 }
 
 .sg-tab-content {
@@ -181,26 +241,39 @@
     margin-bottom: 0.5rem;
 }
 
-/* Resize handle */
+/* Resize handle — same thin divider as Ontology / Mapping Studio:
+   1px track, 0.5px grip, half-gutter overlap, wider invisible hit area. */
 #sigmagraph-section .resize-handle {
-    width: 8px;
+    position: relative;
+    width: 1px;
+    margin-left: -0.25rem;
+    margin-right: -0.25rem;
     cursor: col-resize;
     display: flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    z-index: 1;
+    user-select: none;
+}
+
+#sigmagraph-section .resize-handle::before {
+    content: "";
+    position: absolute;
+    inset: 0 -4px;
 }
 
 #sigmagraph-section .resize-handle .resize-handle-bar {
-    width: 3px;
+    width: 0.5px;
     height: 40px;
-    background: #dee2e6;
-    border-radius: 2px;
-    transition: background 0.15s;
+    background: var(--db-border);
+    border-radius: 1px;
+    transition: background 0.15s ease;
 }
 
-#sigmagraph-section .resize-handle:hover .resize-handle-bar {
-    background: #adb5bd;
+#sigmagraph-section .resize-handle:hover .resize-handle-bar,
+#sigmagraph-section .resize-handle.active .resize-handle-bar {
+    background: var(--db-primary);
 }
 
 /* Filter pane */
@@ -218,7 +291,7 @@
 
 .sg-filter-pane .card-header {
     padding: 0.4rem 0.75rem;
-    background: #f8f9fa;
+    background: #ffffff;
 }
 
 .sg-filter-pane .card-body {
@@ -245,6 +318,11 @@
     white-space: nowrap;
     z-index: 100;
     display: none;
+}
+
+/* Find-in-graph info banner */
+#sgSearchInfo .text-info {
+    color: var(--db-primary) !important;
 }
 
 /* Floating info bubble for right-click expand outcomes (no-op cases) */
@@ -289,7 +367,7 @@
 .sg-seed-table th {
     position: sticky;
     top: 0;
-    background: #f8f9fa;
+    background: #ffffff;
     z-index: 1;
     border-bottom: 2px solid #dee2e6;
 }
@@ -313,7 +391,7 @@
 }
 
 #sgSeedPreviewModal .modal-footer {
-    background: #f8f9fa;
+    background: #ffffff;
 }
 
 /* Data cluster panel */
@@ -334,12 +412,12 @@
     padding: 0.25rem 0.4rem;
     border: 1px solid #e9ecef;
     border-radius: 6px;
-    background: #f8f9fa;
+    background: #ffffff;
     transition: background 0.15s;
 }
 
 .sg-cluster-chip:hover {
-    background: #e9ecef;
+    background: #ffffff;
 }
 
 .sg-cluster-dot {
@@ -356,6 +434,7 @@
     position: fixed;
     z-index: 9999;
     min-width: 170px;
+    overflow-y: auto;
     background: #fff;
     border: 1px solid #dee2e6;
     border-radius: 6px;
@@ -377,7 +456,12 @@
 }
 
 #sgContextMenu .ctx-item:hover {
-    background: #e9ecef;
+    background: #e8f4fd;
+    color: #1a73e8;
+}
+
+#sgContextMenu .ctx-item:hover i {
+    color: #1a73e8;
 }
 
 #sgContextMenu .ctx-item i {
@@ -434,6 +518,7 @@
     z-index: 9999;
     min-width: 200px;
     max-width: 340px;
+    overflow-y: auto;
     background: #fff;
     border: 1px solid #dee2e6;
     border-radius: 6px;
@@ -457,7 +542,12 @@
 }
 
 #sgNodeContextMenu .ctx-item:hover {
-    background: #e9ecef;
+    background: #e8f4fd;
+    color: #1a73e8;
+}
+
+#sgNodeContextMenu .ctx-item:hover i {
+    color: #1a73e8;
 }
 
 #sgNodeContextMenu .ctx-item i {
@@ -474,4 +564,107 @@
     color: #6c757d;
     font-weight: 600;
     pointer-events: none;
+}
+
+/* Find Path typeahead (modal) */
+.sg-find-path-picker {
+    position: relative;
+}
+
+.sg-find-path-suggest {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 100%;
+    margin-top: 2px;
+    max-height: 220px;
+    overflow-y: auto;
+    z-index: 1060;
+    background: var(--db-surface-warm);
+    border: 1px solid var(--db-border);
+    border-radius: var(--db-radius-control);
+    box-shadow: var(--db-shadow-md);
+}
+
+.sg-find-path-suggest-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    background: transparent;
+    padding: 0.4rem 0.75rem;
+    color: var(--db-text);
+    border-radius: 0;
+}
+
+.sg-find-path-suggest-item:hover,
+.sg-find-path-suggest-item.active {
+    background: var(--db-hover-indigo);
+}
+
+.sg-find-path-suggest-type {
+    display: block;
+    color: var(--db-text-muted);
+    font-size: 0.75rem;
+}
+
+.sg-find-path-picked {
+    margin-top: 0.35rem;
+    padding: 0.25rem 0.6rem;
+    border: 1px solid var(--db-border);
+    border-radius: var(--db-radius-chip);
+    background: var(--db-primary-light);
+    color: var(--db-primary-darker);
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+.sg-find-path-picked-label {
+    min-width: 0;
+    flex: 1;
+}
+
+.sg-find-path-picked .btn-close {
+    width: 0.5em;
+    height: 0.5em;
+    padding: 0.2em;
+}
+
+@media (max-width: 768px) {
+    .sidebar-content:has(#sigmagraph-section.active),
+    #sigmagraph-section.active {
+        overflow: visible;
+    }
+
+    #sigmagraph-section.active {
+        flex: none;
+    }
+
+    #sigmagraph-section > .visualization-layout {
+        flex: none;
+        flex-direction: column;
+        overflow: visible;
+    }
+
+    #sigmagraph-section .graph-wrapper {
+        min-width: 0;
+        overflow: visible;
+    }
+
+    #sigmagraph-section .graph-panel,
+    #sgContainer {
+        min-height: 400px;
+    }
+
+    #sigmagraph-section .resize-handle {
+        display: none;
+    }
+
+    #sigmagraph-section .details-panel {
+        width: 100%;
+        min-width: 0;
+        max-width: none;
+        min-height: 320px;
+    }
 }

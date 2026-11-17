@@ -1,0 +1,59 @@
+[project]
+name = "backend"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "databricks-sdk==0.81.0",
+  "fastapi==0.115.0",
+  "psycopg[binary]==3.2.3",
+  "uvicorn[standard]==0.32.0",
+]
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "import-linter==2.15",
+  "pytest==9.1.1",
+  "pyyaml==6.0.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["backend", "tests"]
+python_files = ["test_*.py"]
+
+[tool.importlinter]
+root_package = "backend"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Slices do not import each other"
+type = "independence"
+modules = ["backend.features.*"]
+
+[[tool.importlinter.contracts]]
+name = "Only runtime names slices and adapters"
+type = "forbidden"
+source_modules = ["backend.features", "backend.ports", "backend.kernel", "backend.adapters"]
+forbidden_modules = ["backend.runtime"]
+
+[[tool.importlinter.contracts]]
+name = "Slices depend on ports, not adapters or vendors"
+type = "forbidden"
+source_modules = ["backend.features"]
+forbidden_modules = ["backend.adapters", "databricks", "psycopg"]
+# A slice's route test runs against the in-memory adapters, which the contract tests
+# hold to the same behavior as the real ones. Only test modules are exempt.
+ignore_imports = ["backend.features.*.test_route -> backend.adapters.*"]
+
+[[tool.importlinter.contracts]]
+name = "Ports import only the standard library and the kernel"
+type = "forbidden"
+source_modules = ["backend.ports"]
+forbidden_modules = ["backend.features", "backend.adapters", "fastapi", "pydantic", "databricks", "psycopg"]
+
+[[tool.importlinter.contracts]]
+name = "Kernel imports only the standard library"
+type = "forbidden"
+source_modules = ["backend.kernel"]
+forbidden_modules = ["backend.features", "backend.ports", "backend.adapters", "fastapi", "pydantic", "databricks", "psycopg"]

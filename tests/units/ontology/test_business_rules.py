@@ -13,13 +13,16 @@ Covers:
 import pytest
 from unittest.mock import MagicMock, patch
 
-from back.core.reasoning.models import InferredTriple, ReasoningResult, RuleViolation
-from back.core.reasoning.SWRLParser import SWRLParser
-from back.core.reasoning.SWRLSQLTranslator import SWRLSQLTranslator
-from back.core.reasoning.SWRLBuiltinRegistry import SWRLBuiltin, SWRLBuiltinRegistry
-from back.core.reasoning.DecisionTableEngine import DecisionTableEngine
-from back.core.reasoning.SPARQLRuleEngine import SPARQLRuleEngine
-from back.core.reasoning.AggregateRuleEngine import AggregateRuleEngine
+from back.core.reasoning.results.InferredTriple import InferredTriple
+from back.core.reasoning.results.ReasoningResult import ReasoningResult
+from back.core.reasoning.results.RuleViolation import RuleViolation
+from back.core.reasoning.swrl.SWRLParser import SWRLParser
+from back.core.reasoning.swrl.SWRLSQLTranslator import SWRLSQLTranslator
+from back.core.reasoning.swrl.SWRLBuiltin import SWRLBuiltin
+from back.core.reasoning.swrl.SWRLBuiltinRegistry import SWRLBuiltinRegistry
+from back.core.reasoning.rules.DecisionTableEngine import DecisionTableEngine
+from back.core.reasoning.rules.SPARQLRuleEngine import SPARQLRuleEngine
+from back.core.reasoning.rules.AggregateRuleEngine import AggregateRuleEngine
 from back.core.reasoning.ReasoningService import ReasoningService
 
 
@@ -231,6 +234,16 @@ class TestDecisionTableEngine:
         assert "http://test.org/ontology#Customer" in sql
         assert "http://test.org/ontology/tier" in sql
 
+    def test_numeric_condition_tolerates_non_numeric_values(self, sample_table):
+        # Warehouses run with ANSI mode on, where a bare CAST aborts the whole
+        # statement on the first amount that is not a number.
+        engine = DecisionTableEngine()
+        sql = engine.build_violation_sql(
+            sample_table, "triples", "http://test.org/ontology#"
+        )
+        assert "TRY_CAST(inp1.object AS DOUBLE)" in sql
+        assert "CAST(" not in sql.replace("TRY_CAST(", "")
+
     def test_validate_valid_table(self, sample_table):
         errors = DecisionTableEngine.validate_table(sample_table)
         assert errors == []
@@ -333,6 +346,23 @@ class TestAggregateRuleEngine:
         assert "GROUP BY" in sql
         assert "HAVING" in sql
         assert "> 5" in sql
+
+    def test_sum_tolerates_non_numeric_values(self, sample_rule):
+        # Summing a property whose values are not all numbers must skip them
+        # rather than abort the statement, which a bare CAST would do.
+        engine = AggregateRuleEngine()
+        sql = engine.build_sql(
+            {
+                **sample_rule,
+                "aggregate_property": "amount",
+                "aggregate_property_uri": "http://test.org/ontology/amount",
+                "aggregate_function": "sum",
+            },
+            "triples",
+            "http://test.org/ontology#",
+        )
+        assert "SUM(TRY_CAST(t_agg.object AS DOUBLE))" in sql
+        assert "CAST(" not in sql.replace("TRY_CAST(", "")
 
     def test_validate_valid_rule(self, sample_rule):
         errors = AggregateRuleEngine.validate_rule(sample_rule)

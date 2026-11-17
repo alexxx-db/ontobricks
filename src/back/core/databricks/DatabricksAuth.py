@@ -1,13 +1,15 @@
 """Databricks authentication and host resolution.
 
-Centralises OAuth (Databricks Apps) and PAT (local dev) authentication
-so that every service class in this package can share a single
-``DatabricksAuth`` instance instead of duplicating credential logic.
+Centralises OAuth (Databricks Apps), PAT (local dev with tokens) and
+Databricks CLI profile authentication (local dev where token generation
+is blocked) so that every service class in this package can share a
+single ``DatabricksAuth`` instance instead of duplicating credential logic.
 """
 
 import os
+import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from back.core.logging import get_logger
 from back.core.errors import ValidationError
@@ -16,6 +18,7 @@ from .constants import (
     _OAUTH_TOKEN_TTL,
     _SQL_SOCKET_TIMEOUT,
 )
+from shared.config.constants import HTTP_USER_AGENT
 
 logger = get_logger(__name__)
 _CLOUD_FETCH_PROBE_TTL_SECONDS = 300
@@ -25,15 +28,20 @@ _CLOUD_FETCH_PROBE_TIMEOUT_SECONDS = 8
 class DatabricksAuth:
     """Shared authentication context for all Databricks service classes.
 
-    Supports two modes:
+    Supports three modes, resolved in priority order:
 
     1. **Databricks Apps** — M2M OAuth via ``DATABRICKS_CLIENT_ID`` /
-       ``DATABRICKS_CLIENT_SECRET``.
-    2. **Local development** — Personal Access Token (``DATABRICKS_TOKEN``).
+       ``DATABRICKS_CLIENT_SECRET`` (auto-injected by the platform).
+    2. **Local Personal Access Token** — ``DATABRICKS_TOKEN``.
+    3. **Local Databricks CLI** — a profile in ``~/.databrickscfg`` populated
+       by ``databricks auth login``. Selected explicitly via
+       ``DATABRICKS_CONFIG_PROFILE`` or implicitly via the default profile.
     """
 
     # Class-level cache: { (host, warehouse_id): (capable, reason, ts) }
     _cloud_fetch_cache: Dict[Tuple[str, str], Tuple[bool, str, float]] = {}
+    _cloud_fetch_resolve_lock = threading.RLock()
+    _resolving_cloud_fetch: bool = False
 
     @staticmethod
     def is_databricks_app() -> bool:
@@ -56,31 +64,40 @@ class DatabricksAuth:
     @staticmethod
     def _resolve_global_cloud_fetch_default(host: str, token: str) -> bool:
         """Best-effort load of global CloudFetch setting (default: enabled)."""
-        try:
-            from shared.config.settings import get_settings
-            from back.objects.registry import RegistryCfg
-            from back.objects.session import global_config_service
-
-            settings = get_settings()
-            registry_cfg = RegistryCfg.from_domain(None, settings).as_dict()
-            if not host or not registry_cfg.get("catalog") or not registry_cfg.get(
-                "schema"
-            ):
+        with DatabricksAuth._cloud_fetch_resolve_lock:
+            if DatabricksAuth._resolving_cloud_fetch:
                 return True
-            return bool(global_config_service.get_use_cloud_fetch(host, token, registry_cfg))
-        except Exception as exc:  # noqa: BLE001 - best-effort default resolution
-            logger.debug(
-                "Could not resolve global CloudFetch setting, defaulting to enabled: %s",
-                exc,
-            )
-            return True
+            DatabricksAuth._resolving_cloud_fetch = True
+            try:
+                from shared.config.settings import get_settings
+                from back.objects.registry import RegistryCfg
+                from back.objects.session import global_config_service
+
+                settings = get_settings()
+                registry_cfg = RegistryCfg.from_domain(None, settings).as_dict()
+                if not host or not registry_cfg.get("catalog") or not registry_cfg.get(
+                    "schema"
+                ):
+                    return True
+                return bool(
+                    global_config_service.get_use_cloud_fetch(host, token, registry_cfg)
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort default resolution
+                logger.debug(
+                    "Could not resolve global CloudFetch setting, defaulting to enabled: %s",
+                    exc,
+                )
+                return True
+            finally:
+                DatabricksAuth._resolving_cloud_fetch = False
 
     @staticmethod
     def get_workspace_host() -> str:
         """Resolve the Databricks workspace host URL.
 
         Checks ``DATABRICKS_HOST`` first, then falls back to the Databricks
-        SDK auto-detection (works inside Databricks Apps).
+        SDK auto-detection (works inside Databricks Apps and for users who
+        have run ``databricks auth login``).
         """
         host = os.getenv("DATABRICKS_HOST", "")
         if host:
@@ -100,12 +117,47 @@ class DatabricksAuth:
             logger.debug("Could not auto-detect host: %s", exc)
             return ""
 
+    @staticmethod
+    def _resolve_cli_config(profile: str, host: str) -> Optional[Any]:
+        """Build an SDK ``Config`` for Databricks CLI profile auth.
+
+        Returns ``None`` when no CLI profile is usable (e.g. ``~/.databrickscfg``
+        is missing or the named profile does not exist). When *profile* was
+        explicitly requested via ``DATABRICKS_CONFIG_PROFILE`` and resolution
+        fails, the failure is logged at WARNING so a typo surfaces — the
+        implicit default-profile path stays at DEBUG so users who never ran
+        ``databricks auth login`` aren't spammed with noise.
+        """
+        try:
+            from databricks.sdk.core import Config
+
+            kwargs: Dict[str, Any] = {}
+            if profile:
+                kwargs["profile"] = profile
+            if host:
+                kwargs["host"] = host
+            cfg = Config(**kwargs)
+            if not cfg.host:
+                return None
+            return cfg
+        except Exception as exc:  # noqa: BLE001 - vendor surface, fall through
+            if profile:
+                logger.warning(
+                    "DATABRICKS_CONFIG_PROFILE=%r did not resolve: %s",
+                    profile,
+                    exc,
+                )
+            else:
+                logger.debug("Could not resolve default CLI profile: %s", exc)
+            return None
+
     def __init__(
         self,
         host: Optional[str] = None,
         token: Optional[str] = None,
         warehouse_id: Optional[str] = None,
         use_cloud_fetch: Optional[bool] = None,
+        use_sea: Optional[bool] = None,
     ) -> None:
         self.token = token or os.getenv("DATABRICKS_TOKEN", "")
         self.warehouse_id = (
@@ -119,10 +171,23 @@ class DatabricksAuth:
         self.client_id = os.getenv("DATABRICKS_CLIENT_ID", "")
         self.client_secret = os.getenv("DATABRICKS_CLIENT_SECRET", "")
         self.is_app_mode = self.is_databricks_app()
+        self.config_profile = os.getenv("DATABRICKS_CONFIG_PROFILE", "").strip()
 
-        self.host = (
-            DatabricksAuth.normalize_host(host) if host else self.get_workspace_host()
-        )
+        explicit_host = DatabricksAuth.normalize_host(host) if host else ""
+
+        self._cli_config: Optional[Any] = None
+        if not self.is_app_mode and not self.token:
+            self._cli_config = self._resolve_cli_config(
+                self.config_profile, explicit_host
+            )
+
+        if explicit_host:
+            self.host = explicit_host
+        elif self._cli_config is not None and self._cli_config.host:
+            self.host = DatabricksAuth.normalize_host(self._cli_config.host)
+        else:
+            self.host = self.get_workspace_host()
+
         if use_cloud_fetch is None:
             self.use_cloud_fetch = self._resolve_global_cloud_fetch_default(
                 self.host, self.token
@@ -130,12 +195,41 @@ class DatabricksAuth:
         else:
             self.use_cloud_fetch = bool(use_cloud_fetch)
 
-        logger.info(
-            "DatabricksAuth init — host=%s, app_mode=%s, warehouse=%s",
-            self.host,
-            self.is_app_mode,
-            self.warehouse_id,
-        )
+        # ``use_sea`` is the persisted compatibility key for Lakehouse/RT.
+        # The deprecated Python SEA backend is intentionally not used: route
+        # these connections through the supported native Kernel backend.
+        self.use_kernel = bool(use_sea)
+
+        if self.auth_mode == "cli":
+            logger.info(
+                "DatabricksAuth init — host=%s, mode=cli, profile=%s, warehouse=%s",
+                self.host,
+                self.cli_profile_name,
+                self.warehouse_id,
+            )
+        else:
+            logger.info(
+                "DatabricksAuth init — host=%s, mode=%s, warehouse=%s",
+                self.host,
+                self.auth_mode,
+                self.warehouse_id,
+            )
+
+    @property
+    def auth_mode(self) -> str:
+        """Resolved auth mode: ``"app"``, ``"pat"``, ``"cli"``, or ``"none"``."""
+        if self.is_app_mode and self.client_id and self.client_secret:
+            return "app"
+        if self.token:
+            return "pat"
+        if self._cli_config is not None:
+            return "cli"
+        return "none"
+
+    @property
+    def cli_profile_name(self) -> str:
+        """Resolved CLI profile name (``"default"`` when unspecified)."""
+        return self.config_profile or "default"
 
     def get_oauth_token(self) -> str:
         """Obtain (or return cached) M2M OAuth access token.
@@ -160,6 +254,7 @@ class DatabricksAuth:
                 token_url,
                 data={"grant_type": "client_credentials", "scope": "all-apis"},
                 auth=(self.client_id, self.client_secret),
+                headers={"User-Agent": HTTP_USER_AGENT},
                 timeout=5,
             )
             response.raise_for_status()
@@ -181,13 +276,23 @@ class DatabricksAuth:
             return {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                "User-Agent": HTTP_USER_AGENT,
             }
         if self.token:
             return {
                 "Authorization": f"Bearer {self.token}",
                 "Content-Type": "application/json",
+                "User-Agent": HTTP_USER_AGENT,
             }
-        return {}
+        if self._cli_config is not None:
+            sdk_headers = self._cli_config.authenticate()
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent": HTTP_USER_AGENT,
+            }
+            headers.update(sdk_headers)
+            return headers
+        return {"User-Agent": HTTP_USER_AGENT}
 
     def get_sql_connection_params(self) -> dict:
         """Return kwargs suitable for ``databricks.sql.connect()``.
@@ -204,11 +309,26 @@ class DatabricksAuth:
             "_socket_timeout": _SQL_SOCKET_TIMEOUT,
         }
         params["use_cloud_fetch"] = self.can_use_cloud_fetch()
+        if self.use_kernel:
+            params["use_kernel"] = True
         if self.is_app_mode and self.client_id and self.client_secret:
-            params["access_token"] = self.get_oauth_token()
+            params["credentials_provider"] = self._oauth_credentials_provider
         elif self.token:
             params["access_token"] = self.token
+        elif self._cli_config is not None:
+            params["credentials_provider"] = lambda: self._cli_config.authenticate
         return params
+
+    def _oauth_credentials_provider(self):
+        """``credentials_provider`` for ``databricks.sql.connect`` in app mode.
+
+        The connector calls this once per connection, then calls the returned
+        header factory on every HTTP request, status polls of a running
+        statement included. Reading the token through :meth:`get_oauth_token`
+        there picks up its refresh; a static ``access_token`` captured at
+        connect time expired one hour into long statements and lost them.
+        """
+        return lambda: {"Authorization": f"Bearer {self.get_oauth_token()}"}
 
     @staticmethod
     def _env_true(name: str) -> bool:
@@ -226,32 +346,6 @@ class DatabricksAuth:
         except Exception as exc:  # noqa: BLE001 - optional dependency probe
             return False, f"pyarrow unavailable: {exc}"
         return True, "prerequisites ok"
-
-    def cloud_fetch_status(self, force: bool = False) -> Tuple[bool, str]:
-        """Return ``(capable, reason)`` for CloudFetch in the current runtime.
-
-        Cached per ``(host, warehouse_id)`` for
-        ``_CLOUD_FETCH_PROBE_TTL_SECONDS``. Pass ``force=True`` to bypass
-        the cache (used by ``/health``).
-        """
-        if self._env_true("DATABRICKS_DISABLE_CLOUD_FETCH"):
-            return False, "Disabled by DATABRICKS_DISABLE_CLOUD_FETCH"
-        if self._env_true("DATABRICKS_FORCE_CLOUD_FETCH"):
-            return True, "Forced by DATABRICKS_FORCE_CLOUD_FETCH"
-        if not self.use_cloud_fetch:
-            return False, "Disabled by global settings"
-
-        ok, msg = self._cloud_fetch_prerequisites()
-        if not ok:
-            return False, msg
-
-        key = (self.host, self.warehouse_id)
-        now = time.time()
-        cached = DatabricksAuth._cloud_fetch_cache.get(key)
-        if not force and cached and (now - cached[2]) < _CLOUD_FETCH_PROBE_TTL_SECONDS:
-            return cached[0], cached[1]
-
-        return self.probe_cloud_fetch_capability()
 
     def can_use_cloud_fetch(self) -> bool:
         """Return whether CloudFetch should be enabled for SQL params.
@@ -309,10 +403,16 @@ class DatabricksAuth:
                 "_socket_timeout": _CLOUD_FETCH_PROBE_TIMEOUT_SECONDS,
                 "use_cloud_fetch": True,
             }
+            if self.use_kernel:
+                probe_params["use_kernel"] = True
             if self.is_app_mode and self.client_id and self.client_secret:
                 probe_params["access_token"] = self.get_oauth_token()
             elif self.token:
                 probe_params["access_token"] = self.token
+            elif self._cli_config is not None:
+                probe_params["credentials_provider"] = (
+                    lambda: self._cli_config.authenticate
+                )
 
             with sql.connect(**probe_params) as conn:
                 with conn.cursor() as cur:
@@ -339,10 +439,12 @@ class DatabricksAuth:
         """Return *True* when usable credentials are available."""
         if self.is_app_mode:
             return bool(self.client_id and self.client_secret)
-        return bool(self.token)
+        if self.token:
+            return True
+        return self._cli_config is not None
 
     def get_bearer_token(self) -> str:
-        """Return the current bearer token (PAT or OAuth)."""
+        """Return the current bearer token (PAT, OAuth, or CLI profile)."""
         if self.token:
             return self.token
         pat = os.getenv("DATABRICKS_TOKEN", "")
@@ -350,4 +452,9 @@ class DatabricksAuth:
             return pat
         if self.is_app_mode:
             return self.get_oauth_token()
+        if self._cli_config is not None:
+            headers = self._cli_config.authenticate()
+            authz = headers.get("Authorization", "")
+            if authz.startswith("Bearer "):
+                return authz[len("Bearer ") :]
         return ""

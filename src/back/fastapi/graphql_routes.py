@@ -14,6 +14,8 @@ Routes (mounted at ``/graphql`` on the main app and at the external prefix from 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
+from html import escape
+import json
 from typing import Any, Dict, List, Optional
 
 from api.constants import EXTERNAL_GRAPHQL_PUBLIC_PREFIX
@@ -28,13 +30,29 @@ from back.core.errors import (
     InfrastructureError,
 )
 from back.objects.registry import RegistryService
-from back.core.triplestore import get_triplestore
+from back.core.graphdb import get_graphdb
 from shared.config.constants import DEFAULT_BASE_URI
-from back.core.helpers import effective_graph_name
+from back.core.helpers import effective_graph_name, effective_graph_query_table
+from shared.fastapi.ui_branding import (
+    get_request_ui_branding,
+    render_ui_branding_css_vars,
+)
 
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+
+def assert_public_graph_read(request, domain, settings) -> None:
+    """Team gate for the public GraphQL graph-read surface.
+
+    Imported lazily to avoid an import cycle with the ``api.routers.internal``
+    package (which transitively imports the external routers)."""
+    from api.routers.internal._graph_access import (
+        assert_public_graph_read as _impl,
+    )
+
+    _impl(request, domain, settings)
 
 
 def _graphql_safe_error_message(exc: BaseException) -> str:
@@ -45,6 +63,17 @@ def _graphql_safe_error_message(exc: BaseException) -> str:
     if isinstance(original, OntoBricksError):
         return original.message
     return "The query could not be executed."
+
+
+def _is_external_request(request: Request) -> bool:
+    """Whether the request hit the public external GraphQL mount.
+
+    Reads the raw routed path (``scope["path"]``) rather than
+    ``request.url.path``: the latter is reconstructed from the Host header and
+    could be poisoned to flip the external/internal gate (BadHost /
+    CVE-2026-48710).
+    """
+    return request.scope["path"].startswith(EXTERNAL_GRAPHQL_PUBLIC_PREFIX)
 
 
 # ------------------------------------------------------------------
@@ -77,19 +106,42 @@ class GraphQLDomainsResponse(BaseModel):
 # ------------------------------------------------------------------
 
 
-def _load_domain_from_registry(domain_name, session_mgr, settings):
-    """Load a domain by name from the registry and return a DomainSession."""
+def _load_domain_from_registry(domain_name, session_mgr, settings, *, external=False):
+    """Load a domain by name from the registry and return a DomainSession.
+
+    When *external* is ``True`` (the public ``/api/v1/graphql`` mount) the
+    resolution is strict PUBLISHED-only: the session-folder shortcut is
+    skipped and only the latest PUBLISHED version is served. Internal UI
+    GraphiQL (*external* ``False``) keeps the session shortcut and falls
+    back to the latest version when nothing is open/published.
+    """
     domain = get_domain(session_mgr)
 
     svc = RegistryService.from_context(domain, settings)
     if not svc.cfg.is_configured:
         raise ValidationError("Registry not configured")
 
+    if external:
+        # Public API surface: only PUBLISHED versions are data-accessible.
+        ok, data, version, err = svc.load_published_domain_data(domain_name)
+        if not ok:
+            raise NotFoundError(err)
+        domain.clear_generated_content()
+        domain.import_from_file(data, version=version)
+        domain.domain_folder = domain_name
+        domain.save()
+        logger.info(
+            "GraphQL(external): loaded PUBLISHED domain '%s' version %s",
+            domain_name,
+            version,
+        )
+        return domain
+
     # If the user already has this registry folder open at a chosen version,
-    # keep it. Otherwise GraphQL would call load_mcp_domain_data(), which
-    # picks the newest version with mcp_enabled=True — often an older v3 while
-    # the user is on v4 — and would open the wrong graph store snapshot for
-    # subsequent Digital Twin / data-quality calls.
+    # keep it. Otherwise GraphQL would resolve to the latest PUBLISHED
+    # version — often an older v3 while the user is on v4 — and would open
+    # the wrong graph store snapshot for subsequent Knowledge Graph /
+    # data-quality calls.
     session_folder = (getattr(domain, "domain_folder", None) or "").strip()
     session_ver = (getattr(domain, "current_version", None) or "").strip()
     if session_folder == domain_name and session_ver:
@@ -109,17 +161,21 @@ def _load_domain_from_registry(domain_name, session_mgr, settings):
             return domain
         logger.warning(
             "GraphQL: cannot read session version %s for '%s' (%s) — "
-            "falling back to MCP-enabled / latest version",
+            "falling back to PUBLISHED / latest version",
             session_ver,
             domain_name,
             msg_session,
         )
 
-    ok, data, version, err = svc.load_mcp_domain_data(domain_name)
+    ok, data, version, err = svc.load_published_domain_data(domain_name)
     if not ok:
-        if "not found" in err.lower() or "no versions" in err.lower():
-            raise NotFoundError(err)
-        raise InfrastructureError(err)
+        # Internal UI fallback: serve the latest version even if not
+        # PUBLISHED (the UI operates on the session-loaded version).
+        ok, data, version, err = svc.load_latest_domain_data(domain_name)
+        if not ok:
+            if "not found" in err.lower() or "no versions" in err.lower():
+                raise NotFoundError(err)
+            raise InfrastructureError(err)
 
     domain.clear_generated_content()
     domain.import_from_file(data, version=version)
@@ -135,8 +191,43 @@ def _load_domain_from_registry(domain_name, session_mgr, settings):
     return domain
 
 
+def _diagnose_empty_ontology(classes, properties_list):
+    """Return a structured ``(reason, message)`` tuple when the ontology
+    cannot back a GraphQL schema, else ``None``.
+
+    Surfaces the SAME information the route layer used to swallow into
+    a 400 — but now consumers (UI Playground, MCP introspection) can
+    branch on ``reason`` and render a friendly state instead of a
+    blunt "HTTP 400".
+
+    Reasons:
+    - ``"no_classes"`` — ontology has zero classes (nothing to query).
+    - ``"no_properties"`` — classes exist but no relationships/data
+      properties. The auto-generated schema would have no fields to
+      traverse beyond the bare type list; we treat this as
+      "GraphQL not ready" rather than serve a degenerate schema.
+    """
+    if not classes:
+        return ("no_classes",
+                "Ontology has no classes — add classes in the Designer "
+                "before querying the knowledge graph via GraphQL.")
+    if not properties_list:
+        return ("no_properties",
+                "Ontology has classes but no relationships or data "
+                "properties — GraphQL needs at least one property to "
+                "expose meaningful query fields. Add properties in the "
+                "Designer or via OWL import.")
+    return None
+
+
 def _get_schema_and_context(domain, settings):
-    """Build (or retrieve cached) GraphQL schema and execution context."""
+    """Build (or retrieve cached) GraphQL schema and execution context.
+
+    Raises :class:`ValidationError` only when the ontology is genuinely
+    unusable. For the "no classes / no properties" cases the caller
+    should prefer :func:`_diagnose_empty_ontology` to render a friendly
+    state instead of catching the exception.
+    """
     from back.core.graphql import build_schema_for_domain
 
     ontology = domain.ontology or {}
@@ -144,6 +235,14 @@ def _get_schema_and_context(domain, settings):
     properties_list = ontology.get("properties", [])
     base_uri = ontology.get("base_uri", DEFAULT_BASE_URI)
     display_name = (domain.info or {}).get("name", "")
+
+    diag = _diagnose_empty_ontology(classes, properties_list)
+    if diag is not None:
+        # Route handlers call ``_diagnose_empty_ontology`` first and
+        # return early; if we still got here, the caller chose to keep
+        # the legacy "raise" behaviour (e.g. ``/execute``).
+        reason, message = diag
+        raise ValidationError(message, detail=reason)
 
     result = build_schema_for_domain(classes, properties_list, base_uri, display_name)
     if not result:
@@ -153,13 +252,13 @@ def _get_schema_and_context(domain, settings):
 
     schema, metadata = result
 
-    store = get_triplestore(domain, settings, backend="graph")
+    store = get_graphdb(domain, settings)
     if not store:
         raise InfrastructureError(
             "Graph backend not configured or unreachable."
         )
 
-    table = effective_graph_name(domain)
+    table = effective_graph_query_table(domain, settings, store=store)
 
     logger.info(
         "GraphQL context: table=%s, store=%s, classes=%d",
@@ -206,6 +305,7 @@ async def graphql_list_domains(
         domains=[
             GraphQLDomainInfo(name=p["name"], description=p["description"])
             for p in items
+            if p.get("has_graph", True)
         ],
     )
 
@@ -236,32 +336,62 @@ async def graphql_playground(
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    domain = _load_domain_from_registry(domain_name, session_mgr, settings)
+    is_external = _is_external_request(request)
+    domain = _load_domain_from_registry(
+        domain_name, session_mgr, settings, external=is_external
+    )
     _get_schema_and_context(domain, settings)
 
     display_name = (domain.info or {}).get("name", domain_name)
     api_prefix = (
-        EXTERNAL_GRAPHQL_PUBLIC_PREFIX
-        if request.url.path.startswith(EXTERNAL_GRAPHQL_PUBLIC_PREFIX)
-        else "/graphql"
+        EXTERNAL_GRAPHQL_PUBLIC_PREFIX if is_external else "/graphql"
     )
-    return HTMLResponse(_graphiql_html(domain_name, display_name, api_prefix))
+    branding = get_request_ui_branding(request)
+    return HTMLResponse(
+        _graphiql_html(
+            domain_name=domain_name,
+            display_name=display_name,
+            graphql_api_prefix=api_prefix,
+            page_title=f"{branding.get('app_title', 'OntoBricks')} GraphQL - {display_name}",
+            logo_url=str(branding.get("logo_url", "/static/global/img/favicon.svg")),
+            css_vars=render_ui_branding_css_vars(branding),
+        )
+    )
 
 
 @router.post(
     "/{domain_name}",
     summary="Execute GraphQL query",
     description="Execute a GraphQL query against a domain's knowledge graph. "
-    "The schema is auto-generated from the domain's ontology.",
+    "The schema is auto-generated from the domain's ontology. "
+    "Query param ``cache`` (true/false) overrides the domain Search cache switch.",
 )
 async def graphql_execute(
+    request: Request,
     domain_name: str,
     body: GraphQLRequest,
+    cache: Optional[str] = Query(
+        None,
+        description="true/false: force search companions on or off. "
+        "Omitted uses Domain → General → Backend Search cache.",
+    ),
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    domain = _load_domain_from_registry(domain_name, session_mgr, settings)
+    is_external = _is_external_request(request)
+    domain = _load_domain_from_registry(
+        domain_name, session_mgr, settings, external=is_external
+    )
+    assert_public_graph_read(request, domain, settings)
     schema, context = _get_schema_and_context(domain, settings)
+    store = context.get("triplestore")
+    if store is not None:
+        from back.core.graphdb.search_cache import (
+            apply_search_cache_to_store,
+            parse_cache_param,
+        )
+
+        apply_search_cache_to_store(store, domain, parse_cache_param(cache))
 
     if body.depth is not None:
         context["depth"] = min(max(body.depth, 1), MAX_DEPTH)
@@ -302,17 +432,43 @@ async def graphql_execute(
     description="Return the auto-generated GraphQL schema in SDL format.",
 )
 async def graphql_sdl(
+    request: Request,
     domain_name: str,
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    domain = _load_domain_from_registry(domain_name, session_mgr, settings)
+    is_external = _is_external_request(request)
+    domain = _load_domain_from_registry(
+        domain_name, session_mgr, settings, external=is_external
+    )
+
+    # Friendly fallback: when the ontology is too thin to back a GraphQL
+    # schema, return a 200 with ``sdl=null`` + a typed ``reason`` + a
+    # human message. The Playground JS branches on this to render an
+    # in-context hint instead of a blunt "HTTP 400" toast.
+    ontology = domain.ontology or {}
+    classes = ontology.get("classes", []) or []
+    properties_list = ontology.get("properties", []) or []
+    diag = _diagnose_empty_ontology(classes, properties_list)
+    if diag is not None:
+        reason, message = diag
+        return JSONResponse(content={
+            "sdl": None,
+            "ready": False,
+            "reason": reason,
+            "message": message,
+            "stats": {
+                "classes": len(classes),
+                "properties": len(properties_list),
+            },
+        })
+
     schema, _ = _get_schema_and_context(domain, settings)
 
     from strawberry.printer import print_schema
 
     sdl = print_schema(schema)
-    return JSONResponse(content={"sdl": sdl})
+    return JSONResponse(content={"sdl": sdl, "ready": True})
 
 
 @router.get(
@@ -322,13 +478,18 @@ async def graphql_sdl(
     "Also returns subject counts and optional search diagnostics.",
 )
 async def graphql_debug(
+    request: Request,
     domain_name: str,
     type_name: str = Query(None, description="Type to inspect (e.g. Customer)"),
     search: str = Query(None, description="Test search string (e.g. Martinez)"),
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    domain = _load_domain_from_registry(domain_name, session_mgr, settings)
+    is_external = _is_external_request(request)
+    domain = _load_domain_from_registry(
+        domain_name, session_mgr, settings, external=is_external
+    )
+    assert_public_graph_read(request, domain, settings)
     schema, context = _get_schema_and_context(domain, settings)
 
     from back.core.graphql import build_schema_for_domain
@@ -398,16 +559,30 @@ async def graphql_debug(
 # ------------------------------------------------------------------
 
 
-def _graphiql_html(domain_name: str, display_name: str, graphql_api_prefix: str) -> str:
+def _graphiql_html(
+    domain_name: str,
+    display_name: str,
+    graphql_api_prefix: str,
+    page_title: str,
+    logo_url: str,
+    css_vars: str,
+) -> str:
     """*graphql_api_prefix* is ``/graphql`` or ``EXTERNAL_GRAPHQL_PUBLIC_PREFIX`` so GraphiQL POSTs to the same mount."""
+    escaped_title = escape(page_title, quote=True)
+    escaped_logo_url = escape(logo_url, quote=True)
+    escaped_css_vars = escape(css_vars, quote=False)
+    depth_url_js = json.dumps(f"{graphql_api_prefix}/settings/depth")
+    execute_url_js = json.dumps(f"{graphql_api_prefix}/{domain_name}")
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>OntoBricks GraphQL — {display_name}</title>
-  <link rel="icon" href="/static/global/img/favicon-32.png" />
+  <title>{escaped_title}</title>
+  <link rel="icon" href="{escaped_logo_url}" />
   <link href="https://unpkg.com/graphiql@3/graphiql.min.css" rel="stylesheet" />
   <style>
+    {escaped_css_vars}
     body {{ margin: 0; overflow: hidden; }}
     #graphiql {{ height: 100vh; }}
     .graphiql-container .topBar {{
@@ -435,7 +610,7 @@ def _graphiql_html(domain_name: str, display_name: str, graphql_api_prefix: str)
     (async function() {{
       var dflt = {DEFAULT_DEPTH}, mx = {MAX_DEPTH};
       try {{
-        var r = await fetch('{graphql_api_prefix}/settings/depth');
+        var r = await fetch({depth_url_js});
         if (r.ok) {{ var d = await r.json(); dflt = d.default || dflt; mx = d.max || mx; }}
       }} catch {{}}
       var sel = document.getElementById('depthSel');
@@ -448,7 +623,7 @@ def _graphiql_html(domain_name: str, display_name: str, graphql_api_prefix: str)
       function fetcher(params) {{
         var depth = parseInt(sel.value || dflt, 10);
         var body = Object.assign({{}}, params, {{ depth: depth }});
-        return fetch('{graphql_api_prefix}/{domain_name}', {{
+        return fetch({execute_url_js}, {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
           credentials: 'same-origin',

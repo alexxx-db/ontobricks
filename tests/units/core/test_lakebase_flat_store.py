@@ -7,6 +7,7 @@ import pytest
 
 pytest.importorskip("psycopg")
 
+from back.core.errors import InfrastructureError
 from back.core.graphdb.lakebase.LakebaseFlatStore import LakebaseFlatStore
 
 
@@ -77,6 +78,9 @@ def test_create_table_issues_schema_ddl_and_indexes(auth):
     # Union view must be created.
     assert any("CREATE OR REPLACE VIEW" in s and "mydomain_v1" in s for s in executed)
     assert any("CREATE INDEX" in s for s in executed)
+    assert any("CREATE EXTENSION pgcrypto WITH SCHEMA public" in s for s in executed)
+    assert any("object_hash" in s and "digest" in s for s in create_tables)
+    assert any("PRIMARY KEY (subject, predicate, object_hash)" in s for s in create_tables)
 
 
 def test_writable_table_id_is_companion_for_app_managed(auth):
@@ -299,7 +303,7 @@ def test_default_schema_constant():
 
 def test_find_subjects_by_type_delegates(auth):
     store = LakebaseFlatStore(auth, schema="g")
-    with patch.object(
+    with patch.object(store, "table_exists", return_value=False), patch.object(
         store,
         "execute_query",
         return_value=[{"subject": "http://ex/1"}, {"subject": "http://ex/2"}],
@@ -313,15 +317,46 @@ def test_find_subjects_by_type_delegates(auth):
     assert subs == ["http://ex/1", "http://ex/2"]
 
 
+def test_find_subjects_by_type_uses_entity_search_when_ready(auth):
+    store = LakebaseFlatStore(auth, schema="g")
+    with patch.object(store, "table_exists", return_value=True), patch.object(
+        store,
+        "execute_query",
+        return_value=[{"uri": "http://ex/1"}],
+    ) as execute:
+        subs = store.find_subjects_by_type(
+            "G_V1", "http://ex.org/Customer", limit=10, offset=0
+        )
+    assert subs == ["http://ex/1"]
+    assert "g_v1_entity_search" in execute.call_args.args[0]
+
+
 def test_bfs_traversal_sql_path(auth):
     store = LakebaseFlatStore(auth, schema="g")
-    with patch.object(
+    with patch.object(store, "table_exists", return_value=False), patch.object(
         store,
         "execute_query",
         return_value=[{"entity": "http://seed", "min_lvl": 0}],
     ):
         rows = store.bfs_traversal("G_V1", " WHERE subject = 'http://seed'", depth=3)
     assert rows == [{"entity": "http://seed", "min_lvl": 0}]
+
+
+def test_bfs_traversal_uses_companions_when_ready(auth):
+    store = LakebaseFlatStore(auth, schema="g")
+    with patch.object(store, "table_exists", return_value=True), patch.object(
+        store,
+        "execute_query",
+        return_value=[{"entity": "http://ex/1", "min_lvl": 0}],
+    ) as execute:
+        rows = store.bfs_traversal(
+            "G_V1", " WHERE subject = 'http://seed'", depth=1, entity_type="Customer"
+        )
+    assert rows == [{"entity": "http://ex/1", "min_lvl": 0}]
+    sql = execute.call_args.args[0]
+    assert "g_v1_entity_search" in sql
+    assert "g_v1_adj_out" in sql
+    assert "g_v1_adj_in" in sql
 
 
 # ---------------------------------------------------------------
@@ -516,6 +551,22 @@ class TestManagedSyncedRouting:
         assert "FROM g_v1_sync" in view_ddl
         assert '"ontobricks_graph"' not in view_ddl
 
+    def test_ensure_synced_union_view_ensures_graph_indexes_on_sync_table(self, synced_store):
+        """managed_synced builds re-apply graph indexes on Lakeflow-owned _sync tables."""
+        cur = MagicMock()
+        with patch.object(synced_store, "_cursor", _cursor_ctx(cur)):
+            synced_store.ensure_synced_union_view("G_V1")
+        executed = [str(c[0][0]) for c in cur.execute.call_args_list]
+        index_ddls = [s for s in executed if "CREATE INDEX IF NOT EXISTS" in s]
+        assert len(index_ddls) == 3
+        assert all("ON g_v1_sync" in s for s in index_ddls)
+        assert any("subject, predicate" in s for s in index_ddls)
+        assert any("predicate, object_hash" in s for s in index_ddls)
+        assert any("object_hash, predicate" in s for s in index_ddls)
+        view_idx = next(i for i, s in enumerate(executed) if "CREATE OR REPLACE VIEW" in s)
+        first_index_idx = next(i for i, s in enumerate(executed) if "CREATE INDEX IF NOT EXISTS" in s)
+        assert first_index_idx < view_idx
+
     def test_ensure_synced_companion_skips_union_view(self, synced_store):
         cur = MagicMock()
         with patch.object(synced_store, "_cursor", _cursor_ctx(cur)):
@@ -523,6 +574,24 @@ class TestManagedSyncedRouting:
         executed = [str(c[0][0]) for c in cur.execute.call_args_list]
         assert any("CREATE TABLE IF NOT EXISTS g_v1__app" in s for s in executed)
         assert not any("CREATE OR REPLACE VIEW" in s for s in executed)
+
+    def test_drop_app_owned_sync_artifacts_skips_lakeflow_owner(self, synced_store):
+        cur = MagicMock()
+        cur.fetchone.return_value = {"owner": "databricks_writer_16536"}
+        with patch.object(synced_store, "_cursor", _cursor_ctx(cur)):
+            assert synced_store.drop_app_owned_sync_artifacts_if_present("G_V1") is False
+        executed = [str(c[0][0]) for c in cur.execute.call_args_list]
+        assert not any("DROP VIEW" in s for s in executed)
+        assert not any("DROP TABLE" in s for s in executed)
+
+    def test_drop_app_owned_sync_artifacts_drops_user_owned_sync(self, synced_store):
+        cur = MagicMock()
+        cur.fetchone.return_value = {"owner": "benoit.cayla@databricks.com"}
+        with patch.object(synced_store, "_cursor", _cursor_ctx(cur)):
+            assert synced_store.drop_app_owned_sync_artifacts_if_present("G_V1") is True
+        executed = [str(c[0][0]) for c in cur.execute.call_args_list]
+        assert any("DROP VIEW IF EXISTS g_v1" in s for s in executed)
+        assert any("DROP TABLE IF EXISTS g_v1_sync" in s for s in executed)
 
     def test_truncate_companion_runs_truncate(self, synced_store):
         cur = MagicMock()
@@ -544,7 +613,7 @@ class TestResolveLakebaseGraphSchema:
         domain = SimpleNamespace(settings={"registry": {}})
         settings = SimpleNamespace()
         with patch(
-            "back.objects.registry.RegistryCfg.from_domain",
+            "back.objects.registry.RegistryCfg.RegistryCfg.from_domain",
             return_value=MagicMock(catalog="c", schema="volume_sch", volume="v"),
         ):
             out = resolve_lakebase_graph_schema(
@@ -565,7 +634,7 @@ class TestResolveLakebaseGraphSchema:
         domain = SimpleNamespace(settings={"registry": {}})
         settings = SimpleNamespace()
         with patch(
-            "back.objects.registry.RegistryCfg.from_domain",
+            "back.objects.registry.RegistryCfg.RegistryCfg.from_domain",
             return_value=MagicMock(catalog="c", schema="volume_sch", volume="v"),
         ):
             out = resolve_lakebase_graph_schema(domain, settings, "")
@@ -581,7 +650,7 @@ class TestResolveLakebaseGraphSchema:
         domain = SimpleNamespace()
         settings = SimpleNamespace()
         with patch(
-            "back.objects.registry.RegistryCfg.from_domain",
+            "back.objects.registry.RegistryCfg.RegistryCfg.from_domain",
             return_value=MagicMock(catalog="c", schema="", volume="v"),
         ):
             out = resolve_lakebase_graph_schema(domain, settings, "custom_g")
@@ -599,7 +668,7 @@ class TestResolveSyncUcFallbackCatalog:
         domain = SimpleNamespace(settings={"registry": {}})
         settings = SimpleNamespace()
         with patch(
-            "back.objects.registry.RegistryCfg.from_domain",
+            "back.objects.registry.RegistryCfg.RegistryCfg.from_domain",
             return_value=MagicMock(catalog="team_catalog", schema="s", volume="v"),
         ):
             out = resolve_sync_uc_fallback_catalog(
@@ -619,7 +688,7 @@ class TestResolveSyncUcFallbackCatalog:
         domain = SimpleNamespace()
         settings = SimpleNamespace()
         with patch(
-            "back.objects.registry.RegistryCfg.from_domain",
+            "back.objects.registry.RegistryCfg.RegistryCfg.from_domain",
             return_value=MagicMock(catalog="", schema="", volume=""),
         ):
             out = resolve_sync_uc_fallback_catalog(
@@ -642,7 +711,7 @@ class TestResolveSyncUcFallbackCatalog:
         domain = SimpleNamespace(settings={"registry": {}})
         settings = SimpleNamespace()
         with patch(
-            "back.objects.registry.RegistryCfg.from_domain",
+            "back.objects.registry.RegistryCfg.RegistryCfg.from_domain",
             return_value=MagicMock(catalog="team_catalog", schema="s", volume="v"),
         ):
             out = resolve_sync_uc_fallback_catalog(
@@ -666,7 +735,7 @@ class TestResolveSyncUcFallbackCatalog:
         domain = SimpleNamespace(settings={"registry": {}})
         settings = SimpleNamespace()
         with patch(
-            "back.objects.registry.RegistryCfg.from_domain",
+            "back.objects.registry.RegistryCfg.RegistryCfg.from_domain",
             return_value=MagicMock(catalog="team_catalog", schema="s", volume="v"),
         ):
             out = resolve_sync_uc_fallback_catalog(
@@ -676,3 +745,178 @@ class TestResolveSyncUcFallbackCatalog:
             )
         assert out == "legacy_catalog"
 
+
+def test_copy_insert_batch_phy_reraises_index_limit_with_predicate_detail(auth):
+    store = LakebaseFlatStore(auth, schema="ontobricks_graph")
+    long_object = "x" * 4000
+    batch = [
+        {
+            "subject": "http://ex/s",
+            "predicate": "http://ex/longMessage",
+            "object": long_object,
+        }
+    ]
+
+    class _ProgramLimitExceeded(Exception):
+        pass
+
+    def _boom(*_args, **_kwargs):
+        raise _ProgramLimitExceeded(
+            'index row size 7480 exceeds btree version 4 maximum 2704 for index "g_v1_sync_pkey"'
+        )
+
+    with patch.object(store, "_txn_cursor", side_effect=_boom):
+        with pytest.raises(InfrastructureError, match="predicate='http://ex/longMessage'"):
+            store._copy_insert_batch_phy("g_v1_sync", batch)
+
+
+def test_wrap_triple_view_sql_for_lakeflow_adds_object_hash():
+    from back.core.graphdb.lakebase._companion_ddl import wrap_triple_view_sql_for_lakeflow
+
+    inner = "SELECT 's' AS subject, 'p' AS predicate, 'o' AS object"
+    wrapped = wrap_triple_view_sql_for_lakeflow(inner)
+    assert "sha2(TRY_CAST(object AS STRING), 256) AS object_hash" in wrapped
+    assert "CAST(" not in wrapped.replace("TRY_CAST(", "")
+    assert wrapped.endswith("FROM (SELECT 's' AS subject, 'p' AS predicate, 'o' AS object) AS _ob_triples")
+
+
+def test_upgrade_legacy_triple_table_adds_object_hash_and_pk():
+    from back.core.graphdb.lakebase._companion_ddl import (
+        upgrade_legacy_triple_table_to_object_hash,
+    )
+
+    cur = MagicMock()
+    # table exists, missing object_hash, then digest() present after ensure_pgcrypto
+    cur.fetchone.side_effect = [(1,), None, (1,)]
+
+    upgrade_legacy_triple_table_to_object_hash(cur, "cust360auto_v5__app")
+
+    executed = " ".join(str(c[0][0]) for c in cur.execute.call_args_list)
+    assert "ADD COLUMN IF NOT EXISTS object_hash" in executed
+    assert "DROP CONSTRAINT" in executed
+    assert "ADD PRIMARY KEY (subject, predicate, object_hash)" in executed
+    assert "DROP INDEX IF EXISTS" in executed
+
+
+def test_create_triple_table_migrates_legacy_before_indexes():
+    from back.core.graphdb.lakebase._companion_ddl import _create_triple_table
+
+    cur = MagicMock()
+    # table exists, missing object_hash, then digest() present after ensure_pgcrypto
+    cur.fetchone.side_effect = [(1,), None, (1,)]
+
+    _create_triple_table(cur, "ontobricks_graph", "g_v1__app")
+
+    executed = [str(c[0][0]) for c in cur.execute.call_args_list]
+    assert any("CREATE TABLE IF NOT EXISTS g_v1__app" in s for s in executed)
+    assert any("ADD COLUMN IF NOT EXISTS object_hash" in s for s in executed)
+    assert any("CREATE INDEX IF NOT EXISTS" in s and "object_hash" in s for s in executed)
+
+
+def test_scheduled_view_sql_wraps_object_hash_for_managed_synced():
+    from back.objects.registry.schedule.build import _view_sql_for_graph_store
+
+    inner = "SELECT subject, predicate, object FROM t"
+    managed = MagicMock()
+    managed.is_synced = True
+    wrapped = _view_sql_for_graph_store(inner, managed)
+    assert "object_hash" in wrapped
+    assert inner in wrapped
+
+    app_managed = MagicMock()
+    app_managed.is_synced = False
+    assert _view_sql_for_graph_store(inner, app_managed) == inner
+    assert _view_sql_for_graph_store(inner, None) == inner
+
+
+def test_find_subjects_by_patterns_empty(auth):
+    store = LakebaseFlatStore(auth, schema="ontobricks_graph")
+    with patch.object(store, "execute_query") as mock_eq:
+        result = store.find_subjects_by_patterns("MyGraph_V1", [])
+    assert result == set()
+    mock_eq.assert_not_called()
+
+
+def test_find_subjects_by_patterns_suffix_fast_path(auth):
+    store = LakebaseFlatStore(auth, schema="ontobricks_graph")
+    with patch.object(store, "execute_query", return_value=[{"subject": "http://ex/WTG:1"}]) as mock_eq:
+        result = store.find_subjects_by_patterns(
+            "MyGraph_V1",
+            ["%/WTG:1", "%/WTG:2", "%/CUST:10"],
+        )
+    assert result == {"http://ex/WTG:1"}
+    mock_eq.assert_called_once()
+    sql = mock_eq.call_args[0][0]
+    assert "RIGHT(subject," in sql
+    assert "ANY(ARRAY" in sql
+    assert "LIKE" not in sql
+    assert "'/WTG:1'" in sql
+    assert "'/WTG:2'" in sql
+    assert "'/CUST:10'" in sql
+
+
+def test_find_subjects_by_patterns_generic_fallback(auth):
+    store = LakebaseFlatStore(auth, schema="ontobricks_graph")
+    with patch.object(
+        store,
+        "execute_query",
+        side_effect=[
+            [{"subject": "http://ex/a"}],
+            [{"subject": "http://ex/b"}],
+        ],
+    ) as mock_eq:
+        result = store.find_subjects_by_patterns(
+            "MyGraph_V1",
+            ["%/WTG:1", "%/foo%bar"],
+        )
+    assert result == {"http://ex/a", "http://ex/b"}
+    assert mock_eq.call_count == 2
+    assert "RIGHT(subject," in mock_eq.call_args_list[0][0][0]
+    assert "LIKE" in mock_eq.call_args_list[1][0][0]
+
+
+def test_find_subjects_by_patterns_escapes_quotes(auth):
+    store = LakebaseFlatStore(auth, schema="ontobricks_graph")
+    with patch.object(store, "execute_query", return_value=[]) as mock_eq:
+        store.find_subjects_by_patterns("MyGraph_V1", ["%/O'Brien"])
+    sql = mock_eq.call_args[0][0]
+    assert "O''Brien" in sql
+
+
+def test_get_triples_page_for_subjects_uses_props_table(auth):
+    store = LakebaseFlatStore(auth, schema="ontobricks_graph")
+    with patch.object(
+        store,
+        "execute_query",
+        return_value=[
+            {
+                "subject": "s",
+                "predicate": "p",
+                "object": "o",
+                "_ob_total": 4,
+            }
+        ],
+    ) as execute:
+        got = store.get_triples_page_for_subjects(
+            "G_V1",
+            ["http://ex/1"],
+            limit=2,
+            offset=1,
+        )
+    assert got == {"rows": [{"subject": "s", "predicate": "p", "object": "o"}], "total": 4}
+    sql = execute.call_args.args[0]
+    assert "g_v1_props" in sql
+    assert "COUNT(*) AS _ob_total" in sql
+
+
+def test_get_triples_page_for_subjects_empty_subjects_skips_query(auth):
+    store = LakebaseFlatStore(auth, schema="ontobricks_graph")
+    with patch.object(store, "execute_query") as execute:
+        got = store.get_triples_page_for_subjects(
+            "G_V1",
+            [],
+            limit=2,
+            offset=1,
+        )
+    assert got == {"rows": [], "total": 0}
+    execute.assert_not_called()

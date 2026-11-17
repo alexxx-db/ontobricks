@@ -6,7 +6,10 @@ default values.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from agents.agent_mapping_pge.contracts import EvalReport, SourceModel
 
 
 @dataclass
@@ -23,6 +26,10 @@ class ToolContext:
     domain_name: Optional[str] = None
     domain_folder: Optional[str] = None
     domain_version: Optional[str] = None
+
+    # SQL Warehouse id retained for agent-call compatibility. Document tools
+    # read durable sidecars and never use this field to start parsing.
+    warehouse_id: str = ""
 
     # Auto-mapping fields
     client: Any = None
@@ -49,3 +56,15 @@ class ToolContext:
     dtwin_registry_params: dict = field(default_factory=dict)
     dtwin_domain_name: str = ""
     dtwin_ontology_labels: dict = field(default_factory=dict)  # uri/name → display label
+    dtwin_class_actions: dict = field(default_factory=dict)
+    pending_action: dict | None = None
+
+    # Mapping PGE planner output (``agent_mapping_pge``) – populated by the
+    # ``submit_source_model`` terminal tool. Forward-ref string typing avoids a
+    # circular import between ``agents.tools`` and ``agents.agent_mapping_pge``.
+    source_model: Optional["SourceModel"] = None
+
+    # Mapping PGE semantic critic output (``agent_mapping_pge``) – populated by
+    # the ``submit_evaluation`` terminal tool of the Sprint 6 Critic agent.
+    # Same forward-ref pattern as ``source_model`` to avoid a circular import.
+    semantic_eval_report: Optional["EvalReport"] = None

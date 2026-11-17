@@ -1,16 +1,18 @@
 """Frontend HTML route -- Entity URI resolution.
 
 Accepts an ontology entity URI (path-based or query-param) and redirects
-to the Knowledge Graph visualization with the entity focused.
+to the Graph Viewer visualization with the entity focused.
 
 When no explicit ``domain`` query-parameter is supplied the route
 inspects the URI against all registry domains' base URIs and
-automatically selects the owning domain so the Knowledge Graph page
+automatically selects the owning domain so the Graph Viewer page
 can load the correct graph.
 
 Cross-domain bridges are handled server-side: the target domain is
 loaded into the session *before* the redirect, so the browser only
-needs a single page load to display the graph.
+needs a single page load to display the graph. Successful switches
+append ``domain_switched=1`` so the navbar busts its cached domain
+name/version before painting.
 """
 
 from __future__ import annotations

@@ -1,20 +1,51 @@
 <!-- JS: /static/domain/js/domain-information.js -->
 <!-- Domain information section -->
 <div class="content-section">
-    <div class="section-header d-flex justify-content-between align-items-center mb-4">
-        <div>
-            <h4 class="mb-1"><i class="bi bi-info-circle me-2"></i>Domain Information</h4>
-            <p class="text-muted mb-0 small">Define your domain details</p>
-        </div>
-        <div class="d-flex align-items-center gap-3">
-            <button type="button" class="btn btn-sm btn-outline-primary" id="btnSaveDomain" onclick="saveDomainFromSettings()">
-                <i class="bi bi-cloud-upload me-1"></i> Save Domain
-            </button>
+    <div class="section-header mb-4">
+        <h4 class="mb-1"><i class="bi bi-info-circle me-2"></i>General</h4>
+        <p class="text-muted mb-0 small">Define your domain details</p>
+    </div>
+
+    <!-- Current-domain KPI / health band (moved from the Home page) -->
+    <div class="domain-panel mb-4" id="domainKpiPanel">
+        <div class="ob-kpi-band">
+            <div class="ob-kpi-tile tile-muted" id="kpiEntitiesTile">
+                <div class="ob-kpi-tile-icon"><i class="bi bi-diagram-3"></i></div>
+                <div class="ob-kpi-tile-value" id="kpiEntities">-</div>
+                <div class="ob-kpi-tile-label">Entities</div>
+            </div>
+            <div class="ob-kpi-tile tile-muted" id="kpiRelationshipsTile">
+                <div class="ob-kpi-tile-icon"><i class="bi bi-arrow-left-right"></i></div>
+                <div class="ob-kpi-tile-value" id="kpiRelationships">-</div>
+                <div class="ob-kpi-tile-label">Relationships</div>
+            </div>
+            <div class="ob-kpi-tile tile-muted" id="kpiMappingsTile">
+                <div class="ob-kpi-tile-icon"><i class="bi bi-link-45deg"></i></div>
+                <div class="ob-kpi-tile-value" id="kpiMappings">-</div>
+                <div class="ob-kpi-tile-label">Mappings</div>
+            </div>
+            <div class="ob-kpi-tile tile-muted" id="kpiQualityTile">
+                <div class="ob-kpi-tile-icon"><i class="bi bi-patch-check"></i></div>
+                <div class="ob-kpi-tile-value" id="kpiQuality">-</div>
+                <div class="ob-kpi-tile-label">Quality</div>
+            </div>
+            <div class="ob-kpi-tile tile-muted" id="kpiStatusTile">
+                <div class="ob-kpi-tile-icon"><i class="bi bi-flag"></i></div>
+                <div class="ob-kpi-tile-value" id="kpiStatus">-</div>
+                <div class="ob-kpi-tile-label">Status</div>
+            </div>
+            <div class="ob-kpi-tile tile-muted" id="kpiVersionTile">
+                <div class="ob-kpi-tile-icon"><i class="bi bi-tag"></i></div>
+                <div class="ob-kpi-tile-value" id="kpiVersion">-</div>
+                <div class="ob-kpi-tile-label">Version</div>
+            </div>
         </div>
     </div>
-    
+
+    <form id="domainForm" class="card h-100 ob-tabs-wrap">
+    <div class="card-body p-0 ob-tabs-wrap">
     <!-- Tab navigation -->
-    <ul class="nav nav-tabs ob-tabs mb-0" id="domainInfoTabs" role="tablist">
+    <ul class="nav nav-tabs ob-tabs nav-fill" id="domainInfoTabs" role="tablist">
         <li class="nav-item" role="presentation">
             <button class="nav-link active" id="tab-global" data-bs-toggle="tab" data-bs-target="#panel-global"
                     type="button" role="tab" aria-controls="panel-global" aria-selected="true">
@@ -30,15 +61,18 @@
         <li class="nav-item" role="presentation">
             <button class="nav-link" id="tab-triplestore" data-bs-toggle="tab" data-bs-target="#panel-triplestore"
                     type="button" role="tab" aria-controls="panel-triplestore" aria-selected="false">
-                <i class="bi bi-lightning-charge me-1"></i> Digital Twin
+                <i class="bi bi-hdd-network me-1"></i> Backend
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="tab-mcp" data-bs-toggle="tab" data-bs-target="#panel-mcp"
+                    type="button" role="tab" aria-controls="panel-mcp" aria-selected="false">
+                <i class="bi bi-plug me-1"></i> MCP
             </button>
         </li>
     </ul>
 
-    <div class="card">
-        <div class="card-body">
-            <form id="domainForm">
-                <div class="tab-content" id="domainInfoTabContent">
+                <div class="tab-content p-3" id="domainInfoTabContent">
 
                     <!-- ======== Global Tab ======== -->
                     <div class="tab-pane fade show active" id="panel-global" role="tabpanel" aria-labelledby="tab-global">
@@ -55,8 +89,10 @@
                                 </small>
                             </div>
                             <div class="col-md-3 mb-3">
-                                <label for="domainVersion" class="form-label">
-                                    <i class="bi bi-hash"></i> Version
+                                <label for="domainVersion" class="form-label d-flex align-items-center gap-2">
+                                    <span><i class="bi bi-hash"></i> Version</span>
+                                    <span class="js-version-status-badge badge border bg-warning-subtle text-dark border-warning"
+                                          style="font-size:0.65rem;">Draft</span>
                                 </label>
                                 <input type="text" class="form-control ob-form-readonly-muted" id="domainVersionDisplay"
                                        value="v{{ domain.version or '1' }}" readonly>
@@ -115,89 +151,401 @@
                                        placeholder="Your name or organization" 
                                        value="{{ domain.author or '' }}">
                             </div>
-                            
+                            <div class="col-md-4 mb-3">
+                                <label for="domainReviewQuorum" class="form-label">
+                                    <i class="bi bi-patch-check"></i> Sign-off quorum
+                                </label>
+                                <input type="number" min="1" step="1"
+                                       class="form-control domain-editable" id="domainReviewQuorum"
+                                       value="{{ domain.review_quorum or 1 }}">
+                                <small class="text-muted">Distinct approvals required before a version can be published.</small>
+                            </div>
                         </div>
                     </div>
 
                     <!-- ======== LLM Tab ======== -->
                     <div class="tab-pane fade" id="panel-llm" role="tabpanel" aria-labelledby="tab-llm">
                         <div class="mb-3">
-                            <label for="domainLlmEndpoint" class="form-label">
-                                <i class="bi bi-robot"></i> LLM Endpoint <small class="text-muted">(for OntoBricks Agents)</small>
+                            <label for="domainLlmEndpointDisplay" class="form-label">
+                                <i class="bi bi-robot"></i> LLM <small class="text-muted">(for OntoBricks Agents)</small>
                             </label>
                             <div class="input-group">
-                                <select class="form-select domain-editable" id="domainLlmEndpoint"
-                                        data-saved-value="{{ domain.llm_endpoint or '' }}">
-                                    <option value="">-- Loading endpoints... --</option>
-                                </select>
-                                <button type="button" class="btn btn-outline-secondary" onclick="loadLlmEndpoints()" title="Refresh endpoints">
-                                    <i class="bi bi-arrow-clockwise"></i>
+                                <input type="hidden" class="domain-editable" id="domainLlmEndpoint"
+                                       value="{{ domain.llm_endpoint or '' }}"
+                                       data-saved-value="{{ domain.llm_endpoint or '' }}">
+                                <input type="hidden" class="domain-editable" id="domainLlmEndpointKind"
+                                       value="{{ domain.llm_endpoint_kind or '' }}"
+                                       data-saved-value="{{ domain.llm_endpoint_kind or '' }}">
+                                <input type="text" class="form-control" id="domainLlmEndpointDisplay"
+                                       value="{{ domain.llm_endpoint or '' }}" readonly
+                                       placeholder="No LLM selected">
+                                <button type="button" class="btn btn-outline-secondary domain-editable"
+                                        id="domainLlmBrowse">
+                                    <i class="bi bi-search me-1"></i>Browse
                                 </button>
                             </div>
-                            <small class="text-muted">Select the Databricks Model Serving endpoint to use for the OntoBricks Agents</small>
+                            <small class="text-muted">Select an AI Gateway model service or legacy Model Serving endpoint.</small>
                         </div>
                         <div class="alert alert-light border small mt-4">
                             <i class="bi bi-info-circle me-1"></i>
                             OntoBricks agents (OWL generation, auto-mapping, icon mapping) use this endpoint
-                            to interact with a Foundation Model. The endpoint must be a Databricks Model Serving
-                            endpoint accessible from this workspace.
+                            to interact with a Foundation Model. AI Gateway services are listed first and
+                            require <code>USE CATALOG</code>, <code>USE SCHEMA</code>, and <code>EXECUTE</code>.
                         </div>
                     </div>
 
                     <!-- ======== Triple Store Tab ======== -->
                     <div class="tab-pane fade" id="panel-triplestore" role="tabpanel" aria-labelledby="tab-triplestore">
 
-                        <!-- Dual Digital Twin explanation -->
-                        <div class="alert alert-light border mb-4">
-                            <h6 class="alert-heading mb-2"><i class="bi bi-lightning-charge me-1"></i> Dual Digital Twin</h6>
-                            <p class="small mb-2">When you build the Digital Twin, OntoBricks creates two complementary representations:</p>
+                        <!-- Graph Backend selection (mandatory, per-domain) -->
+                        <fieldset class="mb-4" id="domainGraphBackendCards">
+                            <legend class="form-label fw-semibold">
+                                <i class="bi bi-hdd-network me-1"></i> Graph Backend <span class="text-danger">*</span>
+                            </legend>
+                            <select class="form-select domain-editable d-none" id="domainGraphBackend"
+                                    aria-hidden="true" tabindex="-1"
+                                    data-saved-value="{{ domain.graph_backend or 'lakebase' }}">
+                                <option value="lakebase" {% if (domain.graph_backend or 'lakebase') == 'lakebase' %}selected{% endif %}>Lakebase (Postgres)</option>
+                                <option value="databricks" {% if domain.graph_backend == 'databricks' %}selected{% endif %}>Lakehouse</option>
+                                <option value="neo4j" {% if domain.graph_backend == 'neo4j' %}selected{% endif %}>Neo4j</option>
+                                <option value="none" {% if domain.graph_backend == 'none' %}selected{% endif %}>No Backend (ontology only)</option>
+                            </select>
+
+                            <div class="domain-backend-grid">
+                                <div class="domain-backend-choice">
+                                    <input class="domain-editable domain-backend-option" type="radio"
+                                           name="domainGraphBackendChoice" id="domainGraphBackendLakebase"
+                                           value="lakebase"
+                                           {% if (domain.graph_backend or 'lakebase') == 'lakebase' %}checked{% endif %}>
+                                    <label class="domain-backend-card" for="domainGraphBackendLakebase">
+                                        <i class="bi bi-check-circle-fill domain-backend-check" aria-hidden="true"></i>
+                                        <span class="domain-backend-logo">
+                                            <span class="ob-brand-icon ob-icon-postgresql" aria-hidden="true"></span>
+                                        </span>
+                                        <span class="domain-backend-title">Lakebase</span>
+                                        <span class="domain-backend-description">Managed PostgreSQL graph storage.</span>
+                                    </label>
+                                </div>
+                                <div class="domain-backend-choice">
+                                    <input class="domain-editable domain-backend-option" type="radio"
+                                           name="domainGraphBackendChoice" id="domainGraphBackendLakehouse"
+                                           value="databricks"
+                                           {% if domain.graph_backend == 'databricks' %}checked{% endif %}>
+                                    <label class="domain-backend-card" for="domainGraphBackendLakehouse">
+                                        <i class="bi bi-check-circle-fill domain-backend-check" aria-hidden="true"></i>
+                                        <span class="domain-backend-logo">
+                                            <span class="ob-brand-icon ob-icon-lakehouse" aria-hidden="true"></span>
+                                        </span>
+                                        <span class="domain-backend-title">Lakehouse</span>
+                                        <span class="domain-backend-description">Delta tables in Unity Catalog.</span>
+                                    </label>
+                                </div>
+                                <div class="domain-backend-choice">
+                                    <input class="domain-editable domain-backend-option" type="radio"
+                                           name="domainGraphBackendChoice" id="domainGraphBackendNeo4j"
+                                           value="neo4j"
+                                           {% if domain.graph_backend == 'neo4j' %}checked{% endif %}>
+                                    <label class="domain-backend-card" for="domainGraphBackendNeo4j">
+                                        <i class="bi bi-check-circle-fill domain-backend-check" aria-hidden="true"></i>
+                                        <span class="domain-backend-logo">
+                                            <span class="ob-brand-icon ob-icon-neo4j" aria-hidden="true"></span>
+                                        </span>
+                                        <span class="domain-backend-title">Neo4j</span>
+                                        <span class="domain-backend-description">External native graph database.</span>
+                                    </label>
+                                </div>
+                                <div class="domain-backend-choice">
+                                    <input class="domain-editable domain-backend-option" type="radio"
+                                           name="domainGraphBackendChoice" id="domainGraphBackendNone"
+                                           value="none"
+                                           {% if domain.graph_backend == 'none' %}checked{% endif %}>
+                                    <label class="domain-backend-card" for="domainGraphBackendNone">
+                                        <i class="bi bi-check-circle-fill domain-backend-check" aria-hidden="true"></i>
+                                        <span class="domain-backend-logo domain-backend-logo--neutral">
+                                            <i class="bi bi-slash-circle" aria-hidden="true"></i>
+                                        </span>
+                                        <span class="domain-backend-title">No Backend</span>
+                                        <span class="domain-backend-description">Ontology only, with no knowledge graph.</span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <small class="text-muted d-block mt-2">
+                                Connection settings are configured under <a href="/settings">Settings</a>.
+                            </small>
+                            <div class="alert alert-warning border small mt-2 py-2 mb-0 {% if domain.graph_backend == 'none' %}d-none{% endif %}"
+                                 id="graphBackendMigrationNotice">
+                                <i class="bi bi-exclamation-triangle me-1"></i>
+                                Changing the backend requires rebuilding the Knowledge Graph — existing graph
+                                artifacts in the previous backend are not migrated.
+                            </div>
+                            <!-- Shown only when backend = No Backend (JS toggles d-none) -->
+                            <div class="alert alert-info border small mt-2 py-2 mb-0 {% if domain.graph_backend != 'none' %}d-none{% endif %}" id="noBackendNotice">
+                                <i class="bi bi-diagram-2 me-1"></i>
+                                <strong>Ontology-only domain.</strong> No graph is built: the
+                                <strong>Mapping</strong> and <strong>Knowledge Graph</strong> features are disabled,
+                                the graph MCP tools are turned off (only <code>describe_ontology</code> is exposed),
+                                and the domain can be submitted for review and published on its ontology alone.
+                            </div>
+                        </fieldset>
+
+                        <!-- Access type (shown only when backend = Lakehouse) -->
+                        <div class="mb-4 {% if domain.graph_backend != 'databricks' %}d-none{% endif %}" id="lakehouseMaterializationSection">
+                            <label for="domainLakehouseMaterialization" class="form-label fw-semibold">
+                                <i class="bi bi-layers me-1"></i> Access type
+                            </label>
+                            <select class="form-select domain-editable" id="domainLakehouseMaterialization"
+                                    data-saved-value="{{ domain.lakehouse_materialization or 'view' }}">
+                                <option value="view" {% if (domain.lakehouse_materialization or 'view') != 'table' %}selected{% endif %}>Views only &mdash; no data copy</option>
+                                <option value="table" {% if domain.lakehouse_materialization == 'table' %}selected{% endif %}>Materialized - Faster but needs refresh</option>
+                            </select>
+                            <small class="text-muted">
+                                <i class="bi bi-info-circle me-1"></i>How the mapped triples
+                                (<code>&hellip;_data</code>) are stored. <strong>Materialized</strong> copies them
+                                into a clustered Delta table at build time. <strong>Views only</strong> creates a
+                                pass-through view over the Triple-Store Gateway instead &mdash; nothing is
+                                duplicated and queries always read live source data.
+                            </small>
+                            <div class="alert alert-light border small mt-2 py-2 mb-0">
+                                <i class="bi bi-lightbulb me-1"></i>
+                                In <strong>Views only</strong> mode, builds are near-instant and no storage is
+                                consumed, but every graph query re-runs the mapping SQL against your source
+                                tables. Inferred triples (reasoning, cohorts) always keep their own Delta table,
+                                and Graph Analytics materializes a temporary snapshot for the duration of a run.
+                            </div>
+                        </div>
+
+                        <!-- Search cache (Lakehouse + Lakebase companions) -->
+                        <div class="mb-4 {% if (domain.graph_backend or 'lakebase') not in ['databricks', 'lakebase'] %}d-none{% endif %}"
+                             id="searchCacheSection">
+                            <div class="d-flex align-items-center justify-content-between mb-1">
+                                <label class="form-label fw-semibold mb-0" for="domainGraphCacheEnabled">
+                                    <i class="bi bi-lightning-charge me-1"></i> Search cache
+                                </label>
+                                <div class="form-check form-switch mb-0">
+                                    <input class="form-check-input domain-editable" type="checkbox"
+                                           id="domainGraphCacheEnabled"
+                                           {% if domain.graph_cache_enabled is not defined or domain.graph_cache_enabled %}checked{% endif %}
+                                           data-saved-value="{{ 'true' if (domain.graph_cache_enabled is not defined or domain.graph_cache_enabled) else 'false' }}">
+                                    <label class="form-check-label" for="domainGraphCacheEnabled">Enabled</label>
+                                </div>
+                            </div>
+                            <small class="text-muted d-block">
+                                <i class="bi bi-info-circle me-1"></i>
+                                Materialized indexes (adjacency, entity-search, properties) speed
+                                Explorer Preview, expansion, GraphQL lists, and MCP
+                                <code>describe_entity</code>. Turn off to always read the live
+                                triple relation — Lakehouse Views only then hits source mapping SQL.
+                            </small>
+                            <div class="small mt-2" id="searchCacheStatusLine"></div>
+                        </div>
+
+                        <!-- Neo4j connection selector (shown only when backend = neo4j) -->
+                        <div class="mb-4 {% if domain.graph_backend != 'neo4j' %}d-none{% endif %}" id="neo4jDatabaseSection">
+                            <label for="domainNeo4jDatabase" class="form-label fw-semibold">
+                                <i class="bi bi-database me-1"></i> Neo4j Connection <span class="text-danger">*</span>
+                            </label>
+                            <div class="input-group">
+                                <select class="form-select domain-editable" id="domainNeo4jDatabase"
+                                        data-saved-value="{{ domain.neo4j_connection or '' }}" required>
+                                    {% if domain.neo4j_connection %}
+                                    <option value="{{ domain.neo4j_connection }}" selected>{{ domain.neo4j_connection }}</option>
+                                    {% else %}
+                                    <option value="" selected disabled>— Select a Neo4j connection —</option>
+                                    {% endif %}
+                                </select>
+                                <button class="btn btn-outline-secondary" type="button" id="btnRefreshNeo4jDatabases"
+                                        title="Refresh Settings → Neo4j connections">
+                                    <i class="bi bi-arrow-clockwise"></i>
+                                </button>
+                            </div>
+                            <small class="text-muted">
+                                <i class="bi bi-info-circle me-1"></i>Named connections are managed in
+                                <a href="/settings?section=neo4j">Settings → Neo4j</a>. Each connection
+                                includes URI, database, username, and Databricks secret.
+                            </small>
+                            <div id="neo4jDatabaseHelp" class="small mt-1"></div>
+                        </div>
+
+                        <!-- Dual Knowledge Graph explanation -->
+                        <div class="alert alert-light border mb-4 {% if domain.graph_backend == 'none' %}d-none{% endif %}"
+                             id="dualKnowledgeGraphSection">
+                            <h6 class="alert-heading mb-2"><i class="bi bi-lightning-charge me-1"></i> Dual Knowledge Graph</h6>
+                            <p class="small mb-2">When you build the Knowledge Graph, OntoBricks creates two complementary representations:</p>
                             <ul class="small mb-0">
-                                <li><strong>Triple-Store</strong> &mdash; a SQL VIEW in Unity Catalog that maps directly to your source data with no duplication. Used for <em>Quality</em> checks.</li>
-                                <li><strong>Graph Database</strong> &mdash; a Graph DB embedded graph for <em>Knowledge Graph</em> exploration, <em>GraphQL</em> queries, and <em>API</em> access.</li>
+                                <li><strong>Triple-Store Gateway</strong> &mdash; a SQL VIEW in Unity Catalog that maps directly to your source data with no duplication. Used for <em>Quality</em> checks.</li>
+                                <li><strong>Graph Database</strong> &mdash; a Graph DB embedded graph for <em>Graph Viewer</em> exploration, <em>GraphQL</em> queries, and <em>API</em> access.</li>
                             </ul>
                         </div>
 
-                        <!-- Triple-Store configuration (read-only, derived from registry) -->
-                        <div class="mb-4">
+                        <!-- Triple-Store Gateway configuration (read-only, derived from registry) -->
+                        <div class="mb-4 {% if domain.graph_backend == 'none' %}d-none{% endif %}"
+                             id="tripleStoreGatewaySection">
                             <label class="form-label fw-semibold">
-                                <i class="bi bi-eye me-1"></i> Triple-Store <small class="text-muted">(Unity Catalog)</small>
+                                <i class="bi bi-eye me-1"></i> Triple-Store Gateway <small class="text-muted">(Unity Catalog)</small>
                             </label>
                             <div class="input-group">
                                 <span class="input-group-text bg-light"><i class="bi bi-database"></i></span>
                                 <input type="text" class="form-control font-monospace ob-form-readonly-muted" id="domainTriplestoreFullName"
                                        value="{% if domain.delta.catalog and domain.delta.schema and domain.delta.table_name %}{{ domain.delta.catalog }}.{{ domain.delta.schema }}.{{ domain.delta.table_name }}{% endif %}"
-                                       readonly placeholder="Configure the registry in Settings to enable the Triple-Store">
+                                       readonly placeholder="Configure the registry in Settings to enable the Triple-Store Gateway">
                             </div>
                             <small class="text-muted">
-                                <i class="bi bi-info-circle me-1"></i>The Triple-Store VIEW is always created in the
+                                <i class="bi bi-info-circle me-1"></i>The Triple-Store Gateway VIEW is always created in the
                                 registry's <strong>catalog.schema</strong>.  Its name is derived from the domain
                                 name and version (<code>triplestore_&lt;domain&gt;_V&lt;version&gt;</code>).
                             </small>
                         </div>
 
-                        <!-- Graph Database info (read-only, computed) -->
-                        <div class="mb-3">
-                            <label class="form-label fw-semibold">
-                                <i class="bi bi-diagram-3 me-1"></i> Graph Database <small class="text-muted">(Graph DB)</small>
-                            </label>
+                        <!-- Data access & permissions for the selected backend -->
+                        <div class="alert alert-light border mb-0 {% if domain.graph_backend == 'none' %}d-none{% endif %}"
+                             id="graphAccessInfoSection">
+                            <h6 class="alert-heading mb-2"><i class="bi bi-shield-lock me-1"></i> Data Access &amp; Permissions</h6>
+                            <p class="small mb-3">
+                                Whose identity a graph read runs under depends on the backend selected above.
+                                In Databricks Apps every graph read also requires <strong>Team membership</strong>
+                                on this domain (<em>Viewer</em> role or higher); App administrators bypass, and
+                                these checks are disabled in local development.
+                            </p>
 
-                            <div class="alert alert-light border small mb-2 py-2">
-                                <strong><i class="bi bi-database me-1"></i>Lakebase (Postgres)</strong>
-                                <p class="mb-1 mt-2 small">
-                                    Graph triples are stored in the App-bound Lakebase Postgres instance.
-                                    The logical table name follows your domain and version
-                                    (<span id="graphLakebaseLogicalTable" class="font-monospace">{{ graph_name|default('', true) }}</span>).
-                                    Schema and database are configured under <em>Settings → Graph DB</em>.
-                                </p>
-                                <p class="mb-0 small text-muted">
-                                    Postgres is the source of truth for the graph store.
-                                </p>
+                            {% set _backend = domain.graph_backend or 'lakebase' %}
+
+                            <!-- Lakehouse (Unity Catalog) — OBO -->
+                            <div class="graph-access-detail {% if _backend != 'databricks' %}d-none{% endif %}"
+                                 data-backend="databricks">
+                                <div class="fw-semibold mb-1">
+                                    <i class="bi bi-hdd-network me-1"></i>Lakehouse <span class="text-muted">(Unity Catalog)</span>
+                                </div>
+                                <ul class="small mb-0">
+                                    <li><strong>Reads run as</strong> the signed-in user &mdash;
+                                        <i class="bi bi-check-circle-fill text-success me-1"></i>on-behalf-of (OBO).</li>
+                                    <li><strong>Read requires</strong> the caller's own Unity Catalog grants on the
+                                        data (<code>USE CATALOG</code> / <code>USE SCHEMA</code> / <code>SELECT</code>,
+                                        and <code>EXECUTE</code> for functions) <em>and</em> Team Viewer+.</li>
+                                    <li>A user who lacks the required UC grants is <strong>denied</strong> &mdash; the
+                                        read never silently falls back to the service principal.</li>
+                                    <li>The <strong>build</strong> (materialising the graph) runs as the app service
+                                        principal, not the user.</li>
+                                </ul>
+                            </div>
+
+                            <!-- Lakebase (Postgres) — no OBO -->
+                            <div class="graph-access-detail {% if _backend != 'lakebase' %}d-none{% endif %}"
+                                 data-backend="lakebase">
+                                <div class="fw-semibold mb-1">
+                                    <i class="bi bi-database me-1"></i>Lakebase <span class="text-muted">(Postgres)</span>
+                                </div>
+                                <ul class="small mb-0">
+                                    <li><strong>Reads run as</strong> the app service principal &mdash;
+                                        <i class="bi bi-dash-circle text-muted me-1"></i>no OBO (Postgres carries no
+                                        Unity Catalog identity).</li>
+                                    <li><strong>Read requires</strong> Team membership on this domain
+                                        (Viewer role or higher); the query is pinned to this domain's graph table.</li>
+                                    <li>Both reads and the build use the same service-principal identity.</li>
+                                </ul>
+                            </div>
+
+                            <!-- Neo4j — no OBO -->
+                            <div class="graph-access-detail {% if _backend != 'neo4j' %}d-none{% endif %}"
+                                 data-backend="neo4j">
+                                <div class="fw-semibold mb-1">
+                                    <i class="bi bi-diagram-3 me-1"></i>Neo4j
+                                </div>
+                                <ul class="small mb-0">
+                                    <li><strong>Reads run as</strong> the stored Bolt profile
+                                        (<a href="/settings?section=neo4j">Settings &rarr; Neo4j</a>) &mdash;
+                                        <i class="bi bi-dash-circle text-muted me-1"></i>no OBO.</li>
+                                    <li><strong>Read requires</strong> Team membership on this domain
+                                        (Viewer role or higher); queries are pinned to this domain's Neo4j database.</li>
+                                    <li>Both reads and the build use the same Bolt profile identity.</li>
+                                </ul>
                             </div>
                         </div>
                     </div>
 
+                    <!-- ======== MCP Tab ======== -->
+                    <div class="tab-pane fade" id="panel-mcp" role="tabpanel" aria-labelledby="tab-mcp">
+
+                        <div class="alert alert-light border small mb-4">
+                            <i class="bi bi-info-circle me-1"></i>
+                            Controls what an MCP client (Databricks Playground, Claude, an agent) sees
+                            when it selects this domain. Settings apply as soon as the client calls
+                            <code>select_domain</code> &mdash; no MCP server restart. They have no effect
+                            on this authoring UI, which always shows the full ontology.
+                        </div>
+
+                        <!-- Exposed tools -->
+                        <div class="mb-4">
+                            <div class="d-flex align-items-center justify-content-between mb-2">
+                                <label class="form-label fw-semibold mb-0">
+                                    <i class="bi bi-tools me-1"></i> Exposed Tools
+                                </label>
+                                <div class="form-check mb-0">
+                                    <input class="form-check-input domain-editable" type="checkbox" id="mcpToolsSelectAll">
+                                    <label class="form-check-label small text-muted" for="mcpToolsSelectAll">Select all</label>
+                                </div>
+                            </div>
+                            <div class="row" id="mcpToolsList">
+                                {% for tool in domain.mcp_domain_tools %}
+                                <div class="col-md-6 mb-2">
+                                    <div class="form-check">
+                                        <input class="form-check-input domain-editable js-mcp-tool" type="checkbox"
+                                               id="mcpTool_{{ tool.name }}" data-tool-name="{{ tool.name }}"
+                                               data-requires-graph="{{ 'true' if tool.requires_graph else 'false' }}"
+                                               {% if tool.name not in (domain.mcp_policy.get('disabled_tools') or []) %}checked{% endif %}>
+                                        <label class="form-check-label" for="mcpTool_{{ tool.name }}">
+                                            {{ tool.label }}
+                                            <code class="small text-muted ms-1">{{ tool.name }}</code>
+                                            <span class="d-block small text-muted">{{ tool.description }}</span>
+                                        </label>
+                                    </div>
+                                </div>
+                                {% endfor %}
+                            </div>
+                            <small class="text-muted d-block mt-2">
+                                <i class="bi bi-shield-lock me-1"></i>Always exposed (they run before a domain
+                                is selected, so no per-domain policy can hide them):
+                                {% for name in domain.mcp_registry_tools %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+                            </small>
+                        </div>
+
+                        <!-- Ontology context -->
+                        <div class="mb-2">
+                            <label class="form-label fw-semibold">
+                                <i class="bi bi-diagram-3 me-1"></i> Ontology Context
+                            </label>
+                            <p class="small text-muted">
+                                How the ontology attachments are surfaced to the model.
+                                <strong>Preferred</strong> turns the hint into a directive instruction;
+                                <strong>Disabled</strong> withholds the element from every MCP response.
+                            </p>
+                            {% for feature in domain.mcp_context_features %}
+                            <div class="row align-items-center mb-2">
+                                <div class="col-md-8">
+                                    <label class="form-label mb-0" for="mcpContext_{{ feature.name }}">{{ feature.label }}</label>
+                                    <span class="d-block small text-muted">{{ feature.description }}</span>
+                                </div>
+                                <div class="col-md-4">
+                                    {% set mode = (domain.mcp_policy.get('context') or {}).get(feature.name, 'normal') %}
+                                    <select class="form-select form-select-sm domain-editable js-mcp-context"
+                                            id="mcpContext_{{ feature.name }}" data-feature-name="{{ feature.name }}">
+                                        <option value="preferred" {% if mode == 'preferred' %}selected{% endif %}>Preferred</option>
+                                        <option value="normal" {% if mode == 'normal' %}selected{% endif %}>Normal</option>
+                                        <option value="disabled" {% if mode == 'disabled' %}selected{% endif %}>Disabled</option>
+                                    </select>
+                                </div>
+                            </div>
+                            {% endfor %}
+                        </div>
+
+                        <div class="alert alert-warning border small mt-3 py-2 mb-0">
+                            <i class="bi bi-exclamation-triangle me-1"></i>
+                            Disabling <strong>Actions</strong> also refuses <code>invoke_entity_action</code>
+                            calls, even when that tool stays checked above.
+                        </div>
+                    </div>
+
                 </div>
-            </form>
-        </div>
     </div>
+    </form>
 </div>

@@ -1,0 +1,237 @@
+## Fix stale references in Claude skills
+
+Context: Review of the project skills (.claude/skills/) surfaced three files
+that had drifted from the canonical rules and the real toolchain: the
+changelog skill documented a flat changelogs/YYYY-MM-DD.log path while
+.cursorrules requires changelogs/v<version>/<user>_<date>.log; the deploy
+skill pointed at non-existent paths and a non-existent deploy-prod target;
+the ai-feature skill referenced renamed plugin skills and a hardcoded
+user-local path.
+
+Changes:
+
+1. .claude/skills/changelog/SKILL.md
+   Path convention corrected to changelogs/vX.Y.Z/<github-user>_YYYY-MM-DD.log
+   with the version taken from pyproject.toml (matches .cursorrules).
+2. .claude/skills/deploy/SKILL.md
+   Fixed docs/deployment.md and scripts/deploy.config.sh paths, replaced the
+   non-existent databricks-authentication skill reference with
+   databricks-core/databricks-setup-local, and removed the contradictory
+   make deploy-prod suggestion from the release flow.
+3. .claude/skills/ai-feature/SKILL.md
+   Corrected plugin skill names (databricks-synthetic-data-gen,
+   databricks-mlflow-evaluation), dropped a hardcoded /Users/... path and a
+   non-existent agent-evaluation skill, and updated the stale "5 agents,
+   zero eval coverage" premise to the current 10-agent, partial-coverage
+   reality.
+
+Modified files:
+- .claude/skills/changelog/SKILL.md
+- .claude/skills/deploy/SKILL.md
+- .claude/skills/ai-feature/SKILL.md
+- changelogs/v0.9.2/alexxx-db_2026-11-12.log
+
+Tests: uv run --frozen pytest -q -m "not scenario" → 2 failed, 9650 passed,
+338 skipped in 935.6s. The 2 failures are pre-existing and unrelated:
+tests/units/settings/test_deploy_instance_id.py expects INSTANCE_ID "09x"
+while committed scripts/deploy.config.sh defaults to "abacus" (commit
+1fe10093).
+
+## Correct stale script path and health-route references
+
+Context: During the Databricks best-practices / least-privilege review, two
+classes of stale references were found: source comments and user-facing
+warning messages pointed operators at scripts/bootstrap-lakebase-perms.sh
+(moved to scripts/bootstrap/lakebase-perms.sh), and the deploy skill told
+agents to probe /healthz (the liveness route is /health).
+
+Changes:
+
+1. src/, scripts/, docs/
+   Replaced 20+ occurrences of bootstrap-lakebase-perms.sh with
+   scripts/bootstrap/lakebase-perms.sh in docstrings, operator-facing warning
+   strings, preflight messages, and deployment/backend docs.
+2. .claude/skills/deploy/SKILL.md
+   Post-deploy probe corrected from /healthz to /health (the real liveness
+   route; deep diagnostics stay admin-only at /settings/diagnostics/readiness).
+
+Modified files:
+- .claude/skills/deploy/SKILL.md
+- docs/backend.md, docs/deployment.md
+- scripts/_internal/_deploy-preflight.sh, _lakebase_preflight.py,
+  check-deploy-prerequisites.sh, scripts/deploy.sh
+- src/api/routers/internal/settings.py
+- src/back/core/databricks/lakebase/grants.py
+- src/back/core/graphdb/lakebase/LakebaseGraphProvisioner.py
+- src/back/core/graphdb/lakebase/SyncedTableManager.py
+- src/back/objects/domain/settings/RegistrySettings.py
+- src/back/objects/domain/settings/graphengine/GraphEngineLakebaseSettings.py
+- src/back/objects/registry/store/lakebase/Bootstrap.py, Catalog.py, Schedules.py
+- src/shared/fastapi/health.py
+
+Tests: uv run --frozen pytest -q tests/units/settings tests/units/scripts
+tests/units/registry tests/units/shared tests/units/graphdb → 2389 passed,
+2 failed in 12.6s (same pre-existing test_deploy_instance_id failures —
+INSTANCE_ID "09x" vs committed "abacus"; unrelated to this change).
+
+---
+
+## Least-privilege grants: superuser opt-in + schema-scoped UC readback
+
+Context: regulated-industry posture — provisioning previously granted
+DATABRICKS_SUPERUSER to every workspace admin (Postgres superuser bypasses
+all schema ACLs) and the UC readback grant was catalog-wide ALL_PRIVILEGES.
+Both are now narrow-by-default with deliberate opt-ins for the broad paths.
+
+Changes:
+
+1. LakebaseGraphProvisioner + provision_steps (src/back/core/graphdb/lakebase/)
+   New grant_superusers flag (default False). The "superusers" task step and
+   _step_grant_superuser_to_managers only run when the caller opts in via the
+   provision payload. Individual operators can still be promoted on demand
+   through the existing lakebase-grant-superuser settings action.
+
+2. grant_uc_catalog (src/back/core/databricks/lakebase/grants.py)
+   New uc_schema parameter. When set, grants USE_CATALOG on the catalog plus
+   USE_SCHEMA,SELECT on <catalog>.<schema> (covers all current+future synced
+   tables) instead of catalog-wide ALL_PRIVILEGES — now documented as the
+   development-only fallback. Both call sites (graph provisioner, registry
+   Bootstrap) pass their schema, so the in-app path is least-privilege by
+   default.
+
+3. scripts/bootstrap/lakebase-perms.sh
+   New -S/--uc-schema flag selecting the same least-privilege grant shape;
+   -c without -S keeps the catalog-wide ALL_PRIVILEGES shortcut with an
+   explicit "dev shortcut" message.
+
+4. databricks.yml
+   Hardcoded "group_name: users" on both app ACLs replaced with
+   ${var.app_access_group} (default "users") so regulated installs can scope
+   app access to a real group via --var or deploy.config.sh.
+
+5. Settings UI (settings.html + settings.js)
+   Provision dialog: UC checkbox label updated to "schema-scoped readback";
+   new opt-in checkbox "Promote workspace admins to DATABRICKS_SUPERUSER".
+
+6. search_path hardening
+   Schema name now escapes embedded double quotes before interpolation into
+   SET search_path in LakebaseConnectionPool, LakebaseFlatStore and
+   LakebaseBase (5 sites).
+
+7. docs/deployment.md
+   Grant matrix and lakebase-perms.sh section updated: schema-scoped
+   USE_CATALOG+USE_SCHEMA,SELECT documented as the production path;
+   ALL_PRIVILEGES demoted to a development shortcut for pre-schema deploys.
+
+Modified files:
+- databricks.yml
+- docs/deployment.md
+- scripts/bootstrap/lakebase-perms.sh
+- src/back/core/databricks/lakebase/grants.py
+- src/back/core/databricks/lakebase/LakebaseConnectionPool.py
+- src/back/core/graphdb/lakebase/LakebaseGraphProvisioner.py
+- src/back/core/graphdb/lakebase/LakebaseBase.py, LakebaseFlatStore.py
+- src/back/objects/domain/settings/graphengine/GraphEngineLakebaseSettings.py
+- src/back/objects/registry/store/lakebase/Bootstrap.py
+- src/front/static/config/js/settings.js, src/front/templates/settings.html
+- tests/units/settings/test_lakebase_provision.py
+- tests/units/registry/test_v090_lakebase_bootstrap.py
+
+Tests: uv run --frozen pytest -q tests/units/settings/test_lakebase_provision.py
+tests/units/registry/test_v090_lakebase_bootstrap.py
+tests/units/settings/test_v090_graph_engine_lakebase.py → 110 passed.
+Full suite: uv run --frozen pytest -q -m "not scenario" -> 9649 passed,
+338 skipped, 5 failed. Three were introduced and fixed in this change
+(size-budget growth + literal "users" group assertion — verified green in
+targeted re-run of tests/units/architecture + test_bundle_job_resource);
+the remaining two are the pre-existing test_deploy_instance_id failures
+(INSTANCE_ID "09x" vs committed "abacus" config — unrelated).
+
+---
+
+## Connection health hardening: SEA poll backoff + idle-conn ping
+
+Context: two scale/reliability items from the Databricks review —
+fixed-interval SEA polling generated needless API chatter on long-running
+statements, and the Lakebase pool lent silently-dead sockets because
+``conn.closed`` only sees locally-observed shutdowns.
+
+Changes:
+
+1. StatementExecutionWarehouse (src/back/core/databricks/)
+   Poll interval now doubles from 0.2 s and clamps at 1 s
+   (_POLL_INTERVAL_MAX_SECONDS) inside _wait_for_terminal. Short
+   statements still finish inside the first fast checks; long-running
+   ones settle into a 1 s cadence.
+
+2. LakebaseConnectionPool (src/back/core/databricks/lakebase/)
+   Idle entries now carry idle_since; on checkout a connection parked
+   longer than POOL_PING_IDLE_S (30 s, in constants.py) is verified with
+   SELECT 1 before being lent out. The ping runs outside the pool lock
+   (acquire was restructured: pick/reserve under the lock, slow work
+   outside it). A failed ping discards the connection and re-enters
+   acquire. Both pool consumers (registry + graph) share the fix.
+
+Modified files:
+- src/back/core/databricks/StatementExecutionWarehouse.py
+- src/back/core/databricks/lakebase/LakebaseConnectionPool.py
+- src/back/core/databricks/lakebase/constants.py
+- tests/back/core/databricks/test_lakebase_connection_pool.py (new)
+- tests/units/core/test_statement_execution_warehouse.py
+
+Tests: uv run --frozen pytest on touched areas →
+13 passed (pool + SEA suites, incl. new backoff/ping cases),
+100 passed (architecture + registry store regression).
+
+---
+
+## deploy.sh least-privilege UC wiring + instance-id test fix
+
+Context: finishing the least-privilege rollout — deploy.sh still invoked
+lakebase-perms.sh with -c only (catalog-wide ALL_PRIVILEGES), and two
+pre-existing test_deploy_instance_id failures pinned a stale demo id.
+
+Changes:
+
+1. deploy.sh
+   The Lakebase bootstrap call now passes -S "${UC_SCHEMA:-$LAKEBASE_SCHEMA}"
+   alongside -c, so deploys apply the schema-scoped grant set by default.
+   UC_SCHEMA env overrides; the re-run hint echoes the same flags.
+
+2. lakebase-perms.sh + grants.py
+   The narrow grant's catalog privileges are now USE_CATALOG + CREATE_SCHEMA
+   (not just USE_CATALOG): CREATE_SCHEMA covers the first-deploy gap where
+   the UC sync schema does not exist yet — the SP can create it via the
+   synced-tables flow and owns it. This is the actual capability
+   ALL_PRIVILEGES was standing in for.
+
+3. test_deploy_instance_id.py
+   The two failing tests hardcoded the "09x" demo id while the committed
+   deploy.config.sh defaults to "abacus". They now read DEFAULT_INSTANCE_ID
+   from the config file and assert the derivation (suffixed app names +
+   DAB target), so they verify behaviour not a particular workspace.
+
+Modified files:
+- scripts/deploy.sh
+- scripts/bootstrap/lakebase-perms.sh
+- src/back/core/databricks/lakebase/grants.py
+- docs/deployment.md
+- tests/units/settings/test_deploy_instance_id.py
+- tests/units/settings/test_lakebase_provision.py (assertion strengthened)
+
+Tests: uv run --frozen pytest on touched areas → 74 passed, 0 failed.
+The two test_deploy_instance_id failures are resolved.
+
+hello-abacus: scaffold app from Hello Abacus spec (develop)
+  - Rendered copier template/ from specs/hello-abacus-develop.zip into
+    hello-abacus/ with project_name=hello-abacus, matching the spec's
+    generator defaults (.tmpl suffix stripped, {{ project_name }} and its
+    underscore form substituted, .copier-answers.yml written for develop).
+  - Carries the spec structure verbatim: slices+ports backend (health, me,
+    items; ports/kernel/adapters), React+Vite frontend, databricks.yml +
+    resources/, Atlas migrations, jobs, Seiji deploy hooks, scripts/check.sh.
+  - Atlas {{ .app_users_role }} vars and bundle ${var.*} left literal per spec;
+    no environment values invented.
+Tests: hello-abacus/scripts/check.sh backend+deploy — pytest, lint-imports,
+  manifest check, Seiji hook tests, fetch tests all pass; frontend/artifact/
+  migrations skipped (no pnpm or atlas reachable on this host).

@@ -194,7 +194,7 @@ const ReasoningModule = {
             btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span> Running inference…';
         } else {
             btn.disabled = false;
-            btn.innerHTML = '<i class="bi bi-play-fill me-1"></i> Run Inference';
+            btn.innerHTML = '<i class="bi bi-play-fill me-1"></i> Run';
         }
         checkboxes.forEach(el => {
             el.disabled = running;
@@ -550,6 +550,16 @@ const ReasoningModule = {
     },
 
     async runMaterialize() {
+        if (window.OB && typeof window.OB.canRefreshGraph === 'function'
+                && !window.OB.canRefreshGraph()) {
+            if (typeof showNotification === 'function')
+                showNotification(
+                    'Materialise is unavailable — builder access and an unlocked domain are required.',
+                    'warning'
+                );
+            return;
+        }
+
         const deltaChecked = document.getElementById('materializeDelta')?.checked || false;
         const graphChecked = document.getElementById('materializeGraph')?.checked || false;
         const tableName = (document.getElementById('materializeTableName')?.value || '').trim();
@@ -631,7 +641,7 @@ const ReasoningModule = {
                         } else if (area) {
                             const hint = document.createElement('div');
                             hint.className = 'small text-muted mt-1';
-                            hint.innerHTML = '<i class="bi bi-info-circle me-1"></i>Open the <strong>Knowledge Graph</strong> tab and reload to see the new triples.';
+                            hint.innerHTML = '<i class="bi bi-info-circle me-1"></i>Open the <strong>Graph Viewer</strong> tab and reload to see the new triples.';
                             area.appendChild(hint);
                         }
                     }

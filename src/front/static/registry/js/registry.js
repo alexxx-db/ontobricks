@@ -3,6 +3,141 @@
  * Registry page JavaScript – domain browsing and registry configuration
  */
 
+var registryGithubEnabled = false;
+
+function githubDomainDeleteExtras(enabled) {
+    return enabled
+        ? { checkboxLabel: 'Also delete this domain from GitHub', checkboxChecked: false }
+        : {};
+}
+
+function deleteGithubQuery(options) {
+    return options && options.checkboxChecked ? '?delete_github=1' : '';
+}
+
+function createRegistryVersionDeleteControl(v, domainName) {
+    if (!v.delete_control_visible) return null;
+
+    const version = String(v.version ?? '');
+    const reason = v.delete_block_reason || ('Delete version v' + version);
+    const wrapper = document.createElement('span');
+    wrapper.className = 'registry-version-delete-control';
+    wrapper.title = reason;
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-sm btn-outline-danger border-0 registry-delete-version-btn';
+    button.dataset.domain = String(domainName ?? '');
+    button.dataset.version = version;
+    button.setAttribute('data-requires-app', 'admin');
+    button.setAttribute('aria-label', 'Delete version v' + version);
+
+    if (v.deletes_domain) {
+        button.dataset.deletesDomain = '1';
+    }
+
+    if (v.can_delete) {
+        button.tabIndex = 0;
+    } else {
+        wrapper.tabIndex = 0;
+        button.disabled = true;
+        button.tabIndex = -1;
+    }
+
+    const icon = document.createElement('i');
+    icon.className = 'bi bi-trash';
+    icon.setAttribute('aria-hidden', 'true');
+    button.appendChild(icon);
+    wrapper.appendChild(button);
+    return wrapper;
+}
+
+async function deleteRegistryDomain(domainName) {
+    const options = {
+        title: 'Delete Domain',
+        message: 'Permanently delete domain "' + escapeHtml(domainName)
+            + '" and all its versions from the registry? This permanently '
+            + 'removes all Knowledge Store content and cannot be undone.',
+        confirmText: 'Delete',
+        confirmClass: 'btn-danger',
+        icon: 'trash',
+        ...githubDomainDeleteExtras(registryGithubEnabled)
+    };
+    const confirmed = await showConfirmDialog(options);
+    if (!confirmed) return;
+
+    try {
+        const resp = await fetch(
+            '/settings/registry/domains/' + encodeURIComponent(domainName) +
+                deleteGithubQuery(options),
+            { method: 'DELETE', credentials: 'same-origin' }
+        );
+        const data = await resp.json();
+        if (data.success) {
+            showNotification(data.message, 'success');
+            if (typeof invalidateRegistryBridges === 'function') {
+                invalidateRegistryBridges();
+            }
+            if (typeof loadRegistryDomains === 'function') {
+                loadRegistryDomains(true);
+            }
+        } else {
+            showNotification('Error: ' + data.message, 'error');
+        }
+    } catch (e) {
+        showNotification('Error deleting domain: ' + e.message, 'error');
+    }
+}
+
+async function deleteRegistryVersion(
+    domainName,
+    version,
+    refreshDomains = () => {},
+    invalidateBridges = () => {},
+    deletesDomain = false
+) {
+    const options = {
+        title: deletesDomain ? 'Delete last version and domain' : 'Delete Version',
+        message: deletesDomain
+            ? 'Version v' + escapeHtml(String(version))
+                + ' is the only version of "' + escapeHtml(String(domainName))
+                + '". Deleting it will also delete the domain and all Knowledge '
+                + 'Store content. This cannot be undone.'
+            : 'Permanently delete version v' + escapeHtml(String(version)) +
+                ' from domain "' + escapeHtml(String(domainName)) +
+                '"? This permanently removes its Knowledge Store content '
+                + 'and cannot be undone.',
+        confirmText: 'Delete',
+        confirmClass: 'btn-danger',
+        icon: 'trash',
+        ...githubDomainDeleteExtras(deletesDomain && registryGithubEnabled)
+    };
+    const confirmed = await showConfirmDialog(options);
+    if (!confirmed) return;
+
+    try {
+        const resp = await fetch(
+            '/settings/registry/domains/' + encodeURIComponent(domainName) +
+                '/versions/' + encodeURIComponent(version) +
+                deleteGithubQuery(options),
+            { method: 'DELETE', credentials: 'same-origin' }
+        );
+        const data = await resp.json();
+        if (resp.status === 409) {
+            showNotification(data.message || 'Version deletion is no longer allowed', 'error');
+            refreshDomains(true);
+        } else if (data.success) {
+            showNotification(data.message, 'success');
+            invalidateBridges();
+            refreshDomains(true);
+        } else {
+            showNotification('Error: ' + data.message, 'error');
+        }
+    } catch (e) {
+        showNotification('Error deleting version: ' + e.message, 'error');
+    }
+}
+
 document.addEventListener('DOMContentLoaded', function () {
 
     let registryConfigured = false;
@@ -51,15 +186,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     ? '<i class="bi bi-lock-fill text-muted me-1"></i> Configured via Databricks App resource binding (read-only)'
                     : '<i class="bi bi-gear text-muted me-1"></i> Configured via environment variables (<code>.env</code>) — restart the app to change';
             }
-            const btnInit = document.getElementById('btnInitRegistry');
-            if (btnInit) {
-                if (registryCfg.configured) {
-                    btnInit.style.display = 'none';
-                } else {
-                    btnInit.style.display = '';
-                    btnInit.disabled = false;
-                }
-            }
+            updateRegistryLabel();
         } catch (e) {
             console.error('Error loading registry config:', e);
             if (label) {
@@ -145,111 +272,7 @@ document.addEventListener('DOMContentLoaded', function () {
             }
         }
 
-        // Auto-load row counts the first time the panel is displayed,
-        // then keep them around — admins can re-fetch via the Refresh
-        // button. Skipped when not bound (no point hammering the API).
-        if (lb.bound && !panel.dataset.statsLoaded) {
-            panel.dataset.statsLoaded = '1';
-            loadLakebaseStats();
-        }
     }
-
-    async function loadLakebaseStats() {
-        const tbody = document.getElementById('lakebaseStatsBody');
-        const msg = document.getElementById('lakebaseStatsMessage');
-        const btn = document.getElementById('btnRefreshLakebaseStats');
-        if (!tbody) return;
-
-        if (btn) btn.disabled = true;
-        tbody.innerHTML = '<tr><td class="ps-0 text-muted" colspan="2"><span class="spinner-border spinner-border-sm me-1"></span> Loading row counts…</td></tr>';
-        if (msg) { msg.style.display = 'none'; msg.textContent = ''; }
-
-        try {
-            const resp = await fetch('/settings/registry/lakebase-stats', { credentials: 'same-origin' });
-            const data = await resp.json();
-            if (!data.success) {
-                tbody.innerHTML = '<tr><td class="ps-0 text-muted" colspan="2">'
-                    + '<i class="bi bi-exclamation-triangle text-warning me-1"></i> '
-                    + escapeHtml(data.message || 'Could not load Lakebase stats')
-                    + '</td></tr>';
-                return;
-            }
-            const rows = Array.isArray(data.tables) ? data.tables : [];
-            if (!rows.length) {
-                tbody.innerHTML = '<tr><td class="ps-0 text-muted" colspan="2">No tables to report.</td></tr>';
-                return;
-            }
-            const total = rows.reduce((s, r) => s + (Number(r.rows) || 0), 0);
-            tbody.innerHTML = rows.map(r => (
-                '<tr>'
-                + '<td class="ps-0 font-monospace">' + escapeHtml(r.name) + '</td>'
-                + '<td class="text-end pe-0 font-monospace">' + (Number(r.rows) || 0).toLocaleString() + '</td>'
-                + '</tr>'
-            )).join('') + (
-                '<tr class="border-top">'
-                + '<td class="ps-0 fw-semibold">Total</td>'
-                + '<td class="text-end pe-0 fw-semibold font-monospace">' + total.toLocaleString() + '</td>'
-                + '</tr>'
-            );
-            if (msg) {
-                if (data.initialized) {
-                    msg.style.display = '';
-                    msg.innerHTML = '<i class="bi bi-check-circle text-success me-1"></i> Schema <code>'
-                        + escapeHtml(data.schema || '') + '</code> initialized.';
-                } else {
-                    msg.style.display = '';
-                    // Reason-aware copy: ``no_usage`` is a permission
-                    // problem (admin must run bootstrap-lakebase-perms),
-                    // not a bare "not initialised" — surfacing it
-                    // explicitly avoids the misleading "0 rows /
-                    // not initialised" trap when data is actually
-                    // present but the SP can't see it.
-                    //
-                    // For ``no_usage`` we prefer the backend ``message``
-                    // verbatim because it now carries the live
-                    // ``(database, role, schema_exists)`` triplet the
-                    // probe ran against — operators need that to spot
-                    // grants that landed on a different database than
-                    // the one bound by the Apps ``postgres`` resource.
-                    const reason = data.reason || '';
-                    const detail = data.message || '';
-                    let inner;
-                    if (reason === 'no_usage') {
-                        if (detail) {
-                            inner = '<i class="bi bi-shield-exclamation text-danger me-1"></i> '
-                                + escapeHtml(detail);
-                        } else {
-                            inner = '<i class="bi bi-shield-exclamation text-danger me-1"></i> Schema <code>'
-                                + escapeHtml(data.schema || '') + '</code> visible but the app service principal '
-                                + 'lacks <code>USAGE</code>. Run <code>scripts/bootstrap-lakebase-perms.sh</code> '
-                                + '(or grant manually) and refresh.';
-                        }
-                    } else if (reason === 'connect_failed' || reason === 'table_count_failed') {
-                        inner = '<i class="bi bi-x-circle text-danger me-1"></i> '
-                            + escapeHtml(detail || 'Could not reach Lakebase.');
-                    } else if (reason === 'no_registry_row') {
-                        inner = '<i class="bi bi-exclamation-triangle text-warning me-1"></i> Schema <code>'
-                            + escapeHtml(data.schema || '') + '</code> exists but has no registry row — click <em>Initialize</em>.';
-                    } else {
-                        inner = '<i class="bi bi-exclamation-triangle text-warning me-1"></i> Schema <code>'
-                            + escapeHtml(data.schema || '') + '</code> not initialized — click <em>Initialize</em>, or run <code>scripts/migrate-registry-to-lakebase.sh</code> to import an existing Volume registry.';
-                    }
-                    msg.innerHTML = inner;
-                }
-            }
-        } catch (e) {
-            tbody.innerHTML = '<tr><td class="ps-0 text-muted" colspan="2">'
-                + '<i class="bi bi-x-circle text-danger me-1"></i> '
-                + escapeHtml(e.message || 'Network error')
-                + '</td></tr>';
-        } finally {
-            if (btn) btn.disabled = false;
-        }
-    }
-
-    document.getElementById('btnRefreshLakebaseStats')?.addEventListener('click', () => {
-        loadLakebaseStats();
-    });
 
     function updateRegistryLabel() {
         const schemaLabel = document.getElementById('registrySchemaLabel');
@@ -266,7 +289,16 @@ document.addEventListener('DOMContentLoaded', function () {
             // Volume line: volume name only
             const volName = registryCfg.volume || 'OntoBricksRegistry';
             if (volumeLabel) volumeLabel.innerHTML = '<span class="font-monospace">' + escapeHtml(volName) + '</span>';
-            if (initBtn) initBtn.style.display = registryCfg.configured ? 'none' : '';
+            if (initBtn) {
+                initBtn.style.display = '';
+                if (registryCfg.configured) {
+                    initBtn.className = 'btn btn-sm btn-outline-secondary';
+                    initBtn.innerHTML = '<i class="bi bi-arrow-up-circle me-1"></i> Apply upgrades';
+                } else {
+                    initBtn.className = 'btn btn-sm btn-primary';
+                    initBtn.innerHTML = '<i class="bi bi-plus-circle me-1"></i> Initialize';
+                }
+            }
         } else {
             const empty = '<span class="text-muted">—</span>';
             if (schemaLabel) schemaLabel.innerHTML = '<i class="bi bi-exclamation-triangle text-warning me-1"></i><span class="text-muted">Not configured</span>';
@@ -280,28 +312,35 @@ document.addEventListener('DOMContentLoaded', function () {
         const configDiv = document.getElementById('registryConfigStatus');
         registryConfigured = !!cfg.configured;
 
+        const setStatus = (html) => {
+            if (div) { div.style.display = 'block'; div.innerHTML = html; }
+            if (configDiv) { configDiv.style.display = 'block'; configDiv.innerHTML = html; }
+        };
+
         if (cfg.configured) {
-            if (div) div.style.display = 'none';
-            if (configDiv) configDiv.style.display = 'none';
+            setStatus(
+                '<p class="small text-success mb-0">' +
+                '<i class="bi bi-check-circle-fill me-1"></i>Registry is operational</p>'
+            );
             loadRegistryDomains();
         } else if (cfg.catalog && cfg.schema) {
             const msg = registryLocked
                 ? 'Registry volume is set via Databricks App resource but not yet initialized. Click <strong>Initialize</strong> to set up the registry.'
                 : 'Registry location set but not initialized yet. Click <strong>Initialize</strong> to create the volume.';
-            const alertHtml = '<div class="alert alert-warning small mb-0">' +
-                '<i class="bi bi-exclamation-triangle me-1"></i> ' + msg + '</div>';
-            if (div) { div.style.display = 'block'; div.innerHTML = alertHtml; }
-            if (configDiv) { configDiv.style.display = 'block'; configDiv.innerHTML = alertHtml; }
+            setStatus(
+                '<p class="small text-warning mb-0">' +
+                '<i class="bi bi-exclamation-triangle-fill me-1"></i>Registry is not operational — ' + msg + '</p>'
+            );
             const section = document.getElementById('registryDomainsSection');
             if (section) section.style.display = 'none';
         } else {
-            const notConfiguredAlert = '<div class="alert alert-warning small mb-0">' +
-                '<i class="bi bi-exclamation-triangle me-1"></i> Registry not configured. ' +
+            setStatus(
+                '<p class="small text-danger mb-0">' +
+                '<i class="bi bi-x-circle-fill me-1"></i>Registry is not operational — not configured. ' +
                 'Set <code>REGISTRY_CATALOG</code> / <code>REGISTRY_SCHEMA</code> / <code>LAKEBASE_SCHEMA</code> in <code>.env</code> ' +
                 '(local development) or bind the Volume and Lakebase resources in <code>app.yaml</code> ' +
-                '(Databricks Apps deployment), then restart the app.</div>';
-            if (div) { div.style.display = 'block'; div.innerHTML = notConfiguredAlert; }
-            if (configDiv) { configDiv.style.display = 'block'; configDiv.innerHTML = notConfiguredAlert; }
+                '(Databricks Apps deployment), then restart the app.</p>'
+            );
             const section = document.getElementById('registryDomainsSection');
             if (section) section.style.display = 'none';
         }
@@ -339,9 +378,47 @@ document.addEventListener('DOMContentLoaded', function () {
         return html;
     }
 
+    // --- Lifecycle status helpers ---
+
+    // Color map: DRAFT = amber/secondary, IN-REVIEW = blue/info,
+    // PUBLISHED = green/success (Bootstrap ``badge bg-*-subtle``).
+    const STATUS_BADGE = {
+        'DRAFT': { cls: 'bg-warning-subtle text-dark border-warning', icon: 'pencil', label: 'Draft' },
+        'IN-REVIEW': { cls: 'bg-info-subtle text-dark border-info', icon: 'eye', label: 'In Review' },
+        'PUBLISHED': { cls: 'bg-success-subtle text-dark border-success', icon: 'broadcast', label: 'Published' }
+    };
+
+    function statusBadge(status) {
+        const s = (status || 'DRAFT').toUpperCase();
+        const cfg = STATUS_BADGE[s] || STATUS_BADGE['DRAFT'];
+        return '<span class="badge ' + cfg.cls + ' border" style="font-size:.65rem;" ' +
+            'title="Lifecycle status: ' + escapeHtml(cfg.label) + '">' +
+            '<i class="bi bi-' + cfg.icon + ' me-1"></i>' + escapeHtml(cfg.label) + '</span>';
+    }
+
+    // Lifecycle/workflow actions are NOT surfaced here. The Browse view is
+    // read-only with respect to the review workflow: each version exposes a
+    // "Validate" button that loads the version (if needed) and jumps to the
+    // Domain → Validation workspace, the single place to drive the workflow.
+
     // --- Registry domain list ---
 
-    async function loadRegistryDomains() {
+    const DOMAINS_CACHE_TTL_MS = 15000;
+    let domainsLoadPromise = null;
+    let domainsLoadedAt = 0;
+
+    function loadRegistryDomains(force = false) {
+        const cacheIsFresh = Date.now() - domainsLoadedAt < DOMAINS_CACHE_TTL_MS;
+        if (!force && cacheIsFresh) return Promise.resolve();
+        if (domainsLoadPromise) return domainsLoadPromise;
+
+        domainsLoadPromise = _loadRegistryDomains()
+            .finally(() => { domainsLoadPromise = null; });
+        return domainsLoadPromise;
+    }
+    window.loadRegistryDomains = loadRegistryDomains;
+
+    async function _loadRegistryDomains() {
         const section = document.getElementById('registryDomainsSection');
         const listDiv = document.getElementById('registryDomainsList');
         if (!section || !listDiv) return;
@@ -365,6 +442,8 @@ document.addEventListener('DOMContentLoaded', function () {
                 return;
             }
 
+            domainsLoadedAt = Date.now();
+            registryGithubEnabled = !!data.github_enabled;
             const rows = data.domains || data.projects || [];
             if (!rows.length) {
                 listDiv.innerHTML = '<div class="text-muted small py-3 text-center">' +
@@ -372,11 +451,23 @@ document.addEventListener('DOMContentLoaded', function () {
                 return;
             }
 
+            const backendLabels = {
+                lakebase: 'Lakebase',
+                databricks: 'Lakehouse',
+                neo4j: 'Neo4j',
+            };
+            const backendIconClasses = {
+                lakebase: 'ob-icon-postgresql',
+                databricks: 'ob-icon-lakehouse',
+                neo4j: 'ob-icon-neo4j',
+            };
+            const versionDeleteControls = [];
             let html = '<div class="table-responsive registry-domain-table-wrapper">' +
                 '<table class="table table-sm table-hover align-middle mb-0 registry-domain-table">' +
                 '<thead><tr>' +
-                    '<th class="ps-3" style="width:20%;">Name</th>' +
-                    '<th style="width:30%;">URI</th>' +
+                    '<th class="ps-3" style="width:18%;">Name</th>' +
+                    '<th style="width:26%;">URI</th>' +
+                    '<th style="width:8rem;">Backend</th>' +
                     '<th>Description</th>' +
                     '<th class="text-center" style="width:5rem;">Versions</th>' +
                     '<th class="text-end pe-3" style="width:3rem;"></th>' +
@@ -389,10 +480,17 @@ document.addEventListener('DOMContentLoaded', function () {
                 const uri = d.base_uri
                     ? '<span class="font-monospace small">' + escapeHtml(d.base_uri) + '</span>'
                     : '<span class="fst-italic text-muted">—</span>';
+                const backendKey = (d.graph_backend || 'lakebase').toLowerCase();
+                const backendIcon = backendIconClasses[backendKey] || 'ob-icon-postgresql';
+                const backend = '<span class="badge bg-light text-dark border d-inline-flex align-items-center">' +
+                    '<i class="ob-brand-icon ' + backendIcon + ' me-1" aria-hidden="true"></i>' +
+                    escapeHtml(backendLabels[backendKey] || backendKey) + '</span>';
                 const versions = d.versions || [];
                 const vCount = versions.length;
                 const hasVersions = vCount > 0;
-                const activeVer = versions.find(v => typeof v === 'object' && v.active);
+                const publishedVer = versions.find(
+                    v => typeof v === 'object' && (v.status || '').toUpperCase() === 'PUBLISHED'
+                );
                 const rowId = 'reg-versions-' + idx;
                 const isCurrent = currentFolder && d.name === currentFolder;
                 const nameLabel = escapeHtml(d.name) +
@@ -403,63 +501,61 @@ document.addEventListener('DOMContentLoaded', function () {
                     : '<button type="button" class="btn btn-sm btn-outline-danger border-0 registry-delete-btn" data-requires-app="admin" ' +
                           'data-domain="' + escapeHtml(d.name) + '" title="Delete domain and all versions">' +
                           '<i class="bi bi-trash"></i></button>';
-                const versionsBadge = activeVer
+                const versionsBadge = publishedVer
                     ? '<span class="badge bg-secondary">' + vCount + '</span> ' +
-                      '<span class="badge bg-success-subtle text-success border-success" style="font-size:0.65rem;" title="Active: v' + escapeHtml(activeVer.version) + '">' +
-                          '<i class="bi bi-broadcast"></i> v' + escapeHtml(activeVer.version) +
+                      '<span class="badge bg-success-subtle text-dark border-success" style="font-size:0.65rem;" title="Published: v' + escapeHtml(publishedVer.version) + '">' +
+                          '<i class="bi bi-broadcast"></i> v' + escapeHtml(publishedVer.version) +
                       '</span>'
                     : '<span class="badge bg-secondary">' + vCount + '</span>';
                 html += '<tr class="registry-domain-row" data-target="' + rowId + '" style="cursor:pointer;">' +
                     '<td class="ps-3 fw-semibold text-nowrap">' +
                         '<i class="bi bi-chevron-right me-1 text-muted registry-chevron" style="font-size:0.7rem;transition:transform 0.15s;"></i>' +
-                        '<i class="bi bi-folder2 me-1 text-primary"></i>' +
+                        '<i class="bi bi-box me-1 text-primary"></i>' +
                         nameLabel +
                     '</td>' +
                     '<td class="text-muted text-truncate">' + uri + '</td>' +
+                    '<td class="text-nowrap">' + backend + '</td>' +
                     '<td class="text-muted text-truncate">' + desc + '</td>' +
                     '<td class="text-center">' + versionsBadge + '</td>' +
                     '<td class="text-end pe-3">' + deleteBtn + '</td>' +
                 '</tr>';
                 if (hasVersions) {
                     html += '<tr id="' + rowId + '" class="registry-version-panel" style="display:none;">' +
-                        '<td colspan="5" class="px-0 py-0">' +
+                        '<td colspan="6" class="px-0 py-0">' +
                         '<div class="registry-version-list">';
                     d.versions.forEach(v => {
                         const ver = typeof v === 'object' ? v.version : v;
-                        const isActive = typeof v === 'object' && v.active;
+                        const status = (typeof v === 'object' && v.status ? v.status : 'DRAFT').toUpperCase();
                         const lastUpdate = (typeof v === 'object' && v.last_update) ? v.last_update : '';
                         const lastBuild = (typeof v === 'object' && v.last_build) ? v.last_build : '';
                         const isLoaded = currentFolder === d.name && currentVersion === ver;
-                        const activeLabel = isActive
-                            ? '<span class="badge bg-success-subtle text-success border-success" style="font-size:.65rem;"><i class="bi bi-broadcast me-1"></i>Active</span>'
-                            : '';
+                        const statusLabel = statusBadge(status);
                         const loadedLabel = isLoaded
                             ? '<span class="badge bg-primary-subtle text-primary border" style="font-size:.65rem;"><i class="bi bi-check-circle me-1"></i>Loaded</span>'
                             : '';
                         const datesHtml = _formatVersionDates(lastUpdate, lastBuild);
-                        const activeBtn = isActive
-                            ? '<button type="button" class="btn btn-sm btn-success registry-active-version-btn" disabled title="This version is Active">' +
-                                  '<i class="bi bi-broadcast me-1"></i>Active</button>'
-                            : '<button type="button" class="btn btn-sm btn-outline-success registry-active-version-btn" ' +
-                                  'data-domain="' + escapeHtml(d.name) + '" data-version="' + escapeHtml(ver) + '" title="Set as Active version">' +
-                                  '<i class="bi bi-broadcast me-1"></i>Set Active</button>';
+                        const reviewBtn = '<button type="button" class="btn btn-sm btn-outline-info registry-review-btn" ' +
+                            'data-domain="' + escapeHtml(d.name) + '" data-version="' + escapeHtml(ver) + '" ' +
+                            'data-loaded="' + (isLoaded ? '1' : '') + '" ' +
+                            'title="Open this version in the Validation workspace to manage its review workflow">' +
+                            '<i class="bi bi-ui-checks me-1"></i>Validate</button>';
                         const loadBtn = isLoaded
                             ? ''
                             : '<button type="button" class="btn btn-sm btn-outline-primary registry-load-version-btn" ' +
                                   'data-domain="' + escapeHtml(d.name) + '" data-version="' + escapeHtml(ver) + '" title="Load this version">' +
                                   '<i class="bi bi-box-arrow-in-down me-1"></i>Load</button>';
-                        const deleteBtn = isLoaded
-                            ? ''
-                            : '<button type="button" class="btn btn-sm btn-outline-danger border-0 registry-delete-version-btn" data-requires-app="admin" ' +
-                                  'data-domain="' + escapeHtml(d.name) + '" data-version="' + escapeHtml(ver) + '" ' +
-                                  'title="Delete version v' + escapeHtml(ver) + '">' +
-                                  '<i class="bi bi-trash"></i></button>';
+                        let deleteBtn = '';
+                        if (typeof v === 'object' && v.delete_control_visible) {
+                            const slotId = 'registry-version-delete-' + versionDeleteControls.length;
+                            versionDeleteControls.push({ slotId, version: v, domainName: d.name });
+                            deleteBtn = '<span id="' + slotId + '"></span>';
+                        }
                         html += '<div class="registry-version-row d-flex align-items-center gap-2 px-4 py-2' + (isLoaded ? ' registry-version-loaded' : '') + '">' +
                             '<span class="badge ' + (isLoaded ? 'bg-primary' : 'bg-secondary') + ' registry-version-num">v' + escapeHtml(ver) + '</span>' +
-                            '<div class="d-flex align-items-center gap-2">' + activeLabel + loadedLabel + '</div>' +
+                            '<div class="d-flex align-items-center gap-2">' + statusLabel + loadedLabel + '</div>' +
                             datesHtml +
                             '<span class="flex-grow-1"></span>' +
-                            '<div class="d-flex align-items-center gap-1">' + activeBtn + loadBtn + deleteBtn + '</div>' +
+                            '<div class="d-flex align-items-center gap-1">' + reviewBtn + loadBtn + deleteBtn + '</div>' +
                         '</div>';
                     });
                     html += '</div></td></tr>';
@@ -468,6 +564,12 @@ document.addEventListener('DOMContentLoaded', function () {
 
             html += '</tbody></table></div>';
             listDiv.innerHTML = html;
+
+            versionDeleteControls.forEach(({ slotId, version, domainName }) => {
+                const slot = document.getElementById(slotId);
+                const control = createRegistryVersionDeleteControl(version, domainName);
+                if (slot && control) slot.replaceWith(control);
+            });
 
             listDiv.querySelectorAll('.registry-domain-row').forEach(row => {
                 row.addEventListener('click', (e) => {
@@ -491,7 +593,13 @@ document.addEventListener('DOMContentLoaded', function () {
             listDiv.querySelectorAll('.registry-delete-version-btn').forEach(btn => {
                 btn.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    deleteRegistryVersion(btn.dataset.domain, btn.dataset.version);
+                    deleteRegistryVersion(
+                        btn.dataset.domain,
+                        btn.dataset.version,
+                        loadRegistryDomains,
+                        () => { invalidateRegistryBridges(); },
+                        btn.dataset.deletesDomain === '1'
+                    );
                 });
             });
 
@@ -505,10 +613,12 @@ document.addEventListener('DOMContentLoaded', function () {
                 });
             });
 
-            listDiv.querySelectorAll('.registry-active-version-btn:not([disabled])').forEach(btn => {
+            listDiv.querySelectorAll('.registry-review-btn').forEach(btn => {
                 btn.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    setRegistryVersionActive(btn.dataset.domain, btn.dataset.version);
+                    openVersionInValidation(
+                        btn.dataset.domain, btn.dataset.version, btn.dataset.loaded === '1'
+                    );
                 });
             });
 
@@ -516,60 +626,6 @@ document.addEventListener('DOMContentLoaded', function () {
             console.error('Error loading registry domains:', e);
             listDiv.innerHTML = '<div class="text-danger small py-3">' +
                 '<i class="bi bi-x-circle me-1"></i> Error loading domains</div>';
-        }
-    }
-
-    async function deleteRegistryDomain(domainName) {
-        const confirmed = await showConfirmDialog({
-            title: 'Delete Domain',
-            message: 'Delete domain "' + domainName + '" and all its versions from the registry? This cannot be undone.',
-            confirmText: 'Delete',
-            confirmClass: 'btn-danger',
-            icon: 'trash'
-        });
-        if (!confirmed) return;
-
-        try {
-            const resp = await fetch('/settings/registry/domains/' + encodeURIComponent(domainName), {
-                method: 'DELETE',
-                credentials: 'same-origin'
-            });
-            const data = await resp.json();
-            if (data.success) {
-                showNotification(data.message, 'success');
-                loadRegistryDomains();
-            } else {
-                showNotification('Error: ' + data.message, 'error');
-            }
-        } catch (e) {
-            showNotification('Error deleting domain: ' + e.message, 'error');
-        }
-    }
-
-    async function deleteRegistryVersion(domainName, version) {
-        const confirmed = await showConfirmDialog({
-            title: 'Delete Version',
-            message: 'Delete version v' + version + ' from domain "' + domainName + '"? This cannot be undone.',
-            confirmText: 'Delete',
-            confirmClass: 'btn-danger',
-            icon: 'trash'
-        });
-        if (!confirmed) return;
-
-        try {
-            const resp = await fetch(
-                '/settings/registry/domains/' + encodeURIComponent(domainName) + '/versions/' + encodeURIComponent(version),
-                { method: 'DELETE', credentials: 'same-origin' }
-            );
-            const data = await resp.json();
-            if (data.success) {
-                showNotification(data.message, 'success');
-                loadRegistryDomains();
-            } else {
-                showNotification('Error: ' + data.message, 'error');
-            }
-        } catch (e) {
-            showNotification('Error deleting version: ' + e.message, 'error');
         }
     }
 
@@ -595,7 +651,14 @@ document.addEventListener('DOMContentLoaded', function () {
             if (data.success) {
                 showNotification(data.message || 'Domain loaded!', 'success');
                 if (typeof fetchCachedInvalidate === 'function') fetchCachedInvalidate('/navbar/state');
-                setTimeout(() => window.location.reload(), 800);
+                // Generic loads open Domain → General; do not reload Browse.
+                setTimeout(() => {
+                    if (typeof navigateToDomainGeneral === 'function') {
+                        navigateToDomainGeneral();
+                    } else {
+                        window.location.href = '/domain/?section=information';
+                    }
+                }, 800);
             } else {
                 showNotification('Error: ' + (data.message || 'Failed to load domain'), 'error');
             }
@@ -604,39 +667,45 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
-    async function setRegistryVersionActive(domainName, version) {
+    // Jump to the Domain → Validation workspace for a registry version,
+    // loading it from Unity Catalog first when it is not already current.
+    async function openVersionInValidation(domainName, version, alreadyLoaded) {
+        if (alreadyLoaded) {
+            window.location.href = '/domain/?section=review';
+            return;
+        }
         const confirmed = await showConfirmDialog({
-            title: 'Set Active Version',
-            message: 'Set <strong>v' + escapeHtml(version) + '</strong> of <strong>' + escapeHtml(domainName) + '</strong> as the Active version? Any previously active version will be deactivated.',
-            confirmText: 'Set Active',
-            confirmClass: 'btn-success',
-            icon: 'broadcast'
+            title: 'Open in Validation',
+            message: 'Load <strong>' + escapeHtml(domainName) + '</strong> version <strong>v' +
+                escapeHtml(version) + '</strong> and open its Validation workspace? ' +
+                'Any unsaved changes to the current domain will be lost.',
+            confirmText: 'Open',
+            confirmClass: 'btn-info',
+            icon: 'ui-checks'
         });
         if (!confirmed) return;
 
         try {
-            const resp = await fetch(
-                '/settings/registry/domains/' + encodeURIComponent(domainName) + '/versions/' + encodeURIComponent(version) + '/active',
-                {
-                    method: 'POST',
-                    credentials: 'same-origin',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ enabled: true })
-                }
-            );
+            showNotification('Opening ' + domainName + ' v' + version + '…', 'info', 5000);
+            const resp = await fetch('/domain/load-from-uc', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ domain: domainName, version: version })
+            });
             const data = await resp.json();
-            if (data.success) {
-                showNotification('v' + version + ' is now Active for ' + domainName, 'success');
-                loadRegistryDomains();
+            if (resp.ok && data.success) {
+                if (typeof fetchCachedInvalidate === 'function') fetchCachedInvalidate('/navbar/state');
+                window.location.href = '/domain/?section=review';
             } else {
-                showNotification('Error: ' + (data.message || 'Failed to set active'), 'error');
+                showNotification('Error: ' + (data.message || 'Failed to load domain'), 'error');
             }
         } catch (e) {
-            showNotification('Error: ' + e.message, 'error');
+            showNotification('Error loading domain: ' + e.message, 'error');
         }
     }
 
-    document.getElementById('btnRefreshDomains')?.addEventListener('click', () => loadRegistryDomains());
+    document.getElementById('btnRefreshDomains')?.addEventListener('click', () => loadRegistryDomains(true));
 
     // =====================================================================
     //  OBX EXPORT / IMPORT
@@ -652,8 +721,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
         tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted small py-3">' +
             '<span class="spinner-border spinner-border-sm me-1"></span> Loading…</td></tr>';
-        const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
-        modal.show();
+        showStackedModal(modalEl);
 
         try {
             const resp = await fetch('/settings/registry/domains', { credentials: 'same-origin' });
@@ -683,7 +751,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 ).join('');
                 return '<tr class="export-obx-row" data-domain="' + escapeHtml(d.name) + '">' +
                     '<td class="text-center"><input type="checkbox" class="form-check-input export-obx-pick" checked></td>' +
-                    '<td class="fw-semibold"><i class="bi bi-folder2 me-1 text-primary"></i>' + escapeHtml(d.name) + '</td>' +
+                    '<td class="fw-semibold"><i class="bi bi-box me-1 text-primary"></i>' + escapeHtml(d.name) + '</td>' +
                     '<td class="text-center">' + verBadges + '</td>' +
                     '<td>' +
                         '<select class="form-select form-select-sm export-obx-mode">' +
@@ -782,22 +850,121 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     });
 
+    const IMPORT_NAME_PATTERN = /^[A-Z][A-Za-z0-9]{0,63}$/;
+
+    function sanitizeImportFolder(name) {
+        return name.trim().toLowerCase().replace(/[ -]/g, '_').replace(/[^a-z0-9_]/g, '') ||
+            'untitled_domain';
+    }
+
+    function syncImportActionControls(row) {
+        const input = row.querySelector('.import-obx-name');
+        const conflictActions = row.querySelector('.import-obx-conflict-actions');
+        const createAction = row.querySelector('.import-obx-create-action');
+        const targetsExisting = row.dataset.exists === '1' &&
+            sanitizeImportFolder(input?.value || '') === row.dataset.name;
+        conflictActions?.classList.toggle('d-none', !targetsExisting);
+        createAction?.classList.toggle('d-none', targetsExisting);
+    }
+
+    function syncImportPickState() {
+        const rows = document.querySelectorAll('#importObxTableBody .import-obx-row');
+        const selectAll = document.getElementById('importObxSelectAll');
+        const btn = document.getElementById('btnImportObxConfirm');
+        let checkedCount = 0;
+        rows.forEach(row => {
+            const picked = !!row.querySelector('.import-obx-pick')?.checked;
+            if (picked) checkedCount += 1;
+            row.classList.toggle('table-secondary', !picked);
+            row.querySelectorAll('.import-obx-name, input[type="radio"]').forEach(el => {
+                el.disabled = !picked;
+            });
+        });
+        if (selectAll) {
+            selectAll.checked = rows.length > 0 && checkedCount === rows.length;
+            selectAll.indeterminate = checkedCount > 0 && checkedCount < rows.length;
+        }
+        if (btn) btn.disabled = checkedCount === 0;
+    }
+
+    // The file being imported: either the picked .obx or one rebuilt from GitHub.
+    let pendingImportFile = null;
+    let pendingImportFromGithub = false;
+
     function openImportObxModal() {
         const modalEl = document.getElementById('importObxModal');
         if (!modalEl) return;
-        document.getElementById('importObxStep1').style.display = '';
-        document.getElementById('importObxStep2').style.display = 'none';
+        pendingImportFile = null;
+        pendingImportFromGithub = false;
+        document.getElementById('importObxStep1').classList.remove('d-none');
+        document.getElementById('importObxStep2').classList.add('d-none');
         document.getElementById('importObxFile').value = '';
-        document.getElementById('importObxPreviewError').style.display = 'none';
-        document.getElementById('btnImportObxConfirm').style.display = 'none';
-        bootstrap.Modal.getOrCreateInstance(modalEl).show();
+        document.getElementById('importObxPreviewError').classList.add('d-none');
+        document.getElementById('importObxPreviewBusy')?.classList.add('d-none');
+        document.getElementById('btnImportObxConfirm').classList.add('d-none');
+        document.getElementById('btnImportObxConfirm').disabled = false;
+        const selectAll = document.getElementById('importObxSelectAll');
+        if (selectAll) {
+            selectAll.checked = true;
+            selectAll.indeterminate = false;
+        }
+        showStackedModal(modalEl);
     }
 
-    document.getElementById('importObxFile')?.addEventListener('change', async (e) => {
+    document.getElementById('importObxFile')?.addEventListener('change', (e) => {
         const file = e.target.files?.[0];
+        if (file) previewImportFile(file);
+    });
+
+    document.getElementById('btnImportFromGithub')?.addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
         const errEl = document.getElementById('importObxPreviewError');
-        if (!file) return;
-        errEl.style.display = 'none';
+        const busyEl = document.getElementById('importObxPreviewBusy');
+        errEl.classList.add('d-none');
+        btn.disabled = true;
+        busyEl?.classList.remove('d-none');
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 60000);
+        try {
+            const resp = await fetch('/settings/github/obx', {
+                credentials: 'same-origin',
+                signal: ac.signal
+            });
+            const data = await resp.json();
+            if (!resp.ok || data.success === false) {
+                errEl.textContent = data.message || 'Could not read the GitHub repository';
+                errEl.classList.remove('d-none');
+                if (typeof showNotification === 'function') {
+                    showNotification(errEl.textContent, 'error');
+                }
+                return;
+            }
+            pendingImportFile = null;
+            pendingImportFromGithub = true;
+            renderImportObxPreview(data);
+        } catch (err) {
+            const timedOut = err && err.name === 'AbortError';
+            errEl.textContent = timedOut
+                ? 'GitHub import timed out. Try again, or use Sync all in Settings → GitHub first.'
+                : ('Network error: ' + err.message);
+            errEl.classList.remove('d-none');
+            if (typeof showNotification === 'function') {
+                showNotification(errEl.textContent, 'error');
+            }
+        } finally {
+            clearTimeout(timer);
+            busyEl?.classList.add('d-none');
+            btn.disabled = false;
+        }
+    });
+
+    async function previewImportFile(file) {
+        const errEl = document.getElementById('importObxPreviewError');
+        const busyEl = document.getElementById('importObxPreviewBusy');
+        const input = document.getElementById('importObxFile');
+        errEl.classList.add('d-none');
+        busyEl?.classList.remove('d-none');
+        input.disabled = true;
         try {
             const form = new FormData();
             form.append('file', file);
@@ -809,20 +976,25 @@ document.addEventListener('DOMContentLoaded', function () {
             const data = await resp.json();
             if (!resp.ok || !data.success) {
                 errEl.textContent = data.message || 'Could not read the .obx file';
-                errEl.style.display = '';
+                errEl.classList.remove('d-none');
                 return;
             }
+            pendingImportFile = file;
             renderImportObxPreview(data);
         } catch (err) {
             errEl.textContent = 'Network error: ' + err.message;
-            errEl.style.display = '';
+            errEl.classList.remove('d-none');
+        } finally {
+            busyEl?.classList.add('d-none');
+            input.disabled = false;
         }
-    });
+    }
 
     function renderImportObxPreview(data) {
-        document.getElementById('importObxStep1').style.display = 'none';
-        document.getElementById('importObxStep2').style.display = '';
-        document.getElementById('btnImportObxConfirm').style.display = '';
+        document.getElementById('importObxStep1').classList.add('d-none');
+        document.getElementById('importObxStep2').classList.remove('d-none');
+        const obxConfirmBtn = document.getElementById('btnImportObxConfirm');
+        obxConfirmBtn.classList.remove('d-none');
 
         const meta = document.getElementById('importObxMeta');
         meta.innerHTML =
@@ -841,40 +1013,60 @@ document.addEventListener('DOMContentLoaded', function () {
             const statusBadge = d.exists
                 ? '<span class="badge bg-warning text-dark"><i class="bi bi-exclamation-triangle me-1"></i>Exists</span>'
                 : '<span class="badge bg-success-subtle text-success border-success">New</span>';
-            const defaultAction = d.exists ? 'skip' : 'overwrite';
-            return '<tr class="import-obx-row" data-name="' + escapeHtml(d.name) + '" data-suggested="' + escapeHtml(d.suggested_new_name || '') + '">' +
-                '<td><i class="bi bi-folder2 me-1 text-primary"></i>' + escapeHtml(d.name) +
+            const importName = d.exists
+                ? (d.suggested_new_name || d.display_name || d.name)
+                : (d.display_name || d.name);
+            const actionControls = d.exists
+                ? '<div class="btn-group btn-group-sm import-obx-conflict-actions" role="group">' +
+                      actionRadio(idx, 'skip', 'Skip', true, false) +
+                      actionRadio(idx, 'overwrite', 'Overwrite', false, false) +
+                  '</div>' +
+                  '<span class="small text-muted import-obx-create-action d-none">' +
+                      '<i class="bi bi-plus-circle me-1"></i>Create new</span>'
+                : '<span class="small text-muted import-obx-create-action">' +
+                      '<i class="bi bi-plus-circle me-1"></i>Create new</span>';
+            return '<tr class="import-obx-row" data-name="' + escapeHtml(d.name) + '" data-exists="' + (d.exists ? '1' : '0') + '">' +
+                '<td class="text-center"><input type="checkbox" class="form-check-input import-obx-pick" checked aria-label="Import this domain"></td>' +
+                '<td><i class="bi bi-box me-1 text-primary"></i>' + escapeHtml(d.name) +
                     (d.original_name && d.original_name !== d.name
                         ? '<div class="small text-muted">from <code>' + escapeHtml(d.original_name) + '</code></div>'
                         : '') +
                 '</td>' +
+                '<td>' +
+                    '<input type="text" class="form-control form-control-sm import-obx-name" ' +
+                        'value="' + escapeHtml(importName) + '" required maxlength="64" ' +
+                        'pattern="[A-Z][A-Za-z0-9]*" autocomplete="off" spellcheck="false" ' +
+                        'aria-label="Imported domain name">' +
+                    '<div class="invalid-feedback">Use a unique CamelCase alphanumeric name.</div>' +
+                '</td>' +
                 '<td>' + versionBadges + '</td>' +
                 '<td>' + statusBadge + '</td>' +
-                '<td>' +
-                    '<div class="d-flex flex-column gap-1">' +
-                        '<div class="btn-group btn-group-sm" role="group">' +
-                            actionRadio(idx, 'skip', 'Skip', defaultAction === 'skip', !d.exists) +
-                            actionRadio(idx, 'overwrite', 'Overwrite', defaultAction === 'overwrite', false) +
-                            actionRadio(idx, 'rename', 'Rename', false, !d.exists) +
-                        '</div>' +
-                        '<input type="text" class="form-control form-control-sm import-obx-rename" ' +
-                            'value="' + escapeHtml(d.suggested_new_name || '') + '" ' +
-                            'placeholder="new name" style="display:none;">' +
-                    '</div>' +
-                '</td>' +
+                '<td>' + actionControls + '</td>' +
             '</tr>';
         }).join('');
 
         tbody.querySelectorAll('.import-obx-row').forEach(row => {
-            const rename = row.querySelector('.import-obx-rename');
-            row.querySelectorAll('input[type="radio"]').forEach(radio => {
-                radio.addEventListener('change', () => {
-                    if (rename) rename.style.display = radio.value === 'rename' && radio.checked ? '' : (
-                        row.querySelector('input[type="radio"]:checked')?.value === 'rename' ? '' : 'none'
-                    );
-                });
+            const input = row.querySelector('.import-obx-name');
+            input?.addEventListener('input', () => {
+                input.classList.remove('is-invalid');
+                syncImportActionControls(row);
             });
+            row.querySelector('.import-obx-pick')?.addEventListener('change', syncImportPickState);
+            syncImportActionControls(row);
         });
+
+        const selectAll = document.getElementById('importObxSelectAll');
+        if (selectAll) {
+            selectAll.checked = true;
+            selectAll.indeterminate = false;
+            selectAll.onchange = () => {
+                tbody.querySelectorAll('.import-obx-pick').forEach(cb => {
+                    cb.checked = selectAll.checked;
+                });
+                syncImportPickState();
+            };
+        }
+        syncImportPickState();
     }
 
     function actionRadio(rowIdx, value, label, checked, disabled) {
@@ -882,23 +1074,71 @@ document.addEventListener('DOMContentLoaded', function () {
         return '<input type="radio" class="btn-check" name="obx-action-' + rowIdx + '" ' +
                     'id="' + id + '" value="' + value + '" ' +
                     (checked ? 'checked' : '') + ' ' + (disabled ? 'disabled' : '') + '>' +
-                '<label class="btn btn-outline-' + (value === 'overwrite' ? 'warning' : value === 'rename' ? 'primary' : 'secondary') +
+                '<label class="btn btn-outline-' + (value === 'overwrite' ? 'warning' : 'secondary') +
                     '" for="' + id + '">' + escapeHtml(label) + '</label>';
     }
 
     document.getElementById('btnImportObxConfirm')?.addEventListener('click', async () => {
-        const file = document.getElementById('importObxFile')?.files?.[0];
-        if (!file) { showNotification('Pick a .obx file first', 'warning'); return; }
+        const file = pendingImportFile;
+        if (!file && !pendingImportFromGithub) {
+            showNotification('Pick a .obx file first', 'warning');
+            return;
+        }
 
         const decisions = [];
+        const targetFolders = new Set();
+        let namesValid = true;
         document.querySelectorAll('#importObxTableBody .import-obx-row').forEach(row => {
-            const action = row.querySelector('input[type="radio"]:checked')?.value || 'skip';
-            const decision = { name: row.dataset.name, action };
-            if (action === 'rename') {
-                decision.new_name = row.querySelector('.import-obx-rename')?.value?.trim() || row.dataset.suggested;
+            const sourceFolder = row.dataset.name;
+            if (!row.querySelector('.import-obx-pick')?.checked) {
+                decisions.push({ name: sourceFolder, action: 'skip' });
+                return;
             }
-            decisions.push(decision);
+            const nameInput = row.querySelector('.import-obx-name');
+            const importName = nameInput?.value.trim() || '';
+            const targetFolder = sanitizeImportFolder(importName);
+            const duplicate = targetFolders.has(targetFolder);
+            const valid = IMPORT_NAME_PATTERN.test(importName) && !duplicate;
+
+            nameInput?.classList.toggle('is-invalid', !valid);
+            if (!valid) {
+                namesValid = false;
+                return;
+            }
+            targetFolders.add(targetFolder);
+
+            if (sourceFolder !== targetFolder) {
+                decisions.push({
+                    name: sourceFolder,
+                    action: 'rename',
+                    new_name: importName
+                });
+            } else if (row.dataset.exists === '1') {
+                decisions.push({
+                    name: sourceFolder,
+                    action: row.querySelector('input[type="radio"]:checked')?.value || 'skip'
+                });
+            } else {
+                decisions.push({ name: sourceFolder, action: 'overwrite' });
+            }
         });
+
+        const selectedCount = document.querySelectorAll(
+            '#importObxTableBody .import-obx-pick:checked'
+        ).length;
+        if (!selectedCount) {
+            showNotification('Pick at least one domain to import', 'warning');
+            return;
+        }
+
+        if (!namesValid) {
+            showNotification(
+                'Use a unique CamelCase alphanumeric name for every imported domain',
+                'warning'
+            );
+            document.querySelector('#importObxTableBody .import-obx-name.is-invalid')?.focus();
+            return;
+        }
 
         const overwrites = decisions.filter(d => d.action === 'overwrite').length;
         if (overwrites > 0) {
@@ -919,7 +1159,11 @@ document.addEventListener('DOMContentLoaded', function () {
 
         try {
             const form = new FormData();
-            form.append('file', file);
+            if (pendingImportFromGithub) {
+                form.append('from_github', '1');
+            } else {
+                form.append('file', file);
+            }
             form.append('decisions', JSON.stringify(decisions));
             const resp = await fetch('/settings/registry/import', {
                 method: 'POST',
@@ -936,7 +1180,8 @@ document.addEventListener('DOMContentLoaded', function () {
                 console.warn('OBX import warnings:', data.errors);
             }
             bootstrap.Modal.getInstance(document.getElementById('importObxModal'))?.hide();
-            loadRegistryDomains();
+            invalidateRegistryBridges();
+            loadRegistryDomains(true);
         } catch (e) {
             showNotification('Import error: ' + e.message, 'error');
         } finally {
@@ -958,6 +1203,13 @@ document.addEventListener('DOMContentLoaded', function () {
 
     let bridgesLoaded = false;
     let bridgesData = null;
+    let bridgesLoadPromise = null;
+
+    function invalidateRegistryBridges() {
+        bridgesLoaded = false;
+        bridgesData = null;
+    }
+    window.invalidateRegistryBridges = invalidateRegistryBridges;
 
     function _ensureD3() {
         if (typeof d3 !== 'undefined') return Promise.resolve();
@@ -1004,27 +1256,47 @@ document.addEventListener('DOMContentLoaded', function () {
     document.getElementById('bridgesViewToggle')?.addEventListener('click', (e) => {
         const btn = e.target.closest('[data-view]');
         if (!btn) return;
-        _applyBridgesView(btn.dataset.view);
+        const view = btn.dataset.view;
+        _applyBridgesView(view);
+        // Re-render after layout so the canvas gets real dimensions (critical
+        // inside the Registry modal where the graph pane is flex-sized).
+        if (view === 'graph' && bridgesData) {
+            const graphModel = _buildGraphModel(bridgesData);
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    _renderBridgesGraph(graphModel);
+                });
+            });
+        }
     });
 
     // --- Bridges load triggers ---
 
     document.addEventListener('sidebarSectionChanged', (e) => {
         const section = e.detail?.section;
-        // Re-fetch the domain list every time the user navigates back
-        // to the Domains (Browse) section. The list can go stale when
-        // versions are loaded / activated / deleted from another tab,
-        // when an admin switches the Lakebase database in Settings,
-        // or simply because new versions appeared after a build. Skip
-        // the refresh while the registry is still being
-        // configured (no point hammering the API on a non-configured
-        // registry) — the initial ``loadRegistryConfig`` already
-        // primes the list once the config is ready.
+        // Reuse a recent domain list when navigating back to Browse. The
+        // short TTL avoids duplicate modal-open requests while still
+        // refreshing data that may have changed in another tab or after a
+        // build. Skip requests while the registry is still being configured;
+        // the initial loadRegistryConfig call primes the list when ready.
         if (section === 'domains' && registryConfigured) {
             loadRegistryDomains();
         }
-        if (section === 'bridges' && !bridgesLoaded) {
+        if (e.detail?.source === 'registry-modal' && !bridgesLoaded) {
             loadRegistryBridges();
+        }
+        if (section === 'bridges') {
+            if (!bridgesLoaded) {
+                loadRegistryBridges();
+            } else if (bridgesData && _getBridgesView() === 'graph') {
+                // Modal tab may have been hidden when first rendered; re-measure.
+                const graphModel = _buildGraphModel(bridgesData);
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        _renderBridgesGraph(graphModel);
+                    });
+                });
+            }
         }
     });
 
@@ -1034,9 +1306,7 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     document.getElementById('btnRefreshBridges')?.addEventListener('click', () => {
-        bridgesLoaded = false;
-        bridgesData = null;
-        loadRegistryBridges();
+        loadRegistryBridges(true);
     });
 
     // --- Build entity-level graph model grouped by domain ---
@@ -1349,7 +1619,20 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // --- Main load function ---
 
-    async function loadRegistryBridges() {
+    function loadRegistryBridges(force = false) {
+        if (!force && bridgesLoaded) return Promise.resolve();
+        if (bridgesLoadPromise) return bridgesLoadPromise;
+        if (force) {
+            bridgesLoaded = false;
+            bridgesData = null;
+        }
+
+        bridgesLoadPromise = _loadRegistryBridges()
+            .finally(() => { bridgesLoadPromise = null; });
+        return bridgesLoadPromise;
+    }
+
+    async function _loadRegistryBridges() {
         const content = document.getElementById('bridgesContent');
         const status = document.getElementById('bridgesStatus');
         const graphContainer = document.getElementById('bridgesGraphContainer');
@@ -1393,7 +1676,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 summaryEl.innerHTML = '<div class="bridges-summary-bar">' +
                     '<div class="summary-item"><i class="bi bi-signpost-split text-primary"></i> ' +
                         '<span class="summary-value">' + totalBridges + '</span> bridge' + (totalBridges !== 1 ? 's' : '') + '</div>' +
-                    '<div class="summary-item"><i class="bi bi-folder2 text-secondary"></i> ' +
+                    '<div class="summary-item"><i class="bi bi-box text-secondary"></i> ' +
                         '<span class="summary-value">' + domainsWithBridges.length + '</span> domain' + (domainsWithBridges.length !== 1 ? 's' : '') +
                         ' with bridges</div>' +
                     '<div class="summary-item"><i class="bi bi-globe text-secondary"></i> ' +
@@ -1414,7 +1697,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     '<div class="bridges-domain-header" data-bs-toggle="collapse" data-bs-target="#' + cardId + '">' +
                         '<div class="d-flex align-items-center gap-2">' +
                             '<i class="bi bi-chevron-right text-muted bridges-chevron" style="font-size:0.7rem;transition:transform 0.15s;"></i>' +
-                            '<i class="bi bi-folder2 text-primary"></i>' +
+                            '<i class="bi bi-box text-primary"></i>' +
                             '<span class="domain-name">' + escapeHtml(d.name) + '</span>';
 
                 if (d.base_uri) {
@@ -1434,10 +1717,10 @@ document.addEventListener('DOMContentLoaded', function () {
                 } else {
                     html += '<table class="table table-sm table-hover bridges-table">' +
                         '<thead><tr>' +
-                            '<th>Source Class</th>' +
+                            '<th>Source Entity</th>' +
                             '<th style="width:3rem;"></th>' +
                             '<th>Target Domain</th>' +
-                            '<th>Target Class</th>' +
+                            '<th>Target Entity</th>' +
                             '<th>Label</th>' +
                         '</tr></thead><tbody>';
 
@@ -1449,7 +1732,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         html += '<tr>' +
                             '<td><span class="me-1">' + srcEmoji + '</span> ' + escapeHtml(b.source_class) + '</td>' +
                             '<td class="text-center bridge-arrow"><i class="bi bi-arrow-right"></i></td>' +
-                            '<td><i class="bi bi-folder2 text-secondary me-1"></i>' + escapeHtml(b.target_domain) + '</td>' +
+                            '<td><i class="bi bi-box text-secondary me-1"></i>' + escapeHtml(b.target_domain) + '</td>' +
                             '<td>' + escapeHtml(b.target_class_name) + '</td>' +
                             '<td>' + label + '</td>' +
                         '</tr>';
@@ -1503,8 +1786,10 @@ document.addEventListener('DOMContentLoaded', function () {
 
     document.getElementById('btnInitRegistry')?.addEventListener('click', async () => {
         const btn = document.getElementById('btnInitRegistry');
+        const wasConfigured = registryCfg.configured;
         btn.disabled = true;
-        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Initializing...';
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> '
+            + (wasConfigured ? 'Applying upgrades…' : 'Initializing…');
         try {
             const resp = await fetch('/settings/registry/initialize', {
                 method: 'POST',
@@ -1518,6 +1803,21 @@ document.addEventListener('DOMContentLoaded', function () {
                 registryCfg.configured = true;
                 updateRegistryLabel();
                 updateRegistryStatus(registryCfg);
+                // Surface the Lakebase grants applied during Initialize
+                // (in-app port of bootstrap-lakebase-perms.sh). Rendered by
+                // config/js/settings-registry-configuration.js.
+                if (data.permissions && typeof window._obRenderRegistryGrants === 'function') {
+                    window._obRenderRegistryGrants(data.permissions);
+                    const warns = (data.permissions.warnings || []).length;
+                    if (warns) {
+                        showNotification(
+                            (wasConfigured ? 'Upgrade applied, but ' : 'Registry initialized, but ')
+                            + warns + ' permission grant warning'
+                            + (warns === 1 ? '' : 's') + ' — see Permission Grants below.',
+                            'warning'
+                        );
+                    }
+                }
             } else {
                 showNotification('Error: ' + data.message, 'error');
             }
@@ -1525,7 +1825,7 @@ document.addEventListener('DOMContentLoaded', function () {
             showNotification('Error: ' + e.message, 'error');
         } finally {
             btn.disabled = false;
-            btn.innerHTML = '<i class="bi bi-plus-circle me-1"></i> Initialize';
+            updateRegistryLabel();  // restore correct label/style for current state
         }
     });
 });

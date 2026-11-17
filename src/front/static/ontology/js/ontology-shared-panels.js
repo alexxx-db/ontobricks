@@ -74,15 +74,37 @@ let sharedPanelElement = null;  // Reference to the current panel DOM element fo
 let sharedPanelDashboardUrl = null;  // Dashboard URL for the entity
 let sharedPanelDashboardParams = {};  // Dashboard parameter mappings { paramName: attributeName }
 let sharedPanelBridges = [];  // Cross-domain entity bridges
+// Linked Unity Catalog datasets (tables, views, metric views). Each entry is
+// { catalog, schema, asset, type, fullName, key_column, description }.
+// ``type`` is TABLE | VIEW | METRIC_VIEW.
+let sharedPanelDatasets = [];
+// Linked Unity Catalog function actions. Each entry is
+// { catalog, schema, function, fullName, description, returns_table }.
+// The bound function must take exactly one parameter: the ID of the entity
+// being acted on — it is passed automatically at invocation time.
+let sharedPanelActions = [];
+// Databricks Jobs bound as class actions: { kind: 'job', job_id, job_name, fullName, description }.
+let sharedPanelJobs = [];
+// SWRL business rules referenced by name: [{ name }]. Only rules whose class
+// atoms cite this entity (or one of its parents) can be attached; they are
+// triggered on a single entity from the Knowledge Graph and over MCP.
+let sharedPanelBusinessRules = [];
+// Virtual attribute declarations. One entry per bound Unity Catalog function:
+// { catalog, schema, function, fullName, description, returns_table,
+//   attributes: [{ name, column, label, dataType }] }.
+// Values are never stored here — they are computed on demand by the consumers
+// (Graph Explorer, MCP), never at design time.
+let sharedPanelVirtualAttributes = [];
 let sharedPanelDirty = false;
 
 // Remembered active tab per panel type — persists across entity/relationship selections
+const ENTITY_PANEL_TABS = ['details', 'attributes', 'model', 'behaviour', 'links'];
 let _entityPanelActiveTab = 'details';
 let _relPanelActiveTab = 'details';
 
 // Panel resize state
 let isResizing = false;
-let panelStartWidth = 380;
+let panelStartWidth = 420;
 
 /**
  * Get or create the detail panel in the current active section
@@ -116,8 +138,10 @@ function getOrCreateDetailPanel() {
     
     // Use the specific container for each section
     let panelContainer = activeSection;
+    // The panel is a sibling of the content pane, not a child of it, so the
+    // Designer hosts it on the wrapper rather than on the canvas itself.
     const containerMap = {
-        'map-section': 'ontology-map-container',
+        'map-section': 'ontology-map-wrapper',
         'entities-section': 'ontology-entities-container',
         'relationships-section': 'ontology-relationships-container'
     };
@@ -138,54 +162,199 @@ function getOrCreateDetailPanel() {
         return panel;
     }
     
+    return createDetailPanel(panelContainer);
+}
+
+/**
+ * Build the handle + panel pair inside a container and wire it up.
+ * Returns the existing panel if the container already has one.
+ */
+function createDetailPanel(panelContainer) {
+    const existing = panelContainer.querySelector('.shared-detail-panel');
+    if (existing) return existing;
+
     console.log('[SharedPanel] Creating new panel');
-    
+
     // Create resize handle
     const resizeHandle = document.createElement('div');
     resizeHandle.className = 'detail-panel-resize-handle';
-    resizeHandle.innerHTML = '<div class="resize-bar"></div>';
-    
+    resizeHandle.title = 'Drag to resize panels';
+    resizeHandle.innerHTML = '<div class="resize-handle-bar"></div>';
+
     // Create panel
     const panelDiv = document.createElement('div');
     panelDiv.className = 'shared-detail-panel';
-    
+
     panelDiv.innerHTML = `
         <div class="panel-header">
-            <h6 id="sharedPanelTitle"><i class="bi bi-box"></i> <span id="sharedPanelItemName">Edit</span></h6>
-            <button type="button" class="btn btn-outline-secondary btn-sm panel-close-btn" id="sharedClosePanelBtn" title="Close">
-                <i class="bi bi-x-lg"></i>
-            </button>
+            <h6 id="sharedPanelTitle"><span id="sharedPanelItemName">Select Item</span></h6>
         </div>
         <div class="panel-body" id="sharedPanelBody"></div>
-        <div class="panel-footer" id="sharedPanelFooter">
-            <button type="button" class="btn btn-secondary btn-sm" id="sharedCancelPanelBtn">Cancel</button>
-            <button type="button" class="btn btn-dark btn-sm" id="sharedSavePanelBtn">
-                <i class="bi bi-check-circle"></i> Save
-            </button>
-        </div>
     `;
-    
-    // Append to container (either section or ontology-map-container for Map)
+
+    // Append to container (either section or ontology-map-wrapper for Map)
     panelContainer.appendChild(resizeHandle);
     panelContainer.appendChild(panelDiv);
-    
+
     // Add the class to enable split layout
     panelContainer.classList.add('has-detail-panel');
-    
-    // Setup event listeners for this panel instance
-    setupPanelListeners(panelContainer);
+
     setupResizeHandle(panelContainer);
-    
+
+    renderPanelPlaceholder(panelDiv);
+
     return panelDiv;
 }
 
 /**
- * Setup panel event listeners
+ * Create the panel in every section that hosts one, before the views render.
+ * D3 sizes the Designer canvas from `container.clientWidth` exactly once, so a
+ * panel appearing later would leave the graph centred on the wrong axis.
  */
-function setupPanelListeners(section) {
-    section.querySelector('#sharedClosePanelBtn')?.addEventListener('click', guardedCloseSharedPanel);
-    section.querySelector('#sharedCancelPanelBtn')?.addEventListener('click', guardedCloseSharedPanel);
-    section.querySelector('#sharedSavePanelBtn')?.addEventListener('click', saveSharedPanelItem);
+function ensureDetailPanels() {
+    ['ontology-map-wrapper',
+     'ontology-entities-container',
+     'ontology-relationships-container'].forEach(id => {
+        const container = document.getElementById(id);
+        if (container) createDetailPanel(container);
+    });
+}
+
+/**
+ * Reset a panel to its "nothing selected" state.
+ */
+function renderPanelPlaceholder(panel) {
+    const target = panel || sharedPanelElement;
+    if (!target) return;
+
+    target.classList.add('is-empty');
+
+    const heading = target.querySelector('#sharedPanelTitle');
+    if (heading) {
+        heading.innerHTML = '<span id="sharedPanelItemName">Select Item</span>';
+    }
+
+    const body = target.querySelector('#sharedPanelBody');
+    if (body) {
+        body.innerHTML = `
+            <div class="panel-placeholder">
+                <i class="bi bi-cursor"></i>
+                <p class="small mb-0">Click on an entity or<br>relationship to view details</p>
+            </div>
+        `;
+    }
+}
+
+function renderFormTabsNav(tabs, activeTab) {
+    const items = tabs.map(({ id, icon, label }) => {
+        const selected = activeTab === id;
+        return `<li class="nav-item" role="presentation"><a class="nav-link form-tab-link${selected ? ' active' : ''}" data-form-tab="${id}" href="#" role="tab" aria-selected="${selected}" onclick="event.preventDefault(); switchFormTab(this)"><i class="bi ${icon} me-1"></i>${label}</a></li>`;
+    }).join('');
+    return `<ul class="nav nav-tabs ob-tabs ob-tabs--compact form-tabs-nav" role="tablist">${items}</ul>`;
+}
+
+// ---- Panel section helpers ----
+// Every section of the entity panel: a header (icon, title, count, effect
+// chip, Add), a one-line subtitle with the long help behind an info button,
+// then flat item rows or an actionable empty state. Text arguments are
+// escaped here; `badge` / `body` are HTML built by the caller. `onAdd`,
+// `onclick` and `removeOnclick` are inline handlers written by this file only.
+const EFFECT_CHIPS = {
+    viewed: { icon: 'bi-eye', label: 'Computed when viewed', tone: 'neutral' },
+    result: { icon: 'bi-box-arrow-right', label: 'Returns a result', tone: 'neutral' },
+    background: { icon: 'bi-hourglass-split', label: 'Runs in background', tone: 'neutral' },
+    graphWrite: { icon: 'bi-pencil-square', label: 'Writes to the graph', tone: 'warning' },
+};
+
+function _effectChipHtml(key) {
+    const chip = EFFECT_CHIPS[key];
+    if (!chip) return '';
+    const tone = chip.tone === 'warning'
+        ? 'bg-warning-subtle text-warning-emphasis'
+        : 'bg-secondary-subtle text-secondary';
+    return `<span class="badge entity-effect-chip ${tone} border fw-normal"><i class="bi ${chip.icon} me-1"></i>${chip.label}</span>`;
+}
+
+function panelSectionHeader({ targetId, icon, title, chip = '', subtitle = '', help = '', onAdd = '', menu = null, viewOnly = false, labelFor = '' }) {
+    let add = '';
+    if (!viewOnly && menu) {
+        add = `<div class="dropdown">
+                <button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" data-bs-toggle="dropdown" aria-expanded="false" data-panel-passive><i class="bi bi-plus"></i> Add</button>
+                <ul class="dropdown-menu dropdown-menu-end">${menu.map(item =>
+                    `<li><button type="button" class="dropdown-item" onclick="${item.onclick}"><i class="bi ${item.icon} me-2"></i>${escapeHtml(item.label)}</button></li>`
+                ).join('')}</ul>
+            </div>`;
+    } else if (!viewOnly && onAdd) {
+        add = `<button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" data-section-add-for="${targetId}" onclick="${onAdd}"><i class="bi bi-plus"></i> Add</button>`;
+    }
+    const heading = `<i class="bi ${icon} me-1"></i>${escapeHtml(title)}`;
+    const titleHtml = labelFor
+        ? `<label class="panel-section-title" for="${labelFor}">${heading}</label>`
+        : `<span class="panel-section-title">${heading}</span>`;
+    const helpBtn = help
+        ? `<button type="button" class="btn btn-link btn-sm p-0 panel-section-help" title="${escapeHtml(help)}" aria-label="About ${escapeHtml(title)}: ${escapeHtml(help)}" data-panel-passive><i class="bi bi-info-circle"></i></button>`
+        : '';
+    const subtitleHtml = (subtitle || help)
+        ? `<div class="panel-section-subtitle">${escapeHtml(subtitle)} ${helpBtn}</div>`
+        : '';
+    return `
+        <div class="panel-section-header">
+            <div class="panel-section-heading">
+                ${titleHtml}
+                <span class="panel-section-count" data-section-count-for="${targetId}"></span>
+                ${_effectChipHtml(chip)}
+            </div>
+            ${add}
+        </div>
+        ${subtitleHtml}`;
+}
+
+function panelEmptyState(text, addLabel, onAdd, viewOnly) {
+    const action = !viewOnly && onAdd
+        ? `<button type="button" class="btn btn-link btn-sm p-0" onclick="${onAdd}"><i class="bi bi-plus"></i> ${escapeHtml(addLabel)}</button>`
+        : '';
+    return `<div class="panel-empty-state"><span>${escapeHtml(text)}</span>${action}</div>`;
+}
+
+function panelItemRow({ icon, iconTone = 'text-primary', title, badge = '', meta = '', removeOnclick = '', removeTitle = 'Remove', viewOnly = false, body = '' }) {
+    const remove = !viewOnly && removeOnclick
+        ? `<button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" onclick="${removeOnclick}" title="${escapeHtml(removeTitle)}" aria-label="${escapeHtml(removeTitle)}"><i class="bi bi-x"></i></button>`
+        : '';
+    const metaHtml = meta ? `<div class="panel-item-meta">${escapeHtml(meta)}</div>` : '';
+    return `
+        <div class="panel-item">
+            <div class="panel-item-head">
+                <i class="bi ${icon} ${iconTone} panel-item-icon"></i>
+                <div class="panel-item-text">
+                    <div class="panel-item-title">${escapeHtml(title)} ${badge}</div>
+                    ${metaHtml}
+                </div>
+                ${remove}
+            </div>
+            ${body}
+        </div>`;
+}
+
+function panelInlineField({ value = '', placeholder = '', oninput = '', viewOnly = false, id = '' }) {
+    if (viewOnly) {
+        return value ? `<div class="panel-item-desc">${escapeHtml(value)}</div>` : '';
+    }
+    const idAttr = id ? ` id="${id}"` : '';
+    return `<textarea class="form-control form-control-sm panel-inline-field"${idAttr} rows="1" placeholder="${escapeHtml(placeholder)}" aria-label="${escapeHtml(placeholder)}" oninput="${oninput}">${escapeHtml(value)}</textarea>`;
+}
+// ---- End panel section helpers ----
+
+/** Refresh a section header after its list re-renders: count and Add/Change. */
+function _updatePanelSection(targetId, { count = null, single = false } = {}) {
+    const root = sharedPanelElement || document;
+    const countEl = root.querySelector(`[data-section-count-for="${targetId}"]`);
+    if (countEl) countEl.textContent = count ? String(count) : '';
+    const add = root.querySelector(`[data-section-add-for="${targetId}"]`);
+    if (add && single) {
+        add.innerHTML = count
+            ? '<i class="bi bi-arrow-repeat"></i> Change'
+            : '<i class="bi bi-plus"></i> Add';
+    }
 }
 
 /**
@@ -199,7 +368,9 @@ function switchFormTab(tabLink) {
     const tabName = tabLink.dataset.formTab;
 
     form.querySelectorAll('.form-tabs-nav .form-tab-link').forEach(link => {
-        link.classList.toggle('active', link.dataset.formTab === tabName);
+        const selected = link.dataset.formTab === tabName;
+        link.classList.toggle('active', selected);
+        link.setAttribute('aria-selected', selected ? 'true' : 'false');
     });
     form.querySelectorAll('.form-tab-pane').forEach(pane => {
         pane.classList.toggle('active', pane.dataset.formTabContent === tabName);
@@ -231,7 +402,8 @@ function attachDirtyTracking() {
     body.addEventListener('input', markPanelDirty);
     body.addEventListener('change', markPanelDirty);
     body.addEventListener('click', (e) => {
-        if (e.target.closest('button')) markPanelDirty();
+        const button = e.target.closest('button');
+        if (button && !button.hasAttribute('data-panel-passive')) markPanelDirty();
     });
 }
 
@@ -240,18 +412,7 @@ function attachDirtyTracking() {
  */
 async function guardedCloseSharedPanel() {
     if (sharedPanelDirty) {
-        const save = await showConfirmDialog({
-            title: 'Unsaved Changes',
-            message: 'You have unsaved changes. Do you want to save before closing?',
-            confirmText: 'Save',
-            cancelText: 'Discard',
-            confirmClass: 'btn-primary',
-            icon: 'exclamation-triangle'
-        });
-        if (save) {
-            await saveSharedPanelItem();
-            return;
-        }
+        await saveSharedPanelItem();
     }
     closeSharedPanel();
 }
@@ -278,9 +439,8 @@ function setupResizeHandle(section) {
         
         const sectionRect = section.getBoundingClientRect();
         const newWidth = sectionRect.right - e.clientX;
-        
-        // Clamp width between min and max
-        const clampedWidth = Math.max(280, Math.min(500, newWidth));
+
+        const clampedWidth = Math.max(200, Math.min(900, newWidth));
         panel.style.width = clampedWidth + 'px';
     });
     
@@ -313,19 +473,7 @@ function panelGetById(id) {
  */
 async function checkDirtyBeforeSwitch() {
     if (!sharedPanelDirty) return true;
-    const save = await showConfirmDialog({
-        title: 'Unsaved Changes',
-        message: 'You have unsaved changes. Do you want to save before continuing?',
-        confirmText: 'Save',
-        cancelText: 'Discard',
-        confirmClass: 'btn-primary',
-        icon: 'exclamation-triangle'
-    });
-    if (save) {
-        await saveSharedPanelItem();
-    } else {
-        sharedPanelDirty = false;
-    }
+    await saveSharedPanelItem();
     return true;
 }
 
@@ -342,32 +490,24 @@ function openSharedPanel() {
     
     // Store reference to the current panel element for scoped queries
     sharedPanelElement = panel;
-    
-    // Get the container (either section or map-container for Map section)
-    const container = panel.parentElement;
-    const effectiveContainer = panel.closest('.has-detail-panel') || container;
-    console.log('[SharedPanel] Adding panel-open class to container:', effectiveContainer?.id || effectiveContainer?.className);
-    effectiveContainer?.classList.add('panel-open');
+
+    panel.classList.remove('is-empty');
+
+    // Callers set the header synchronously but render the body in an async
+    // step. Drop the placeholder now so it can't sit under a populated header.
+    panel.querySelector('.panel-placeholder')?.remove();
 }
 
 /**
  * Close the shared panel
  */
 function closeSharedPanel() {
-    // Find all containers that might have the panel-open class
-    const containers = [
-        sharedPanelCurrentSection,
-        document.getElementById('ontology-map-container'),
-        document.getElementById('ontology-entities-container'),
-        document.getElementById('ontology-relationships-container')
-    ];
-    
-    containers.forEach(container => {
-        if (container) {
-            container.classList.remove('panel-open');
-        }
+    // The panel stays in the layout, so "close" means drop the selection and
+    // fall back to the placeholder.
+    document.querySelectorAll('.shared-detail-panel').forEach(panel => {
+        renderPanelPlaceholder(panel);
     });
-    
+
     // Reset state
     sharedPanelEditType = null;
     sharedPanelEditIndex = -1;
@@ -380,6 +520,10 @@ function closeSharedPanel() {
     sharedPanelDashboardUrl = null;
     sharedPanelDashboardParams = {};
     sharedPanelBridges = [];
+    sharedPanelDatasets = [];
+    sharedPanelActions = [];
+    sharedPanelJobs = [];
+    sharedPanelBusinessRules = [];
     sharedPanelDirty = false;
 }
 
@@ -435,6 +579,11 @@ async function openEntityPanel(options = {}) {
     sharedPanelDashboardUrl = null;  // Reset dashboard for new entity
     sharedPanelDashboardParams = {};  // Reset dashboard parameter mappings
     sharedPanelBridges = [];  // Reset bridges for new entity
+    sharedPanelDatasets = [];  // Reset datasets for new entity
+    sharedPanelActions = [];  // Reset UC function actions for new entity
+    sharedPanelJobs = [];
+    sharedPanelBusinessRules = [];  // Reset business rules for new entity
+    sharedPanelVirtualAttributes = [];  // Reset virtual attributes for new entity
     
     openSharedPanel();
     
@@ -445,8 +594,6 @@ async function openEntityPanel(options = {}) {
     }
     
     panel.querySelector('#sharedPanelTitle').innerHTML = '<i class="bi bi-plus-circle"></i> <span id="sharedPanelItemName">Add Entity</span>';
-    panel.querySelector('#sharedSavePanelBtn').style.display = '';
-    
     await renderEntityForm(panel, null);
     attachDirtyTracking();
 }
@@ -477,6 +624,12 @@ async function openEntityPanelForEdit(idx, options = {}) {
     sharedPanelDashboardUrl = cls.dashboard || null;  // Load existing dashboard URL
     sharedPanelDashboardParams = cls.dashboardParams || {};  // Load existing parameter mappings
     sharedPanelBridges = cls.bridges ? JSON.parse(JSON.stringify(cls.bridges)) : [];
+    sharedPanelDatasets = _normalizeClassDatasets(cls);
+    const splitActions = _splitClassActions(cls.actions);
+    sharedPanelActions = splitActions.uc;
+    sharedPanelJobs = splitActions.jobs;
+    sharedPanelBusinessRules = cls.business_rules ? JSON.parse(JSON.stringify(cls.business_rules)) : [];
+    sharedPanelVirtualAttributes = cls.virtualAttributes ? JSON.parse(JSON.stringify(cls.virtualAttributes)) : [];
 
     console.log('[SharedPanel] Edit - Loaded class:', cls.name, 'dataProperties:', (cls.dataProperties || []).length);
     
@@ -485,6 +638,9 @@ async function openEntityPanelForEdit(idx, options = {}) {
     sharedPanelOwnAttributes = (cls.dataProperties || [])
         .map(p => ({ name: p.name || p.localName || p }))
         .filter(a => !inheritedNames.has(a.name));
+    
+    // Jump straight to a specific tab (e.g. Designer context-menu shortcuts)
+    if (options.activeTab) _entityPanelActiveTab = options.activeTab;
     
     openSharedPanel();
     
@@ -495,9 +651,7 @@ async function openEntityPanelForEdit(idx, options = {}) {
     }
     
     const emoji = cls.emoji || OntologyState.defaultClassEmoji || '📦';
-    panel.querySelector('#sharedPanelTitle').innerHTML = `<i class="bi bi-pencil"></i> ${emoji} <span id="sharedPanelItemName">${cls.name}</span>`;
-    panel.querySelector('#sharedSavePanelBtn').style.display = '';
-    
+    panel.querySelector('#sharedPanelTitle').innerHTML = `${emoji} <span id="sharedPanelItemName">${cls.name}</span>`;
     await renderEntityForm(panel, cls);
     attachDirtyTracking();
 }
@@ -514,12 +668,21 @@ async function openEntityPanelForView(idx, options = {}) {
     sharedPanelDashboardUrl = cls.dashboard || null;  // Load existing dashboard URL
     sharedPanelDashboardParams = cls.dashboardParams || {};  // Load existing parameter mappings
     sharedPanelBridges = cls.bridges ? JSON.parse(JSON.stringify(cls.bridges)) : [];
+    sharedPanelDatasets = _normalizeClassDatasets(cls);
+    const splitActions = _splitClassActions(cls.actions);
+    sharedPanelActions = splitActions.uc;
+    sharedPanelJobs = splitActions.jobs;
+    sharedPanelBusinessRules = cls.business_rules ? JSON.parse(JSON.stringify(cls.business_rules)) : [];
+    sharedPanelVirtualAttributes = cls.virtualAttributes ? JSON.parse(JSON.stringify(cls.virtualAttributes)) : [];
 
     sharedPanelInheritedAttributes = getSharedInheritedProperties(cls.parent);
     const inheritedNames = new Set(sharedPanelInheritedAttributes.map(a => a.name));
     sharedPanelOwnAttributes = (cls.dataProperties || [])
         .map(p => ({ name: p.name || p.localName || p }))
         .filter(a => !inheritedNames.has(a.name));
+    
+    // Jump straight to a specific tab (e.g. Designer context-menu shortcuts)
+    if (options.activeTab) _entityPanelActiveTab = options.activeTab;
     
     openSharedPanel();
     
@@ -528,8 +691,6 @@ async function openEntityPanelForView(idx, options = {}) {
     
     const emoji = cls.emoji || OntologyState.defaultClassEmoji || '📦';
     panel.querySelector('#sharedPanelTitle').innerHTML = `<i class="bi bi-eye"></i> ${emoji} <span id="sharedPanelItemName">${cls.name}</span>`;
-    panel.querySelector('#sharedSavePanelBtn').style.display = 'none';
-    
     await renderEntityForm(panel, cls, true);
 }
 
@@ -538,13 +699,13 @@ async function renderEntityForm(panel, cls, viewOnly = false) {
     
     const parentOptions = OntologyState.config.classes
         .filter(c => !cls || c.name !== cls.name)
-        .map(c => `<option value="${c.name}" ${cls && cls.parent === c.name ? 'selected' : ''}>${c.emoji || '📦'} ${c.name}</option>`)
+        .map(c => `<option value="${escapeHtml(c.name)}" ${cls && cls.parent === c.name ? 'selected' : ''}>${escapeHtml(c.emoji || '📦')} ${escapeHtml(c.name)}</option>`)
         .join('');
     
     // Options for disjoint/equivalent (exclude current class)
     const otherClassOptions = OntologyState.config.classes
         .filter(c => !cls || c.name !== cls.name)
-        .map(c => `<option value="${c.name}">${c.emoji || '📦'} ${c.name}</option>`)
+        .map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.emoji || '📦')} ${escapeHtml(c.name)}</option>`)
         .join('');
     
     const emoji = cls?.emoji || OntologyState.defaultClassEmoji || '📦';
@@ -581,151 +742,168 @@ async function renderEntityForm(panel, cls, viewOnly = false) {
                 if (isMember) currentGroup = g.name;
                 const sel = isMember ? 'selected' : '';
                 const icon = g.icon || '';
-                groupOptions += `<option value="${g.name}" ${sel}>${icon} ${g.label || g.name}</option>`;
+                groupOptions += `<option value="${escapeHtml(g.name)}" ${sel}>${escapeHtml(icon)} ${escapeHtml(g.label || g.name)}</option>`;
             });
         }
     } catch (e) {
         console.warn('[SharedPanel] Could not load groups:', e);
     }
     
-    const _eTab = _entityPanelActiveTab || 'details';
+    const _eTab = ENTITY_PANEL_TABS.includes(_entityPanelActiveTab) ? _entityPanelActiveTab : 'details';
     body.innerHTML = `
         <div id="sharedEntityAssignmentLink"></div>
         <form id="sharedEntityForm">
-            <ul class="form-tabs-nav">
-                <li><a class="form-tab-link ${_eTab === 'details' ? 'active' : ''}" data-form-tab="details" href="#" onclick="event.preventDefault(); switchFormTab(this)"><i class="bi bi-info-circle me-1"></i>Details</a></li>
-                <li><a class="form-tab-link ${_eTab === 'attributes' ? 'active' : ''}" data-form-tab="attributes" href="#" onclick="event.preventDefault(); switchFormTab(this)"><i class="bi bi-tags me-1"></i>Attributes</a></li>
-                <li><a class="form-tab-link ${_eTab === 'actions' ? 'active' : ''}" data-form-tab="actions" href="#" onclick="event.preventDefault(); switchFormTab(this)"><i class="bi bi-lightning me-1"></i>Actions</a></li>
-                <li><a class="form-tab-link ${_eTab === 'constraints' ? 'active' : ''}" data-form-tab="constraints" href="#" onclick="event.preventDefault(); switchFormTab(this)"><i class="bi bi-sliders me-1"></i>Constraints</a></li>
-            </ul>
+            ${renderFormTabsNav([
+                { id: 'details', icon: 'bi-info-circle', label: 'General' },
+                { id: 'attributes', icon: 'bi-tags', label: 'Attrs.' },
+                { id: 'model', icon: 'bi-diagram-2', label: 'Model' },
+                { id: 'behaviour', icon: 'bi-lightning', label: 'Behaviour' },
+                { id: 'links', icon: 'bi-link-45deg', label: 'Links' },
+            ], _eTab)}
 
             <div class="form-tab-pane ${_eTab === 'details' ? 'active' : ''}" data-form-tab-content="details">
-                <div class="mb-3 p-2 bg-light rounded border">
-                    <label for="sharedEntityParent" class="form-label"><i class="bi bi-diagram-2"></i> Inherits From</label>
-                    <select class="form-select form-select-sm" id="sharedEntityParent" ${disabled} onchange="onSharedEntityParentChange()">
-                        <option value="">-- None --</option>
-                        ${parentOptions}
-                    </select>
-                </div>
-                <div class="mb-3 p-2 bg-light rounded border">
-                    <label for="sharedEntityGroup" class="form-label"><i class="bi bi-collection"></i> Group</label>
-                    <select class="form-select form-select-sm" id="sharedEntityGroup" ${disabled}
-                        data-entity="${(cls?.name || '').replace(/"/g, '&quot;')}"
-                        data-prev-group="${currentGroup.replace(/"/g, '&quot;')}"
-                        onchange="onSharedEntityGroupChange(this.dataset.entity, this.value, this.dataset.prevGroup)">
-                        ${groupOptions}
-                    </select>
-                </div>
                 <div class="mb-3">
-                    <label for="sharedEntityName" class="form-label">Name <span class="text-danger">*</span></label>
-                    <input type="text" class="form-control form-control-sm" id="sharedEntityName" value="${cls?.name || ''}" ${disabled} required>
-                </div>
-                <div class="mb-3">
-                    <label for="sharedEntityLabel" class="form-label">Label</label>
-                    <input type="text" class="form-control form-control-sm" id="sharedEntityLabel" value="${cls?.label || cls?.name || ''}" ${disabled} placeholder="Defaults to name if empty">
-                </div>
-                <div class="mb-3">
-                    <label class="form-label">Icon</label>
-                    <div class="input-group input-group-sm">
-                        <span class="input-group-text" id="sharedEntityEmojiPreview">${emoji}</span>
-                        <input type="text" class="form-control" id="sharedEntityIcon" value="${emoji}" ${disabled} maxlength="2" style="width: 45px;">
-                        <button type="button" class="btn btn-outline-secondary" id="sharedEntityEmojiBtn" ${disabled}><i class="bi bi-emoji-smile"></i></button>
+                    <label for="sharedEntityName" class="form-label">Icon and name <span class="text-danger">*</span></label>
+                    <div class="panel-identity-row">
+                        <div class="input-group input-group-sm panel-identity-icon">
+                            <input type="text" class="form-control" id="sharedEntityIcon" value="${escapeHtml(emoji)}" ${disabled} maxlength="2" aria-label="Icon">
+                            <button type="button" class="btn btn-outline-secondary" id="sharedEntityEmojiBtn" ${disabled} aria-label="Pick an icon"><i class="bi bi-emoji-smile"></i></button>
+                        </div>
+                        <input type="text" class="form-control form-control-sm" id="sharedEntityName" value="${escapeHtml(cls?.name || '')}" ${disabled} required>
                     </div>
                     <div id="sharedEntityEmojiPickerMount"></div>
                 </div>
                 <div class="mb-3">
+                    <label for="sharedEntityLabel" class="form-label">Label</label>
+                    <input type="text" class="form-control form-control-sm" id="sharedEntityLabel" value="${escapeHtml(cls?.label || cls?.name || '')}" ${disabled} placeholder="Defaults to name if empty">
+                </div>
+                <div class="mb-3">
                     <label for="sharedEntityDescription" class="form-label">Description</label>
-                    <textarea class="form-control form-control-sm" id="sharedEntityDescription" rows="2" ${disabled}>${cls?.comment || cls?.description || ''}</textarea>
+                    <textarea class="form-control form-control-sm" id="sharedEntityDescription" rows="2" ${disabled}>${escapeHtml(cls?.comment || cls?.description || '')}</textarea>
+                </div>
+                <div class="mb-3">
+                    <label for="sharedEntityGroup" class="form-label">Group</label>
+                    <select class="form-select form-select-sm" id="sharedEntityGroup" ${disabled}
+                        data-entity="${escapeHtml(cls?.name || '')}"
+                        data-prev-group="${escapeHtml(currentGroup)}"
+                        onchange="onSharedEntityGroupChange(this.dataset.entity, this.value, this.dataset.prevGroup)">
+                        ${groupOptions}
+                    </select>
                 </div>
             </div>
 
             <div class="form-tab-pane ${_eTab === 'attributes' ? 'active' : ''}" data-form-tab-content="attributes">
-                <div class="d-flex justify-content-end gap-1 mb-2">
-                    ${!viewOnly ? `
-                        <button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" onclick="openMetadataAttributePicker()" title="Add from data sources"><i class="bi bi-database"></i></button>
-                        <button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" onclick="addSharedEntityAttribute()" title="Add manually"><i class="bi bi-plus"></i></button>
-                    ` : ''}
-                </div>
-                <div id="sharedEntityAttributes" class="border rounded p-2" style="background: #f8f9fa; overflow-y: auto;"></div>
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityAttributes', icon: 'bi-tags', title: 'Mapped attributes',
+                        subtitle: 'Data properties filled from the mapping.', viewOnly,
+                        menu: [
+                            { icon: 'bi-database', label: 'From data assets', onclick: 'openMetadataAttributePicker()' },
+                            { icon: 'bi-pencil', label: 'Manually', onclick: 'addSharedEntityAttribute()' },
+                        ] })}
+                    <div id="sharedEntityAttributes" class="panel-section-body"></div>
+                </section>
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityVirtualAttributes', icon: 'bi-magic', title: 'Virtual attributes', chip: 'viewed',
+                        subtitle: 'Values computed by a Unity Catalog function.',
+                        help: 'The function takes exactly one parameter: the ID of the entity. Values are not mapped, not stored in the graph, and not queryable in SPARQL or GraphQL.',
+                        onAdd: 'openVirtualAttributeSelectorModal()', viewOnly })}
+                    <div id="sharedEntityVirtualAttributes" class="panel-section-body"><div id="sharedEntityVirtualAttributesContent"></div></div>
+                </section>
             </div>
 
-            <div class="form-tab-pane ${_eTab === 'actions' ? 'active' : ''}" data-form-tab-content="actions">
-                <div class="mb-3">
-                    <label class="form-label d-flex justify-content-between align-items-center">
-                        <span><i class="bi bi-speedometer2 me-1"></i>Dashboard</span>
-                        ${!viewOnly ? '<button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" onclick="openDashboardSelectorModal()"><i class="bi bi-link-45deg"></i> Assign</button>' : ''}
-                    </label>
-                    <div id="sharedEntityDashboard" class="border rounded p-2" style="background: #f8f9fa;">
-                        <div id="sharedEntityDashboardContent">
-                            <small class="text-muted">No dashboard assigned</small>
-                        </div>
-                    </div>
-                </div>
-                <div class="mb-3">
-                    <label class="form-label d-flex justify-content-between align-items-center">
-                        <span><i class="bi bi-signpost-2 me-1"></i>Bridges</span>
-                        ${!viewOnly ? '<button type="button" class="btn btn-sm btn-outline-primary py-0 px-1" onclick="openBridgeSelectorModal()"><i class="bi bi-plus"></i> Add</button>' : ''}
-                    </label>
-                    <div id="sharedEntityBridges" class="border rounded p-2" style="background: #f8f9fa;">
-                        <div id="sharedEntityBridgesContent">
-                            <small class="text-muted">No bridges to other domains</small>
-                        </div>
-                    </div>
-                </div>
+            <div class="form-tab-pane ${_eTab === 'model' ? 'active' : ''}" data-form-tab-content="model">
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityParent', icon: 'bi-diagram-2', title: 'Inherits from', labelFor: 'sharedEntityParent',
+                        subtitle: 'The parent’s attributes and relationships apply here too.' })}
+                    <select class="form-select form-select-sm" id="sharedEntityParent" ${disabled} onchange="onSharedEntityParentChange()">
+                        <option value="">-- None --</option>
+                        ${parentOptions}
+                    </select>
+                    <div id="sharedEntityInheritedRelations" class="panel-inherited"></div>
+                </section>
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityEquivalentTo', icon: 'bi-arrows-angle-expand', title: 'Equivalent to',
+                        subtitle: 'Entities with exactly the same instances.' })}
+                    <select id="sharedEntityEquivalentTo" class="d-none" multiple aria-hidden="true" tabindex="-1">${otherClassOptions}</select>
+                    <div id="sharedEntityEquivalentToChips" class="panel-axiom-chips"></div>
+                    ${!viewOnly ? `<select class="form-select form-select-sm panel-axiom-add" id="sharedEntityEquivalentToAdd" aria-label="Add an equivalent entity" onchange="addSharedAxiomChip('sharedEntityEquivalentTo', this)"></select>` : ''}
+                </section>
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityDisjointWith', icon: 'bi-x-circle', title: 'Disjoint with',
+                        subtitle: 'No instance can belong to both.' })}
+                    <select id="sharedEntityDisjointWith" class="d-none" multiple aria-hidden="true" tabindex="-1">${otherClassOptions}</select>
+                    <div id="sharedEntityDisjointWithChips" class="panel-axiom-chips"></div>
+                    ${!viewOnly ? `<select class="form-select form-select-sm panel-axiom-add" id="sharedEntityDisjointWithAdd" aria-label="Add a disjoint entity" onchange="addSharedAxiomChip('sharedEntityDisjointWith', this)"></select>` : ''}
+                </section>
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityBridges', icon: 'bi-signpost-2', title: 'Bridges',
+                        subtitle: 'Links to entities in other domains.', onAdd: 'openBridgeSelectorModal()', viewOnly })}
+                    <div id="sharedEntityBridges" class="panel-section-body"><div id="sharedEntityBridgesContent"></div></div>
+                </section>
             </div>
 
-            <div class="form-tab-pane ${_eTab === 'constraints' ? 'active' : ''}" data-form-tab-content="constraints">
-                <div class="mb-3">
-                    <label class="form-label small text-muted mb-1" title="Classes that share no instances with this class">
-                        <i class="bi bi-x-circle me-1"></i>Disjoint With
-                    </label>
-                    <select class="form-select form-select-sm" id="sharedEntityDisjointWith" ${disabled} multiple size="3" 
-                            title="Select classes that cannot share instances with this class">
-                        ${otherClassOptions}
-                    </select>
-                    <div class="form-text small">No instance can belong to both this class and the selected classes</div>
-                </div>
-                <div class="mb-3">
-                    <label class="form-label small text-muted mb-1" title="Classes that have exactly the same instances as this class">
-                        <i class="bi bi-arrows-angle-expand me-1"></i>Equivalent To
-                    </label>
-                    <select class="form-select form-select-sm" id="sharedEntityEquivalentTo" ${disabled} multiple size="3"
-                            title="Select classes that are equivalent to this class">
-                        ${otherClassOptions}
-                    </select>
-                    <div class="form-text small">Classes that have exactly the same instances</div>
-                </div>
+            <div class="form-tab-pane ${_eTab === 'behaviour' ? 'active' : ''}" data-form-tab-content="behaviour">
+                <div class="panel-pane-intro">What the Knowledge Graph can run on one entity.</div>
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityActions', icon: 'bi-lightning-charge', title: 'Functions', chip: 'result',
+                        subtitle: 'Run on demand; the result is shown to the user.',
+                        help: 'A Unity Catalog function taking exactly one parameter: the ID of the entity.',
+                        onAdd: 'openActionSelectorModal()', viewOnly })}
+                    <div id="sharedEntityActions" class="panel-section-body"><div id="sharedEntityActionsContent"></div></div>
+                </section>
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityJobs', icon: 'bi-play-circle', title: 'Jobs', chip: 'background',
+                        subtitle: 'Start a Databricks Job for this entity.',
+                        help: 'The job must declare an entity_id parameter. Spark runs as the job’s run-as identity; on Lakehouse domains the trigger is on behalf of the signed-in user.',
+                        onAdd: 'openJobSelectorModal()', viewOnly })}
+                    <div id="sharedEntityJobs" class="panel-section-body"><div id="sharedEntityJobsContent"></div></div>
+                </section>
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityBusinessRules', icon: 'bi-diagram-3', title: 'Inference rules (SWRL)', chip: 'graphWrite',
+                        subtitle: 'Infer new facts for this entity.',
+                        help: 'SWRL rules from Ontology → Business Rules, triggered on a single entity. The inferred triples are written to the graph.',
+                        onAdd: 'openBusinessRuleSelectorModal()', viewOnly })}
+                    <div id="sharedEntityBusinessRules" class="panel-section-body"><div id="sharedEntityBusinessRulesContent"></div></div>
+                </section>
+            </div>
+
+            <div class="form-tab-pane ${_eTab === 'links' ? 'active' : ''}" data-form-tab-content="links">
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityDashboard', icon: 'bi-speedometer2', title: 'Dashboard',
+                        subtitle: 'Opened from the entity, with parameters set from it.', onAdd: 'openDashboardSelectorModal()', viewOnly })}
+                    <div id="sharedEntityDashboard" class="panel-section-body"><div id="sharedEntityDashboardContent"></div></div>
+                </section>
+                <section class="panel-section">
+                    ${panelSectionHeader({ targetId: 'sharedEntityDataset', icon: 'bi-table', title: 'Datasets',
+                        subtitle: 'Unity Catalog tables, views, or metric views matched to the entity on a key column.', onAdd: 'openDatasetSelectorModal()', viewOnly })}
+                    <div id="sharedEntityDataset" class="panel-section-body"><div id="sharedEntityDatasetContent"></div></div>
+                </section>
             </div>
         </form>
     `;
     
-    // Set multi-select values for constraints
-    if (disjointWith.length > 0) {
-        const disjointSelect = panelGetById('sharedEntityDisjointWith');
-        if (disjointSelect) {
-            Array.from(disjointSelect.options).forEach(opt => {
-                opt.selected = disjointWith.includes(opt.value);
-            });
+    [['sharedEntityDisjointWith', disjointWith], ['sharedEntityEquivalentTo', equivalentTo]].forEach(([selectId, values]) => {
+        const select = panelGetById(selectId);
+        if (select) {
+            Array.from(select.options).forEach(opt => { opt.selected = values.includes(opt.value); });
         }
-    }
-    if (equivalentTo.length > 0) {
-        const equivalentSelect = panelGetById('sharedEntityEquivalentTo');
-        if (equivalentSelect) {
-            Array.from(equivalentSelect.options).forEach(opt => {
-                opt.selected = equivalentTo.includes(opt.value);
-            });
-        }
-    }
+    });
+    renderSharedAxiomChips('sharedEntityEquivalentTo', viewOnly);
+    renderSharedAxiomChips('sharedEntityDisjointWith', viewOnly);
     
     renderSharedEntityAttributes(viewOnly);
+    renderSharedEntityVirtualAttributes(viewOnly);
     renderSharedEntityDashboard(viewOnly);
+    renderSharedEntityDataset(viewOnly);
+    renderSharedEntityActions(viewOnly);
+    renderSharedEntityJobs(viewOnly);
+    renderSharedEntityBusinessRules(viewOnly);
     renderSharedEntityBridges(viewOnly);
     if (!viewOnly) {
         var _btnEl = panelGetById('sharedEntityEmojiBtn');
         if (_btnEl) {
             EmojiPicker.create({
                 triggerEl:   _btnEl,
-                previewEl:   panelGetById('sharedEntityEmojiPreview'),
                 inputEl:     panelGetById('sharedEntityIcon'),
                 containerEl: panelGetById('sharedEntityEmojiPickerMount')
             });
@@ -735,47 +913,109 @@ async function renderEntityForm(panel, cls, viewOnly = false) {
     if (cls?.name) {
         _renderAssignmentLink('sharedEntityAssignmentLink', 'entity', cls.name);
     }
+    renderSharedInheritedRelations(cls);
+}
+
+/**
+ * Equivalent To / Disjoint With: the hidden multi-select stays the source
+ * read on save; chips show its selected options and the add list the rest.
+ */
+function renderSharedAxiomChips(selectId, viewOnly) {
+    const select = panelGetById(selectId);
+    const chips = panelGetById(`${selectId}Chips`);
+    if (!select || !chips) return;
+    const options = Array.from(select.options);
+    const selected = options.filter(o => o.selected);
+    chips.innerHTML = selected.length
+        ? selected.map(o => `
+            <span class="panel-axiom-chip">${escapeHtml(o.textContent.trim())}${viewOnly ? '' :
+                `<button type="button" class="btn-close" onclick="removeSharedAxiomChip('${selectId}', ${options.indexOf(o)})" aria-label="Remove ${escapeHtml(o.value)}"></button>`}</span>`).join('')
+        : `<span class="panel-axiom-none">None</span>`;
+    _updatePanelSection(selectId, { count: selected.length });
+
+    const add = panelGetById(`${selectId}Add`);
+    if (!add) return;
+    const free = options.filter(o => !o.selected);
+    add.innerHTML = `<option value="">+ Add entity…</option>` +
+        free.map(o => `<option value="${options.indexOf(o)}">${escapeHtml(o.textContent.trim())}</option>`).join('');
+    add.disabled = free.length === 0;
+}
+
+function addSharedAxiomChip(selectId, addSelect) {
+    const option = panelGetById(selectId)?.options[Number(addSelect.value)];
+    if (addSelect.value === '' || !option) return;
+    option.selected = true;
+    markPanelDirty();
+    renderSharedAxiomChips(selectId, false);
+    panelGetById(`${selectId}Add`)?.focus();
+}
+
+function removeSharedAxiomChip(selectId, optionIndex) {
+    const option = panelGetById(selectId)?.options[optionIndex];
+    if (!option) return;
+    option.selected = false;
+    renderSharedAxiomChips(selectId, false);
+    panelGetById(`${selectId}Add`)?.focus();
 }
 
 function renderSharedEntityAttributes(viewOnly = false) {
     const container = panelGetById('sharedEntityAttributes');
     if (!container) return;
-    
-    let html = '';
-    
-    if (sharedPanelInheritedAttributes.length > 0) {
-        html += '<div class="mb-1"><small class="text-muted fw-bold"><i class="bi bi-diagram-2"></i> Inherited</small></div>';
-        html += sharedPanelInheritedAttributes.map(attr => `
-            <div class="d-flex align-items-center gap-1 mb-1 opacity-75">
-                <input type="text" class="form-control form-control-sm bg-light" value="${attr.name || ''}" disabled readonly style="font-size:0.75rem;">
-                <span class="badge bg-secondary" style="font-size:0.6rem;"><i class="bi bi-lock"></i></span>
-            </div>
-        `).join('');
-        if (sharedPanelOwnAttributes.length > 0) html += '<hr class="my-1">';
+    const inherited = sharedPanelInheritedAttributes;
+    const own = sharedPanelOwnAttributes;
+    _updatePanelSection('sharedEntityAttributes', { count: inherited.length + own.length });
+    if (!inherited.length && !own.length) {
+        container.innerHTML = panelEmptyState('No mapped attributes yet.', 'Add an attribute', 'addSharedEntityAttribute()', viewOnly);
+        return;
     }
-    
-    if (sharedPanelOwnAttributes.length > 0) {
-        if (sharedPanelInheritedAttributes.length > 0) {
-            html += '<div class="mb-1"><small class="text-muted fw-bold"><i class="bi bi-tag"></i> Own</small></div>';
-        }
-        html += sharedPanelOwnAttributes.map((attr, idx) => `
-            <div class="d-flex align-items-center gap-1 mb-1">
-                <input type="text" class="form-control form-control-sm" value="${attr.name || ''}" ${viewOnly ? 'disabled' : ''} onchange="updateSharedEntityAttribute(${idx}, this.value)" style="font-size:0.75rem;">
-                ${!viewOnly ? `<button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" onclick="removeSharedEntityAttribute(${idx})"><i class="bi bi-x"></i></button>` : ''}
-            </div>
-        `).join('');
+    const inheritedHtml = inherited.map(attr => `
+        <div class="panel-attr-row panel-attr-row--inherited">
+            <i class="bi bi-lock panel-item-icon" aria-hidden="true"></i>
+            <span class="panel-attr-name">${escapeHtml(attr.name || '')}</span>
+            <span class="panel-attr-origin">inherited</span>
+        </div>`).join('');
+    const ownHtml = own.map((attr, idx) => `
+        <div class="panel-attr-row">
+            <i class="bi bi-tag panel-item-icon" aria-hidden="true"></i>
+            <input type="text" class="form-control form-control-sm panel-inline-field" value="${escapeHtml(attr.name || '')}" ${viewOnly ? 'disabled' : ''} placeholder="Attribute name" aria-label="Attribute name" onchange="updateSharedEntityAttribute(${idx}, this.value)">
+            ${!viewOnly ? `<button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" onclick="removeSharedEntityAttribute(${idx})" title="Remove attribute" aria-label="Remove attribute"><i class="bi bi-x"></i></button>` : ''}
+        </div>`).join('');
+    container.innerHTML = `<div class="panel-list">${inheritedHtml}${ownHtml}</div>`;
+}
+
+/**
+ * Mirror the open entity's attribute buffer into OntologyState.config now.
+ *
+ * The panel is an edit buffer, but attribute add/remove/rename must not wait
+ * for an explicit Save: a background autosave (autoGenerateOwl → saveConfig, a
+ * section init, the registry unload beacon …) can persist OntologyState.config
+ * at any moment, and if the buffer edit has not been mirrored yet that autosave
+ * re-persists the pre-edit attribute list — the bug where a removed attribute
+ * reappears after leaving and returning. We only touch the open class's
+ * dataProperties (own attributes); name/parent/dataset etc. stay in the form
+ * until Save, and the class index is stable, so this is safe. Matches the
+ * shape saveSharedEntity writes (own attributes only; inherited are derived).
+ *
+ * @param {boolean} persist When true, also push the config to the session so
+ *     the edit survives an immediate navigation without relying on the unload
+ *     flush.
+ */
+function commitOpenEntityAttributesToConfig(persist) {
+    if (sharedPanelEditType !== 'entity' || sharedPanelEditIndex < 0) return;
+    const cls = OntologyState.config?.classes?.[sharedPanelEditIndex];
+    if (!cls) return;
+    cls.dataProperties = sharedPanelOwnAttributes
+        .filter(a => a.name && a.name.trim())
+        .map(a => ({ name: a.name.trim(), localName: a.name.trim() }));
+    if (persist && typeof window.saveConfigToSession === 'function') {
+        window.saveConfigToSession();
     }
-    
-    if (sharedPanelInheritedAttributes.length === 0 && sharedPanelOwnAttributes.length === 0) {
-        html = '<small class="text-muted">No attributes</small>';
-    }
-    
-    container.innerHTML = html;
 }
 
 function addSharedEntityAttribute() {
     sharedPanelOwnAttributes.push({ name: '' });
     markPanelDirty();
+    commitOpenEntityAttributesToConfig(false);
     renderSharedEntityAttributes(false);
     setTimeout(() => {
         const inputs = document.querySelectorAll('#sharedEntityAttributes input:not([disabled])');
@@ -786,18 +1026,61 @@ function addSharedEntityAttribute() {
 function updateSharedEntityAttribute(idx, value) {
     if (sharedPanelOwnAttributes[idx]) sharedPanelOwnAttributes[idx].name = value.trim();
     markPanelDirty();
+    // Rename typed by the user: mirror into config immediately, and persist so
+    // the session reflects it even if the user navigates right after.
+    commitOpenEntityAttributesToConfig(true);
 }
 
 function removeSharedEntityAttribute(idx) {
     sharedPanelOwnAttributes.splice(idx, 1);
     markPanelDirty();
+    // Persist the removal now: a background autosave must not re-add the
+    // attribute from a stale OntologyState.config after we leave the page.
+    commitOpenEntityAttributesToConfig(true);
     renderSharedEntityAttributes(false);
+}
+
+function renderSharedInheritedRelations(cls) {
+    const box = panelGetById('sharedEntityInheritedRelations');
+    if (!box) return;
+    if (!cls || !cls.name || typeof outgoingRelationsForClass !== 'function') {
+        box.innerHTML = '';
+        box.style.display = 'none';
+        return;
+    }
+    const classes = (OntologyState.config.classes || []).map(c =>
+        c.name === cls.name ? { ...c, parent: cls.parent } : c
+    );
+    const inherited = outgoingRelationsForClass(
+        classes,
+        OntologyState.config.properties || [],
+        cls.name
+    ).filter(r => r.inherited);
+    if (!inherited.length) {
+        box.innerHTML = '';
+        box.style.display = 'none';
+        return;
+    }
+    box.style.display = '';
+    box.innerHTML = `
+        <div class="panel-inherited-title">Inherited relationships</div>
+        ${inherited.map(r => `
+            <button type="button" class="btn btn-link btn-sm panel-inherited-link" data-panel-passive
+                onclick="editPropertyByName(${escapeHtml(JSON.stringify(r.name))})">
+                <i class="bi bi-arrow-right-short" aria-hidden="true"></i>${escapeHtml(r.label || r.name)}
+                <span class="text-muted">→ ${escapeHtml(r.range || '')}</span>
+                <span class="panel-attr-origin">from ${escapeHtml(r.inheritedFrom || '')}</span>
+            </button>`).join('')}
+    `;
 }
 
 function onSharedEntityParentChange() {
     const parentName = panelGetById('sharedEntityParent')?.value;
     sharedPanelInheritedAttributes = getSharedInheritedProperties(parentName);
     renderSharedEntityAttributes(false);
+    const cls = OntologyState.config.classes[sharedPanelEditIndex];
+    const name = cls?.name || panelGetById('sharedEntityName')?.value;
+    renderSharedInheritedRelations({ ...(cls || {}), name, parent: parentName });
 }
 
 function onSharedEntityGroupChange(entityName, newGroup, previousGroup) {
@@ -848,7 +1131,8 @@ function onSharedEntityGroupChange(entityName, newGroup, previousGroup) {
 function renderSharedEntityDashboard(viewOnly = false) {
     const container = panelGetById('sharedEntityDashboardContent');
     if (!container) return;
-    
+    _updatePanelSection('sharedEntityDashboard', { count: sharedPanelDashboardUrl ? 1 : 0, single: true });
+
     if (sharedPanelDashboardUrl) {
         const dashboardName = extractDashboardNameFromUrl(sharedPanelDashboardUrl);
         
@@ -857,37 +1141,31 @@ function renderSharedEntityDashboard(viewOnly = false) {
         let mappingsHtml = '';
         if (mappings.length > 0) {
             mappingsHtml = `
-                <div class="mt-2 pt-2 border-top">
-                    <small class="text-muted d-block mb-1"><i class="bi bi-link-45deg me-1"></i>Parameter Mappings:</small>
+                <div class="panel-item-sub">
+                    <div class="panel-item-sub-label">Parameters</div>
                     ${mappings.map(([param, mapping]) => {
                         // Handle both old format (string) and new format (object)
                         const attrName = typeof mapping === 'object' ? mapping.attribute : mapping;
                         const displayName = attrName === '__ID__' ? 'Entity ID' : attrName;
                         return `
-                            <div class="d-flex align-items-center gap-1 small">
-                                <span class="badge bg-secondary">${escapeHtml(param)}</span>
-                                <i class="bi bi-arrow-right text-muted"></i>
-                                <span class="badge bg-primary">${escapeHtml(displayName)}</span>
+                            <div class="panel-param-row">
+                                <code>${escapeHtml(param)}</code>
+                                <i class="bi bi-arrow-left-short text-muted" aria-hidden="true"></i>
+                                <span>${escapeHtml(displayName)}</span>
                             </div>
                         `;
                     }).join('')}
                 </div>
             `;
         }
-        
-        container.innerHTML = `
-            <div class="d-flex align-items-center gap-2">
-                <a href="${escapeHtml(sharedPanelDashboardUrl)}" target="_blank" class="text-decoration-none flex-grow-1" title="Open dashboard">
-                    <i class="bi bi-speedometer2 text-primary"></i>
-                    <span class="ms-1">${escapeHtml(dashboardName)}</span>
-                    <i class="bi bi-box-arrow-up-right ms-1 small"></i>
-                </a>
-                ${!viewOnly ? `<button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" onclick="removeSharedEntityDashboard()" title="Remove dashboard"><i class="bi bi-x"></i></button>` : ''}
-            </div>
-            ${mappingsHtml}
-        `;
+        const openLink = `<a href="${escapeHtml(sharedPanelDashboardUrl)}" target="_blank" rel="noopener" class="panel-item-link">Open <i class="bi bi-box-arrow-up-right"></i></a>`;
+        container.innerHTML = panelItemRow({
+            icon: 'bi-speedometer2', title: dashboardName, badge: openLink,
+            removeOnclick: 'removeSharedEntityDashboard()', removeTitle: 'Remove dashboard', viewOnly,
+            body: mappingsHtml,
+        });
     } else {
-        container.innerHTML = '<small class="text-muted">No dashboard assigned</small>';
+        container.innerHTML = panelEmptyState('No dashboard linked yet.', 'Link a dashboard', 'openDashboardSelectorModal()', viewOnly);
     }
 }
 
@@ -918,6 +1196,1485 @@ function removeSharedEntityDashboard() {
 }
 
 // =====================================================
+// UNITY CATALOG DATASET
+// =====================================================
+
+function _normalizeClassDatasets(cls) {
+    if (!cls) return [];
+    if (Array.isArray(cls.datasets) && cls.datasets.length) {
+        return JSON.parse(JSON.stringify(cls.datasets));
+    }
+    if (cls.dataset) {
+        return [JSON.parse(JSON.stringify(cls.dataset))];
+    }
+    return [];
+}
+
+function _datasetAssetType(tableType) {
+    const t = String(tableType || '').toUpperCase().replace(/\s+/g, '_');
+    if (t === 'VIEW') return 'VIEW';
+    if (t === 'METRIC_VIEW') return 'METRIC_VIEW';
+    return 'TABLE';
+}
+
+function _datasetTypeMeta(type) {
+    const t = String(type || '').toUpperCase();
+    if (t === 'METRIC_VIEW') {
+        return { label: 'Metric View', icon: 'bi-graph-up-arrow', badgeClass: 'bg-info text-dark' };
+    }
+    if (t === 'VIEW') {
+        return { label: 'View', icon: 'bi-eye', badgeClass: 'bg-info text-dark' };
+    }
+    return { label: 'Table', icon: 'bi-table', badgeClass: 'bg-secondary' };
+}
+
+/**
+ * Render linked Unity Catalog datasets in the entity form
+ */
+function renderSharedEntityDataset(viewOnly = false) {
+    const container = panelGetById('sharedEntityDatasetContent');
+    if (!container) return;
+
+    _updatePanelSection('sharedEntityDataset', { count: sharedPanelDatasets.length });
+    if (!sharedPanelDatasets.length) {
+        container.innerHTML = panelEmptyState('No datasets linked yet.', 'Link a dataset', 'openDatasetSelectorModal()', viewOnly);
+        return;
+    }
+
+    container.innerHTML = sharedPanelDatasets.map((ds, idx) => {
+        const meta = _datasetTypeMeta(ds.type);
+        const badge = `<span class="panel-kind-badge">${meta.label}</span>`;
+        const fullName = ds.fullName || `${ds.catalog}.${ds.schema}.${ds.asset}`;
+        const keyColHtml = !viewOnly
+            ? `<div class="panel-key-row">
+                 <label class="panel-item-sub-label mb-0" for="datasetKeyColumnSelect-${idx}" title="Column matched against the entity ID">Key column</label>
+                 <select class="form-select form-select-sm"
+                         id="datasetKeyColumnSelect-${idx}"
+                         onchange="onDatasetKeyColumnChange(${idx}, this.value)"
+                         disabled>
+                   <option value="">Loading columns…</option>
+                 </select>
+                 <button type="button"
+                         class="btn btn-sm btn-outline-secondary d-none"
+                         id="datasetKeyColumnRetry-${idx}"
+                         onclick="retryDatasetKeyColumns(${idx})">Retry</button>
+               </div>`
+            : (ds.key_column
+                ? `<div class="panel-key-row"><span class="panel-item-sub-label">Key column</span><code>${escapeHtml(ds.key_column)}</code></div>`
+                : '');
+        const descHtml = !viewOnly
+            ? `<div class="panel-desc-row">
+                 ${panelInlineField({ value: ds.description || '', placeholder: 'Purpose of this dataset', oninput: `onDatasetDescriptionChange(${idx}, this.value)`, id: `datasetDescriptionInput-${idx}` })}
+                 <button type="button"
+                         class="btn btn-sm btn-link p-0"
+                         id="datasetDescriptionFromUcBtn-${idx}"
+                         title="Fill from the Data Assets table description"
+                         aria-label="Fill from the Data Assets table description"
+                         onclick="loadDatasetDescriptionFromDataSource(${idx})">
+                   <i class="bi bi-database-down"></i>
+                 </button>
+               </div>`
+            : panelInlineField({ value: ds.description || '', viewOnly: true });
+        return panelItemRow({
+            icon: meta.icon, title: ds.asset, badge, meta: fullName,
+            removeOnclick: `removeSharedEntityDataset(${idx})`, removeTitle: 'Remove dataset', viewOnly,
+            body: keyColHtml + descHtml,
+        });
+    }).join('');
+
+    if (!viewOnly) {
+        sharedPanelDatasets.forEach((ds, idx) => {
+            void _loadDatasetKeyColumns(idx, ds);
+        });
+    }
+}
+
+function _setDatasetKeyColumnState(index, label, retry = false) {
+    const select = panelGetById(`datasetKeyColumnSelect-${index}`);
+    const retryButton = panelGetById(`datasetKeyColumnRetry-${index}`);
+    if (select) {
+        select.disabled = true;
+        select.innerHTML = `<option value="">${escapeHtml(label)}</option>`;
+    }
+    if (retryButton) retryButton.classList.toggle('d-none', !retry);
+}
+
+function _populateDatasetKeyColumnSelect(index, columns) {
+    const select = panelGetById(`datasetKeyColumnSelect-${index}`);
+    const retryButton = panelGetById(`datasetKeyColumnRetry-${index}`);
+    const ds = sharedPanelDatasets[index];
+    if (!select || !ds) return;
+
+    let usable = Array.isArray(columns) ? columns : [];
+    if (String(ds.type || '').toUpperCase() === 'METRIC_VIEW') {
+        const withRoles = usable.filter(c => c && c.role);
+        if (withRoles.length) {
+            usable = withRoles.filter(c => String(c.role).toLowerCase() !== 'measure');
+        }
+    }
+
+    const names = usable
+        .map(column => String(column?.name || '').trim())
+        .filter(Boolean);
+    if (!names.length) {
+        _setDatasetKeyColumnState(index, 'No columns found', true);
+        return;
+    }
+
+    const current = ds.key_column || '';
+    const options = [new Option('Select a key column…', '')];
+    if (current && !names.includes(current)) {
+        options.push(new Option(`${current} (missing)`, current, true, true));
+    }
+    for (const name of names) {
+        const selected = name === current;
+        options.push(new Option(name, name, selected, selected));
+    }
+    select.replaceChildren(...options);
+    select.disabled = false;
+    if (retryButton) retryButton.classList.add('d-none');
+}
+
+async function _enrichMetricViewColumns(dataset, columns) {
+    if (String(dataset?.type || '').toUpperCase() !== 'METRIC_VIEW') {
+        return columns;
+    }
+    if ((columns || []).some(c => c && c.role)) {
+        return columns;
+    }
+    try {
+        const resp = await fetch('/domain/metadata', { credentials: 'same-origin' });
+        if (!resp.ok) return columns;
+        const data = await resp.json();
+        const tables = data.metadata?.tables || [];
+        const target = (
+            dataset.fullName
+            || `${dataset.catalog}.${dataset.schema}.${dataset.asset}`
+        ).toLowerCase();
+        const match = tables.find(table =>
+            String(table.full_name || '').toLowerCase() === target
+            || String(table.name || '').toLowerCase() === String(dataset.asset || '').toLowerCase()
+        );
+        if (!match || !Array.isArray(match.columns) || !match.columns.length) {
+            return columns;
+        }
+        const byName = new Map(
+            (columns || []).map(c => [String(c.name || '').toLowerCase(), c])
+        );
+        return match.columns.map(col => {
+            const name = col.name || col.column_name || '';
+            const base = byName.get(String(name).toLowerCase()) || { name };
+            return {
+                ...base,
+                name,
+                role: col.role || (col.is_measure ? 'measure' : 'dimension'),
+            };
+        });
+    } catch (err) {
+        console.warn('[Dataset] Could not enrich metric-view column roles:', err);
+        return columns;
+    }
+}
+
+async function _loadDatasetKeyColumns(index, dataset, force = false) {
+    const datasetKey = _datasetKey(dataset);
+    if (!datasetKey || !dataset?.catalog || !dataset?.schema || !dataset?.asset) {
+        _setDatasetKeyColumnState(index, 'No columns found', true);
+        return;
+    }
+
+    if (!force && _datasetColumnCache.has(datasetKey)) {
+        _populateDatasetKeyColumnSelect(index, _datasetColumnCache.get(datasetKey));
+        return;
+    }
+
+    _setDatasetKeyColumnState(index, 'Loading columns…');
+    try {
+        const response = await fetch('/mapping/table-columns', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                catalog: dataset.catalog,
+                schema: dataset.schema,
+                table: dataset.asset,
+            }),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        let columns = Array.isArray(data.columns) ? data.columns : [];
+        columns = await _enrichMetricViewColumns(dataset, columns);
+        if (columns.length) {
+            _datasetColumnCache.set(datasetKey, columns);
+        }
+        if (_datasetKey(sharedPanelDatasets[index]) === datasetKey) {
+            _populateDatasetKeyColumnSelect(index, columns);
+        }
+    } catch (error) {
+        console.error('[Dataset] Error loading columns:', error);
+        if (_datasetKey(sharedPanelDatasets[index]) === datasetKey) {
+            _setDatasetKeyColumnState(index, 'Failed to load columns', true);
+        }
+    }
+}
+
+function retryDatasetKeyColumns(index) {
+    const ds = sharedPanelDatasets[index];
+    if (!ds) return;
+    void _loadDatasetKeyColumns(index, ds, true);
+}
+
+function onDatasetKeyColumnChange(index, value) {
+    const ds = sharedPanelDatasets[index];
+    if (!ds) return;
+    ds.key_column = value || null;
+    markPanelDirty();
+}
+
+function onDatasetDescriptionChange(index, value) {
+    const ds = sharedPanelDatasets[index];
+    if (!ds) return;
+    ds.description = value.trim() || null;
+    markPanelDirty();
+}
+
+async function loadDatasetDescriptionFromDataSource(index) {
+    const ds = sharedPanelDatasets[index];
+    if (!ds?.catalog || !ds?.schema || !ds?.asset) {
+        showNotification('No dataset selected', 'warning', 2500);
+        return;
+    }
+    const btn = panelGetById(`datasetDescriptionFromUcBtn-${index}`);
+    const datasetKey = _datasetKey(ds);
+    const targetFullName = (
+        ds.fullName
+        || `${ds.catalog}.${ds.schema}.${ds.asset}`
+    ).toLowerCase();
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status"></span>';
+    }
+    try {
+        const resp = await fetch('/domain/metadata', { credentials: 'same-origin' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        if (_datasetKey(sharedPanelDatasets[index]) !== datasetKey) return;
+        if (!data.success || !data.has_metadata || !data.metadata?.tables?.length) {
+            showNotification('No Data Assets loaded for this domain', 'info', 3000);
+            return;
+        }
+        const match = data.metadata.tables.find(table => {
+            const fullName = String(table.full_name || '').toLowerCase();
+            const shortName = String(table.name || '').toLowerCase();
+            return fullName === targetFullName
+                || shortName === targetFullName
+                || shortName === String(ds.asset || '').toLowerCase();
+        });
+        if (!match) {
+            showNotification('Dataset not found in Data Assets', 'info', 3000);
+            return;
+        }
+        const comment = String(match.comment || match.description || '').trim();
+        if (!comment) {
+            showNotification('No table description in Data Assets for this dataset', 'info', 3000);
+            return;
+        }
+        onDatasetDescriptionChange(index, comment);
+        const input = panelGetById(`datasetDescriptionInput-${index}`);
+        if (input) input.value = comment;
+        showNotification('Description loaded from Data Assets', 'success', 2500);
+    } catch (err) {
+        console.error('[Dataset] Error loading Data Assets description:', err);
+        if (_datasetKey(sharedPanelDatasets[index]) === datasetKey) {
+            showNotification('Failed to load Data Assets description', 'danger', 3000);
+        }
+    } finally {
+        if (btn && _datasetKey(sharedPanelDatasets[index]) === datasetKey) {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-database-down"></i>';
+        }
+    }
+}
+
+/**
+ * Remove a linked dataset by index
+ */
+function removeSharedEntityDataset(index) {
+    sharedPanelDatasets.splice(index, 1);
+    markPanelDirty();
+    renderSharedEntityDataset(false);
+}
+
+// Selector state
+let _datasetSelCatalog = '';
+let _datasetSelSchema = '';
+let _datasetAllAssets = [];
+const _datasetColumnCache = new Map();
+
+function _datasetKey(dataset) {
+    if (!dataset) return '';
+    return `${dataset.catalog || ''}.${dataset.schema || ''}.${dataset.asset || ''}`;
+}
+
+/**
+ * Open the dataset selector modal (catalog -> schema -> table/view/metric view).
+ */
+async function openDatasetSelectorModal() {
+    const modalId = 'datasetSelectorModal';
+    const existing = document.getElementById(modalId);
+    if (existing) existing.remove();
+
+    _datasetSelCatalog = '';
+    _datasetSelSchema = '';
+    _datasetAllAssets = [];
+
+    const modalHtml = `
+        <div class="modal fade" id="${modalId}" tabindex="-1" data-bs-backdrop="static">
+            <div class="modal-dialog modal-lg modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="bi bi-table me-2"></i>Select a Unity Catalog table, view, or metric view</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="row g-2 mb-3">
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Catalog</label>
+                                <select class="form-select form-select-sm" id="datasetCatalogSelect" onchange="_datasetOnCatalogChange()">
+                                    <option value="">Loading...</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Schema</label>
+                                <select class="form-select form-select-sm" id="datasetSchemaSelect" onchange="_datasetOnSchemaChange()" disabled>
+                                    <option value="">Select a catalog first</option>
+                                </select>
+                            </div>
+                        </div>
+                        <input type="text" class="form-control form-control-sm mb-2" id="datasetAssetSearch" placeholder="Search tables, views, and metric views..." oninput="_filterDatasetAssets()" disabled>
+                        <div id="datasetAssetList" class="list-group" style="max-height: 320px; overflow-y: auto;">
+                            <div class="text-muted p-3 text-center">Select a catalog and schema to list assets</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+    const modal = new bootstrap.Modal(document.getElementById(modalId));
+    modal.show();
+
+    try {
+        const resp = await fetch('/settings/catalogs', { credentials: 'same-origin' });
+        const data = await resp.json();
+        const sel = document.getElementById('datasetCatalogSelect');
+        if (!sel) return;
+        const catalogs = data.catalogs || [];
+        sel.innerHTML = '<option value="">Select a catalog...</option>' +
+            catalogs.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+    } catch (err) {
+        console.error('[Dataset] Error loading catalogs:', err);
+        const sel = document.getElementById('datasetCatalogSelect');
+        if (sel) sel.innerHTML = '<option value="">Failed to load catalogs</option>';
+    }
+}
+
+async function _datasetOnCatalogChange() {
+    const catalog = document.getElementById('datasetCatalogSelect')?.value || '';
+    _datasetSelCatalog = catalog;
+    _datasetSelSchema = '';
+    _datasetAllAssets = [];
+    const searchInput = document.getElementById('datasetAssetSearch');
+    if (searchInput) searchInput.disabled = true;
+    const list = document.getElementById('datasetAssetList');
+    if (list) list.innerHTML = '<div class="text-muted p-3 text-center">Select a schema to list assets</div>';
+    if (catalog) {
+        await _datasetLoadSchemas(catalog);
+    } else {
+        const schemaSel = document.getElementById('datasetSchemaSelect');
+        if (schemaSel) {
+            schemaSel.disabled = true;
+            schemaSel.innerHTML = '<option value="">Select a catalog first</option>';
+        }
+    }
+}
+
+async function _datasetLoadSchemas(catalog, preSchema = '') {
+    const schemaSel = document.getElementById('datasetSchemaSelect');
+    if (!schemaSel) return;
+    schemaSel.disabled = true;
+    schemaSel.innerHTML = '<option value="">Loading...</option>';
+    try {
+        const resp = await fetch(`/settings/schemas/${encodeURIComponent(catalog)}`, { credentials: 'same-origin' });
+        const data = await resp.json();
+        const schemas = data.schemas || [];
+        schemaSel.innerHTML = '<option value="">Select a schema...</option>' +
+            schemas.map(s => `<option value="${escapeHtml(s)}"${s === preSchema ? ' selected' : ''}>${escapeHtml(s)}</option>`).join('');
+        schemaSel.disabled = false;
+        if (preSchema) {
+            _datasetSelSchema = preSchema;
+            await _datasetLoadAssets(catalog, preSchema);
+        }
+    } catch (err) {
+        console.error('[Dataset] Error loading schemas:', err);
+        schemaSel.innerHTML = '<option value="">Failed to load schemas</option>';
+    }
+}
+
+async function _datasetOnSchemaChange() {
+    const schema = document.getElementById('datasetSchemaSelect')?.value || '';
+    _datasetSelSchema = schema;
+    if (schema && _datasetSelCatalog) {
+        await _datasetLoadAssets(_datasetSelCatalog, schema);
+    } else {
+        const list = document.getElementById('datasetAssetList');
+        if (list) list.innerHTML = '<div class="text-muted p-3 text-center">Select a schema to list assets</div>';
+    }
+}
+
+async function _datasetLoadAssets(catalog, schema) {
+    const list = document.getElementById('datasetAssetList');
+    if (list) list.innerHTML = '<div class="text-center py-3"><div class="spinner-border spinner-border-sm text-primary"></div> Loading assets...</div>';
+    try {
+        const resp = await fetch(`/settings/uc-assets?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}`, { credentials: 'same-origin' });
+        const data = await resp.json();
+        _datasetAllAssets = (data.success && data.assets) ? data.assets : [];
+        const searchInput = document.getElementById('datasetAssetSearch');
+        if (searchInput) searchInput.disabled = _datasetAllAssets.length === 0;
+        if (!_datasetAllAssets.length) {
+            if (list) list.innerHTML = '<div class="text-muted p-3 text-center">No tables, views, or metric views found in this schema</div>';
+            return;
+        }
+        _renderDatasetAssetList(_datasetAllAssets);
+    } catch (err) {
+        console.error('[Dataset] Error loading assets:', err);
+        if (list) list.innerHTML = '<div class="text-danger p-2"><i class="bi bi-exclamation-triangle"></i> Failed to load assets</div>';
+    }
+}
+
+function _renderDatasetAssetList(assets) {
+    const list = document.getElementById('datasetAssetList');
+    if (!list) return;
+    const linked = new Set(sharedPanelDatasets.map(_datasetKey));
+    list.innerHTML = assets.map(a => {
+        const type = _datasetAssetType(a.table_type);
+        const meta = _datasetTypeMeta(type);
+        const already = linked.has(`${_datasetSelCatalog}.${_datasetSelSchema}.${a.name}`);
+        const badge = `<span class="badge ${meta.badgeClass}">${meta.label}</span>`;
+        const disabledAttr = already ? 'disabled' : '';
+        const note = already ? '<small class="text-muted">Already linked</small>' : (
+            a.comment ? `<small class="text-muted">${escapeHtml(String(a.comment).substring(0, 80))}</small>` : ''
+        );
+        return `
+            <button type="button" class="list-group-item list-group-item-action d-flex align-items-center gap-2"
+                    ${disabledAttr}
+                    onclick='_datasetSelectAsset(${JSON.stringify(a).replace(/'/g, "&#39;")})'>
+                <i class="bi ${meta.icon} text-primary"></i>
+                <div class="flex-grow-1">
+                    <div class="fw-semibold">${escapeHtml(a.name)} ${badge}</div>
+                    ${note}
+                </div>
+                <i class="bi bi-chevron-right text-muted"></i>
+            </button>
+        `;
+    }).join('');
+}
+
+function _filterDatasetAssets() {
+    const q = (document.getElementById('datasetAssetSearch')?.value || '').toLowerCase();
+    const filtered = _datasetAllAssets.filter(a =>
+        (a.name || '').toLowerCase().includes(q) ||
+        (a.comment || '').toLowerCase().includes(q)
+    );
+    _renderDatasetAssetList(filtered);
+}
+
+function _datasetSelectAsset(asset) {
+    const fullName = asset.full_name || `${_datasetSelCatalog}.${_datasetSelSchema}.${asset.name}`;
+    const key = `${_datasetSelCatalog}.${_datasetSelSchema}.${asset.name}`;
+    if (sharedPanelDatasets.some(ds => _datasetKey(ds) === key)) {
+        showNotification(`Dataset already linked: ${fullName}`, 'warning', 3000);
+        return;
+    }
+    const defaultDescription = String(asset.comment || '').trim();
+    sharedPanelDatasets.push({
+        catalog: _datasetSelCatalog,
+        schema: _datasetSelSchema,
+        asset: asset.name,
+        type: _datasetAssetType(asset.table_type),
+        fullName,
+        key_column: null,
+        description: defaultDescription || null,
+    });
+    markPanelDirty();
+    renderSharedEntityDataset(false);
+    closeDatasetSelectorModal();
+    showNotification(`Dataset linked: ${fullName}`, 'success', 3000);
+}
+
+function closeDatasetSelectorModal() {
+    const modal = document.getElementById('datasetSelectorModal');
+    if (modal) {
+        const bsModal = bootstrap.Modal.getInstance(modal);
+        if (bsModal) bsModal.hide();
+        modal.addEventListener('hidden.bs.modal', () => modal.remove(), { once: true });
+    }
+    _datasetSelCatalog = '';
+    _datasetSelSchema = '';
+    _datasetAllAssets = [];
+}
+
+// =====================================================
+// UNITY CATALOG FUNCTION PICKERS — shared cascade
+// =====================================================
+// Both the Actions picker and the Virtual Attributes picker walk the same
+// catalog -> schema -> function cascade. Only the eligibility rules and what
+// they do with the chosen function differ, so the three fetches live here.
+
+/**
+ * Fill a catalog <select> with the accessible Unity Catalog catalogs.
+ */
+async function _ucFillCatalogSelect(selectId) {
+    try {
+        const resp = await fetch('/settings/catalogs', { credentials: 'same-origin' });
+        const data = await resp.json();
+        const sel = document.getElementById(selectId);
+        if (!sel) return;
+        const catalogs = data.catalogs || [];
+        sel.innerHTML = '<option value="">Select a catalog...</option>' +
+            catalogs.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+    } catch (err) {
+        console.error('[UCPicker] Error loading catalogs:', err);
+        const sel = document.getElementById(selectId);
+        if (sel) sel.innerHTML = '<option value="">Failed to load catalogs</option>';
+    }
+}
+
+/**
+ * Fill a schema <select> with the schemas of *catalog*.
+ */
+async function _ucFillSchemaSelect(catalog, selectId) {
+    const schemaSel = document.getElementById(selectId);
+    if (!schemaSel) return;
+    schemaSel.disabled = true;
+    schemaSel.innerHTML = '<option value="">Loading...</option>';
+    try {
+        const resp = await fetch(`/settings/schemas/${encodeURIComponent(catalog)}`, { credentials: 'same-origin' });
+        const data = await resp.json();
+        const schemas = data.schemas || [];
+        schemaSel.innerHTML = '<option value="">Select a schema...</option>' +
+            schemas.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('');
+        schemaSel.disabled = false;
+    } catch (err) {
+        console.error('[UCPicker] Error loading schemas:', err);
+        schemaSel.innerHTML = '<option value="">Failed to load schemas</option>';
+    }
+}
+
+/**
+ * Return the user-defined functions of catalog.schema, or [] on failure.
+ * Each entry carries param_count, returns_table, return_type and
+ * return_columns.
+ */
+async function _ucFetchFunctions(catalog, schema) {
+    const resp = await fetch(
+        `/settings/uc-functions?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}`,
+        { credentials: 'same-origin' }
+    );
+    const data = await resp.json();
+    return (data.success && data.functions) ? data.functions : [];
+}
+
+/**
+ * Number of values a function returns: one RETURNS TABLE column each, or 1 for
+ * a scalar. Null when the metastore did not report the columns of a table
+ * function, which is not the same as returning nothing.
+ *
+ * @param {Object} fn Entry from /settings/uc-functions.
+ * @returns {?number} Output count, or null when unknown.
+ */
+function _ucOutputCount(fn) {
+    if (!fn.returns_table) return 1;
+    const columns = fn.return_columns || [];
+    return columns.length > 0 ? columns.length : null;
+}
+
+/**
+ * Badge stating how many values a function returns, for the picker list.
+ * Empty when the count is unknown rather than guessing at it.
+ */
+function _ucOutputBadge(fn) {
+    const count = _ucOutputCount(fn);
+    if (count === null) {
+        return '<span class="badge bg-light text-muted border" ' +
+            'title="Unity Catalog did not report this function\'s result columns">' +
+            'outputs unknown</span>';
+    }
+    return `<span class="badge bg-light text-dark border" title="Returns ${count} value${count === 1 ? '' : 's'}">` +
+        `${count} output${count === 1 ? '' : 's'}</span>`;
+}
+
+/**
+ * Discard a dynamically inserted picker modal once Bootstrap has hidden it.
+ */
+function _ucClosePickerModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+    const bsModal = bootstrap.Modal.getInstance(modal);
+    if (bsModal) bsModal.hide();
+    modal.addEventListener('hidden.bs.modal', () => modal.remove(), { once: true });
+}
+
+function _isJobAction(action) {
+    return !!(action && (action.kind === 'job' || (action.job_id != null && action.kind !== 'uc_function')));
+}
+
+function _splitClassActions(raw) {
+    const all = raw ? JSON.parse(JSON.stringify(raw)) : [];
+    return {
+        uc: all.filter(a => !_isJobAction(a)),
+        jobs: all.filter(a => _isJobAction(a)),
+    };
+}
+
+// =====================================================
+// UNITY CATALOG FUNCTION ACTIONS
+// =====================================================
+
+/**
+ * Render the linked Unity Catalog function actions in the entity form
+ */
+function renderSharedEntityActions(viewOnly = false) {
+    const container = panelGetById('sharedEntityActionsContent');
+    if (!container) return;
+
+    _updatePanelSection('sharedEntityActions', { count: sharedPanelActions.length });
+    if (!sharedPanelActions.length) {
+        container.innerHTML = panelEmptyState('No functions yet.', 'Add a function', 'openActionSelectorModal()', viewOnly);
+        return;
+    }
+
+    container.innerHTML = sharedPanelActions.map((action, idx) => {
+        const fullName = action.fullName
+            || `${action.catalog || ''}.${action.schema || ''}.${action.function || ''}`;
+        return panelItemRow({
+            icon: 'bi-lightning-charge', title: action.function || '',
+            badge: `<span class="panel-kind-badge">${action.returns_table ? 'Table' : 'Scalar'}</span>`,
+            meta: fullName,
+            removeOnclick: `removeSharedEntityAction(${idx})`, removeTitle: 'Remove function', viewOnly,
+            body: panelInlineField({
+                value: action.description || '', placeholder: 'What does this function do?', viewOnly,
+                oninput: `onActionDescriptionChange(${idx}, this.value)`, id: `actionDescriptionInput-${idx}`,
+            }),
+        });
+    }).join('');
+}
+
+function onActionDescriptionChange(index, value) {
+    const action = sharedPanelActions[index];
+    if (!action) return;
+    action.description = value.trim() || null;
+    markPanelDirty();
+}
+
+/**
+ * Remove an action by index
+ */
+function removeSharedEntityAction(index) {
+    sharedPanelActions.splice(index, 1);
+    markPanelDirty();
+    renderSharedEntityActions(false);
+}
+
+function renderSharedEntityJobs(viewOnly = false) {
+    const container = panelGetById('sharedEntityJobsContent');
+    if (!container) return;
+    _updatePanelSection('sharedEntityJobs', { count: sharedPanelJobs.length });
+    if (!sharedPanelJobs.length) {
+        container.innerHTML = panelEmptyState('No jobs yet.', 'Add a job', 'openJobSelectorModal()', viewOnly);
+        return;
+    }
+    container.innerHTML = sharedPanelJobs.map((job, idx) => panelItemRow({
+        icon: 'bi-play-circle', title: String(job.job_name || job.function || job.job_id),
+        meta: `job:${job.job_id}`,
+        removeOnclick: `removeSharedEntityJob(${idx})`, removeTitle: 'Remove job', viewOnly,
+        body: panelInlineField({
+            value: job.description || '', placeholder: 'What does this job do?', viewOnly,
+            oninput: `onJobDescriptionChange(${idx}, this.value)`,
+        }),
+    })).join('');
+}
+
+function onJobDescriptionChange(index, value) {
+    const job = sharedPanelJobs[index];
+    if (!job) return;
+    job.description = value.trim() || null;
+    markPanelDirty();
+}
+
+function removeSharedEntityJob(index) {
+    sharedPanelJobs.splice(index, 1);
+    markPanelDirty();
+    renderSharedEntityJobs(false);
+}
+
+async function openJobSelectorModal() {
+    const modalId = 'jobSelectorModal';
+    const existing = document.getElementById(modalId);
+    if (existing) existing.remove();
+    const modalHtml = `
+        <div class="modal fade" id="${modalId}" tabindex="-1" data-bs-backdrop="static">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header py-2">
+                        <h6 class="modal-title"><i class="bi bi-play-circle me-2"></i>Add Databricks Job</h6>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <input type="search" class="form-control form-control-sm mb-2" id="jobSelectorQuery"
+                               placeholder="Filter by name…" oninput="_jobSelectorReload()">
+                        <div id="jobSelectorList" class="border rounded p-2" style="max-height: 240px; overflow-y: auto;">
+                            <small class="text-muted">Loading…</small>
+                        </div>
+                        <div class="form-text small">Only jobs that declare an <code>entity_id</code> parameter are listed. OntoBricks starts the job; Spark still uses the job run-as identity.</div>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+    const modal = new bootstrap.Modal(document.getElementById(modalId));
+    document.getElementById(modalId).addEventListener('hidden.bs.modal', () => {
+        document.getElementById(modalId)?.remove();
+    }, { once: true });
+    modal.show();
+    await _jobSelectorReload();
+}
+
+async function _jobSelectorReload() {
+    const list = document.getElementById('jobSelectorList');
+    if (!list) return;
+    const q = (document.getElementById('jobSelectorQuery')?.value || '').trim();
+    list.innerHTML = '<small class="text-muted">Loading…</small>';
+    try {
+        const resp = await fetch('/settings/jobs?q=' + encodeURIComponent(q), { credentials: 'same-origin' });
+        const data = await resp.json();
+        const jobs = (data.success && data.jobs) ? data.jobs : [];
+        if (!jobs.length) {
+            list.innerHTML = '<small class="text-muted">No jobs with an entity_id parameter</small>';
+            return;
+        }
+        list.innerHTML = jobs.map(job => {
+            const id = Number(job.job_id);
+            const name = job.name || ('job-' + id);
+            return `<button type="button" class="btn btn-sm btn-outline-secondary w-100 text-start mb-1" onclick="_jobSelectJob(${id}, this.dataset.name)" data-name="${escapeHtml(name)}">
+                <span class="fw-semibold">${escapeHtml(name)}</span>
+                <small class="text-muted d-block">job:${id}</small>
+            </button>`;
+        }).join('');
+    } catch (err) {
+        console.error('[SharedPanel] Failed to list jobs', err);
+        list.innerHTML = '<small class="text-danger">Failed to list jobs</small>';
+    }
+}
+
+function _jobSelectJob(jobId, name) {
+    if (sharedPanelJobs.some(j => Number(j.job_id) === Number(jobId))) {
+        showNotification('Job already assigned: ' + name, 'warning', 3000);
+        return;
+    }
+    sharedPanelJobs.push({
+        kind: 'job',
+        job_id: Number(jobId),
+        job_name: name,
+        function: name,
+        fullName: 'job:' + jobId,
+        description: null,
+    });
+    markPanelDirty();
+    renderSharedEntityJobs(false);
+    _ucClosePickerModal('jobSelectorModal');
+    showNotification('Job added: ' + name, 'success', 3000);
+}
+
+// Action selector state
+let _actionSelCatalog = '';
+let _actionSelSchema = '';
+let _actionAllFunctions = [];
+
+/**
+ * Open the action selector modal (catalog -> schema -> function).
+ */
+async function openActionSelectorModal() {
+    const modalId = 'actionSelectorModal';
+    const existing = document.getElementById(modalId);
+    if (existing) existing.remove();
+
+    _actionSelCatalog = '';
+    _actionSelSchema = '';
+    _actionAllFunctions = [];
+
+    const modalHtml = `
+        <div class="modal fade" id="${modalId}" tabindex="-1" data-bs-backdrop="static">
+            <div class="modal-dialog modal-lg modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="bi bi-lightning-charge me-2"></i>Select a Unity Catalog Function</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="alert alert-info py-2 px-3 small">
+                            <i class="bi bi-info-circle me-1"></i>
+                            The function must accept <strong>exactly one parameter</strong>: the ID of the
+                            entity to act on. Functions with a different signature cannot be selected.
+                        </div>
+                        <div class="row g-2 mb-3">
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Catalog</label>
+                                <select class="form-select form-select-sm" id="actionCatalogSelect" onchange="_actionOnCatalogChange()">
+                                    <option value="">Loading...</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Schema</label>
+                                <select class="form-select form-select-sm" id="actionSchemaSelect" onchange="_actionOnSchemaChange()" disabled>
+                                    <option value="">Select a catalog first</option>
+                                </select>
+                            </div>
+                        </div>
+                        <input type="text" class="form-control form-control-sm mb-2" id="actionFunctionSearch" placeholder="Search functions..." oninput="_filterActionFunctions()" disabled>
+                        <div id="actionFunctionList" class="list-group" style="max-height: 320px; overflow-y: auto;">
+                            <div class="text-muted p-3 text-center">Select a catalog and schema to list functions</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+    const modal = new bootstrap.Modal(document.getElementById(modalId));
+    modal.show();
+
+    await _ucFillCatalogSelect('actionCatalogSelect');
+}
+
+async function _actionOnCatalogChange() {
+    const catalog = document.getElementById('actionCatalogSelect')?.value || '';
+    _actionSelCatalog = catalog;
+    _actionSelSchema = '';
+    _actionAllFunctions = [];
+    const searchInput = document.getElementById('actionFunctionSearch');
+    if (searchInput) searchInput.disabled = true;
+    const list = document.getElementById('actionFunctionList');
+    if (list) list.innerHTML = '<div class="text-muted p-3 text-center">Select a schema to list functions</div>';
+    if (catalog) {
+        await _ucFillSchemaSelect(catalog, 'actionSchemaSelect');
+    } else {
+        const schemaSel = document.getElementById('actionSchemaSelect');
+        if (schemaSel) {
+            schemaSel.disabled = true;
+            schemaSel.innerHTML = '<option value="">Select a catalog first</option>';
+        }
+    }
+}
+
+async function _actionOnSchemaChange() {
+    const schema = document.getElementById('actionSchemaSelect')?.value || '';
+    _actionSelSchema = schema;
+    if (schema && _actionSelCatalog) {
+        await _actionLoadFunctions(_actionSelCatalog, schema);
+    } else {
+        const list = document.getElementById('actionFunctionList');
+        if (list) list.innerHTML = '<div class="text-muted p-3 text-center">Select a schema to list functions</div>';
+    }
+}
+
+async function _actionLoadFunctions(catalog, schema) {
+    const list = document.getElementById('actionFunctionList');
+    if (list) list.innerHTML = '<div class="text-center py-3"><div class="spinner-border spinner-border-sm text-primary"></div> Loading functions...</div>';
+    try {
+        _actionAllFunctions = await _ucFetchFunctions(catalog, schema);
+        const searchInput = document.getElementById('actionFunctionSearch');
+        if (searchInput) searchInput.disabled = _actionAllFunctions.length === 0;
+        if (!_actionAllFunctions.length) {
+            if (list) list.innerHTML = '<div class="text-muted p-3 text-center">No functions found in this schema</div>';
+            return;
+        }
+        _renderActionFunctionList(_actionAllFunctions);
+    } catch (err) {
+        console.error('[Action] Error loading functions:', err);
+        if (list) list.innerHTML = '<div class="text-danger p-2"><i class="bi bi-exclamation-triangle"></i> Failed to load functions</div>';
+    }
+}
+
+function _renderActionFunctionList(functions) {
+    const list = document.getElementById('actionFunctionList');
+    if (!list) return;
+    list.innerHTML = functions.map(fn => {
+        // Only single-parameter functions are eligible: the one argument is the entity ID.
+        const eligible = Number(fn.param_count) === 1;
+        const badge = fn.returns_table
+            ? '<span class="badge bg-info text-dark">Table</span>'
+            : '<span class="badge bg-secondary">Scalar</span>';
+        const params = (fn.input_params || []).join(', ');
+        const hint = eligible
+            ? `<small class="text-muted">${escapeHtml(fn.comment ? String(fn.comment).substring(0, 80) : `(${params})`)}</small>`
+            : `<small class="text-warning"><i class="bi bi-exclamation-triangle me-1"></i>Needs exactly 1 parameter (has ${Number(fn.param_count) || 0})</small>`;
+        return `
+            <button type="button" class="list-group-item list-group-item-action d-flex align-items-center gap-2"
+                    ${eligible ? `onclick='_actionSelectFunction(${JSON.stringify(fn).replace(/'/g, "&#39;")})'` : 'disabled'}>
+                <i class="bi bi-lightning-charge text-warning"></i>
+                <div class="flex-grow-1">
+                    <div class="fw-semibold">${escapeHtml(fn.name)} ${badge} ${_ucOutputBadge(fn)}</div>
+                    ${hint}
+                </div>
+                ${eligible ? '<i class="bi bi-chevron-right text-muted"></i>' : ''}
+            </button>
+        `;
+    }).join('');
+}
+
+function _filterActionFunctions() {
+    const q = (document.getElementById('actionFunctionSearch')?.value || '').toLowerCase();
+    const filtered = _actionAllFunctions.filter(fn =>
+        (fn.name || '').toLowerCase().includes(q) ||
+        (fn.comment || '').toLowerCase().includes(q)
+    );
+    _renderActionFunctionList(filtered);
+}
+
+function _actionSelectFunction(fn) {
+    const fullName = fn.full_name || `${_actionSelCatalog}.${_actionSelSchema}.${fn.name}`;
+    if (sharedPanelActions.some(a => a.fullName === fullName)) {
+        showNotification(`Function already assigned: ${fullName}`, 'warning', 3000);
+        return;
+    }
+    sharedPanelActions.push({
+        catalog: _actionSelCatalog,
+        schema: _actionSelSchema,
+        function: fn.name,
+        fullName,
+        description: String(fn.comment || '').trim() || null,
+        returns_table: Boolean(fn.returns_table),
+    });
+    markPanelDirty();
+    renderSharedEntityActions(false);
+    closeActionSelectorModal();
+    showNotification(`Function added: ${fullName} — add a description`, 'success', 3000);
+}
+
+function closeActionSelectorModal() {
+    _ucClosePickerModal('actionSelectorModal');
+}
+
+// =====================================================
+// BUSINESS RULES (SWRL rules referenced by the entity)
+// =====================================================
+// Mirrors OntologyRules.swrl_rule_classes / rules_for_class on the backend.
+
+const _SWRL_CLASS_ATOM_RE = /(?:(\w+):)?([A-Za-z_]\w*)\s*\(([^)]*)\)/g;
+let _businessRuleCandidates = [];
+
+function swrlRuleClassNames(rule) {
+    const names = new Set();
+    ['antecedent', 'consequent'].forEach(part => {
+        for (const m of String((rule && rule[part]) || '').matchAll(_SWRL_CLASS_ATOM_RE)) {
+            if (m[1]) continue;
+            const args = m[3].split(',').map(a => a.trim()).filter(Boolean);
+            if (args.length === 1) names.add(m[2].toLowerCase());
+        }
+    });
+    return names;
+}
+
+function rulesUsingClass(rules, classes, className, parentName) {
+    const lineage = [className];
+    if (parentName) lineage.push(parentName, ...ancestorClassNames(classes, parentName));
+    else lineage.push(...ancestorClassNames(classes, className));
+    const wanted = new Set(lineage.filter(Boolean).map(n => n.toLowerCase()));
+    return (rules || []).filter(r => {
+        if (!r || !r.name) return false;
+        for (const n of swrlRuleClassNames(r)) if (wanted.has(n)) return true;
+        return false;
+    });
+}
+
+function renderSharedEntityBusinessRules(viewOnly = false) {
+    const container = panelGetById('sharedEntityBusinessRulesContent');
+    if (!container) return;
+    _updatePanelSection('sharedEntityBusinessRules', { count: sharedPanelBusinessRules.length });
+    if (!sharedPanelBusinessRules.length) {
+        container.innerHTML = panelEmptyState('No inference rules yet.', 'Add an inference rule', 'openBusinessRuleSelectorModal()', viewOnly);
+        return;
+    }
+    container.innerHTML = sharedPanelBusinessRules.map((ref, idx) => panelItemRow({
+        icon: 'bi-diagram-3', title: ref.name || '',
+        removeOnclick: `removeSharedEntityBusinessRule(${idx})`, removeTitle: 'Remove inference rule', viewOnly,
+    })).join('');
+}
+
+function removeSharedEntityBusinessRule(index) {
+    sharedPanelBusinessRules.splice(index, 1);
+    markPanelDirty();
+    renderSharedEntityBusinessRules(false);
+}
+
+async function openBusinessRuleSelectorModal() {
+    const modalId = 'businessRuleSelectorModal';
+    document.getElementById(modalId)?.remove();
+
+    const className = panelGetById('sharedEntityName')?.value.trim() || sharedPanelOriginalName || '';
+    const parentName = panelGetById('sharedEntityParent')?.value || '';
+    if (!className) {
+        showNotification('Enter the entity name first', 'warning');
+        return;
+    }
+
+    const modalHtml = `
+        <div class="modal fade" id="${modalId}" tabindex="-1" data-bs-backdrop="static">
+            <div class="modal-dialog modal-lg modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="bi bi-diagram-3 me-2"></i>Select inference rules (SWRL)</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="alert alert-info py-2 px-3 small">
+                            <i class="bi bi-info-circle me-1"></i>
+                            Only SWRL rules that reference <strong>${escapeHtml(className)}</strong> or one of its parents are listed.
+                        </div>
+                        <div class="d-flex gap-2 mb-2">
+                            <input type="text" class="form-control form-control-sm" id="businessRuleSearch" placeholder="Search rules..." oninput="_renderBusinessRuleCandidates()">
+                            <button type="button" class="btn btn-sm btn-outline-secondary text-nowrap" onclick="_toggleAllBusinessRules()">Select all</button>
+                        </div>
+                        <div id="businessRuleList" class="list-group" style="max-height: 340px; overflow-y: auto;">
+                            <div class="text-muted p-3 text-center">Loading rules...</div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="button" class="btn btn-sm btn-primary" onclick="_addSelectedBusinessRules()"><i class="bi bi-plus me-1"></i>Add selected</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+    new bootstrap.Modal(document.getElementById(modalId)).show();
+
+    let rules = [];
+    try {
+        const r = await fetch('/ontology/swrl/list', { credentials: 'same-origin' });
+        const d = await r.json();
+        rules = d.rules || [];
+    } catch (e) {
+        console.error('[SharedPanel] Could not load SWRL rules:', e);
+    }
+    const attached = new Set(sharedPanelBusinessRules.map(b => b.name));
+    _businessRuleCandidates = rulesUsingClass(rules, OntologyState.config.classes || [], className, parentName)
+        .filter(r => !attached.has(r.name));
+    _renderBusinessRuleCandidates();
+}
+
+function _renderBusinessRuleCandidates() {
+    const list = document.getElementById('businessRuleList');
+    if (!list) return;
+    if (!_businessRuleCandidates.length) {
+        list.innerHTML = '<div class="text-muted p-3 text-center">No SWRL rule references this entity or its parents.</div>';
+        return;
+    }
+    const q = (document.getElementById('businessRuleSearch')?.value || '').toLowerCase();
+    const checked = new Set(Array.from(list.querySelectorAll('input[type=checkbox]:checked')).map(i => i.value));
+    list.innerHTML = _businessRuleCandidates
+        .filter(r => !q || `${r.name} ${r.description || ''}`.toLowerCase().includes(q))
+        .map(r => {
+            const disabled = r.enabled === false;
+            return `
+                <label class="list-group-item d-flex gap-2 align-items-start ${disabled ? 'text-muted' : ''}">
+                    <input class="form-check-input mt-1" type="checkbox" value="${escapeHtml(r.name)}" ${disabled ? 'disabled' : ''} ${checked.has(r.name) ? 'checked' : ''}>
+                    <span class="flex-grow-1">
+                        <span class="fw-semibold">${escapeHtml(r.name)}</span>
+                        ${disabled ? '<span class="badge bg-secondary ms-1">Disabled</span>' : ''}
+                        ${r.description ? `<small class="d-block">${escapeHtml(r.description)}</small>` : ''}
+                        <code class="small d-block text-break">${escapeHtml(r.antecedent || '')} &rarr; ${escapeHtml(r.consequent || '')}</code>
+                    </span>
+                </label>`;
+        }).join('');
+}
+
+function _toggleAllBusinessRules() {
+    const boxes = Array.from(document.querySelectorAll('#businessRuleList input[type=checkbox]:not(:disabled)'));
+    const allChecked = boxes.length > 0 && boxes.every(b => b.checked);
+    boxes.forEach(b => { b.checked = !allChecked; });
+}
+
+function _addSelectedBusinessRules() {
+    const names = Array.from(document.querySelectorAll('#businessRuleList input[type=checkbox]:checked')).map(i => i.value);
+    if (!names.length) {
+        showNotification('Select at least one rule', 'warning');
+        return;
+    }
+    names.forEach(name => {
+        if (!sharedPanelBusinessRules.some(b => b.name === name)) sharedPanelBusinessRules.push({ name });
+    });
+    markPanelDirty();
+    renderSharedEntityBusinessRules(false);
+    _ucClosePickerModal('businessRuleSelectorModal');
+    showNotification(`${names.length} inference rule(s) added`, 'success', 2000);
+}
+
+// =====================================================
+// VIRTUAL ATTRIBUTES
+// =====================================================
+// A virtual attribute is not mapped and not stored in the graph: a Unity
+// Catalog function computes it on demand. One function yields one attribute
+// per RETURNS TABLE column, or a single one when it is scalar. Nothing is
+// computed here — at design time there is no entity instance to bind the ID to.
+
+/**
+ * Alias used for the single value of a scalar function, which has no result
+ * column name of its own. Must match SCALAR_RESULT_COLUMN server-side.
+ */
+const VA_SCALAR_COLUMN = 'result';
+
+/**
+ * Render the declared virtual attribute groups in the entity form.
+ */
+function renderSharedEntityVirtualAttributes(viewOnly = false) {
+    const container = panelGetById('sharedEntityVirtualAttributesContent');
+    if (!container) return;
+
+    const attrCount = sharedPanelVirtualAttributes.reduce((n, g) => n + (g.attributes || []).length, 0);
+    _updatePanelSection('sharedEntityVirtualAttributes', { count: attrCount });
+    if (!sharedPanelVirtualAttributes.length) {
+        container.innerHTML = panelEmptyState('No virtual attributes yet.', 'Add a virtual attribute', 'openVirtualAttributeSelectorModal()', viewOnly);
+        return;
+    }
+
+    container.innerHTML = sharedPanelVirtualAttributes.map((group, idx) => {
+        const fullName = group.fullName
+            || `${group.catalog || ''}.${group.schema || ''}.${group.function || ''}`;
+        const attrsHtml = (group.attributes || []).map((attr, aIdx) => {
+            const type = attr.dataType ? `<span class="panel-kind-badge">${escapeHtml(attr.dataType)}</span>` : '';
+            const label = viewOnly
+                ? `<span>${escapeHtml(attr.label || attr.name || '')}</span>`
+                : `<input type="text" class="form-control form-control-sm panel-inline-field"
+                          value="${escapeHtml(attr.label || attr.name || '')}"
+                          placeholder="Display label" aria-label="Display label for ${escapeHtml(attr.name || '')}"
+                          oninput="onVirtualAttributeLabelChange(${idx}, ${aIdx}, this.value)">`;
+            return `
+                <div class="panel-attr-row">
+                    <code class="panel-attr-name">${escapeHtml(attr.name || '')}</code>${type}
+                    ${label}
+                </div>`;
+        }).join('');
+        return panelItemRow({
+            icon: 'bi-magic', title: group.function || '',
+            badge: `<span class="panel-kind-badge">${group.returns_table ? 'Table' : 'Scalar'}</span>`,
+            meta: fullName,
+            removeOnclick: `removeSharedEntityVirtualAttribute(${idx})`, removeTitle: 'Remove this function and its attributes', viewOnly,
+            body: panelInlineField({
+                value: group.description || '', placeholder: 'What does this function compute?', viewOnly,
+                oninput: `onVirtualAttributeDescriptionChange(${idx}, this.value)`, id: `vaDescriptionInput-${idx}`,
+            }) + `<div class="va-group-attrs">${attrsHtml}</div>`,
+        });
+    }).join('');
+}
+
+function onVirtualAttributeDescriptionChange(index, value) {
+    const group = sharedPanelVirtualAttributes[index];
+    if (!group) return;
+    group.description = value.trim() || null;
+    markPanelDirty();
+}
+
+function onVirtualAttributeLabelChange(index, attrIndex, value) {
+    const attr = sharedPanelVirtualAttributes[index]?.attributes?.[attrIndex];
+    if (!attr) return;
+    attr.label = value.trim() || attr.name;
+    markPanelDirty();
+}
+
+/**
+ * Remove a whole group. A single attribute cannot be removed on its own: it is
+ * part of the function's signature, so dropping one would make the mapping
+ * from result column to attribute ambiguous.
+ */
+async function removeSharedEntityVirtualAttribute(index) {
+    const group = sharedPanelVirtualAttributes[index];
+    if (!group) return;
+    const count = (group.attributes || []).length;
+    const confirmed = await showConfirmDialog({
+        title: 'Remove virtual attributes',
+        message: `Remove <strong>${escapeHtml(group.function || group.fullName)}</strong> and its ${count} virtual attribute${count === 1 ? '' : 's'}?`,
+        confirmText: 'Remove',
+        confirmClass: 'btn-danger',
+        icon: 'trash'
+    });
+    if (!confirmed) return;
+    sharedPanelVirtualAttributes.splice(index, 1);
+    markPanelDirty();
+    renderSharedEntityVirtualAttributes(false);
+}
+
+/**
+ * Names already taken on this class: mapped attributes (own + inherited) and
+ * the other virtual attributes. The Graph Explorer and the MCP render both
+ * families in one namespace, so a collision has to be resolved at declaration
+ * time rather than surfacing as two rows with the same name.
+ */
+function _vaTakenNames(exceptGroupIndex = -1) {
+    const taken = new Set();
+    sharedPanelOwnAttributes.forEach(a => a.name && taken.add(a.name));
+    sharedPanelInheritedAttributes.forEach(a => a.name && taken.add(a.name));
+    sharedPanelVirtualAttributes.forEach((group, idx) => {
+        if (idx === exceptGroupIndex) return;
+        (group.attributes || []).forEach(a => a.name && taken.add(a.name));
+    });
+    return taken;
+}
+
+/**
+ * Derive the virtual attributes of *fn*, suffixing any colliding name.
+ * Returns { attributes, renamed } where renamed lists "old -> new" pairs.
+ */
+function _vaDeriveAttributes(fn) {
+    const taken = _vaTakenNames();
+    const columns = fn.returns_table
+        ? (fn.return_columns || [])
+        : [{ name: fn.name, data_type: fn.return_type || '' }];
+    const attributes = [];
+    const renamed = [];
+    columns.forEach(col => {
+        const rawName = String(col.name || '').trim();
+        if (!rawName) return;
+        let name = rawName;
+        let suffix = 2;
+        while (taken.has(name)) {
+            name = `${rawName}_${suffix}`;
+            suffix += 1;
+        }
+        if (name !== rawName) renamed.push(`${rawName} → ${name}`);
+        taken.add(name);
+        attributes.push({
+            name,
+            column: fn.returns_table ? rawName : VA_SCALAR_COLUMN,
+            label: name,
+            dataType: String(col.data_type || '').trim() || null,
+        });
+    });
+    return { attributes, renamed };
+}
+
+// Virtual attribute selector state
+let _vaSelCatalog = '';
+let _vaSelSchema = '';
+let _vaAllFunctions = [];
+
+/**
+ * Open the virtual attribute selector modal (catalog -> schema -> function).
+ */
+async function openVirtualAttributeSelectorModal() {
+    const modalId = 'virtualAttributeSelectorModal';
+    const existing = document.getElementById(modalId);
+    if (existing) existing.remove();
+
+    _vaSelCatalog = '';
+    _vaSelSchema = '';
+    _vaAllFunctions = [];
+
+    const modalHtml = `
+        <div class="modal fade" id="${modalId}" tabindex="-1" data-bs-backdrop="static">
+            <div class="modal-dialog modal-lg modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="bi bi-magic me-2"></i>Select a Unity Catalog Function</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="alert alert-info py-2 px-3 small">
+                            <i class="bi bi-info-circle me-1"></i>
+                            The function must accept <strong>exactly one parameter</strong>: the ID of the
+                            entity. One virtual attribute is created per returned column.
+                        </div>
+                        <div class="row g-2 mb-3">
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Catalog</label>
+                                <select class="form-select form-select-sm" id="vaCatalogSelect" onchange="_vaOnCatalogChange()">
+                                    <option value="">Loading...</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Schema</label>
+                                <select class="form-select form-select-sm" id="vaSchemaSelect" onchange="_vaOnSchemaChange()" disabled>
+                                    <option value="">Select a catalog first</option>
+                                </select>
+                            </div>
+                        </div>
+                        <input type="text" class="form-control form-control-sm mb-2" id="vaFunctionSearch" placeholder="Search functions..." oninput="_filterVaFunctions()" disabled>
+                        <div id="vaFunctionList" class="list-group va-function-list">
+                            <div class="text-muted p-3 text-center">Select a catalog and schema to list functions</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+    const modal = new bootstrap.Modal(document.getElementById(modalId));
+    modal.show();
+
+    await _ucFillCatalogSelect('vaCatalogSelect');
+}
+
+async function _vaOnCatalogChange() {
+    const catalog = document.getElementById('vaCatalogSelect')?.value || '';
+    _vaSelCatalog = catalog;
+    _vaSelSchema = '';
+    _vaAllFunctions = [];
+    const searchInput = document.getElementById('vaFunctionSearch');
+    if (searchInput) searchInput.disabled = true;
+    const list = document.getElementById('vaFunctionList');
+    if (list) list.innerHTML = '<div class="text-muted p-3 text-center">Select a schema to list functions</div>';
+    if (catalog) {
+        await _ucFillSchemaSelect(catalog, 'vaSchemaSelect');
+    } else {
+        const schemaSel = document.getElementById('vaSchemaSelect');
+        if (schemaSel) {
+            schemaSel.disabled = true;
+            schemaSel.innerHTML = '<option value="">Select a catalog first</option>';
+        }
+    }
+}
+
+async function _vaOnSchemaChange() {
+    const schema = document.getElementById('vaSchemaSelect')?.value || '';
+    _vaSelSchema = schema;
+    if (schema && _vaSelCatalog) {
+        await _vaLoadFunctions(_vaSelCatalog, schema);
+    } else {
+        const list = document.getElementById('vaFunctionList');
+        if (list) list.innerHTML = '<div class="text-muted p-3 text-center">Select a schema to list functions</div>';
+    }
+}
+
+async function _vaLoadFunctions(catalog, schema) {
+    const list = document.getElementById('vaFunctionList');
+    if (list) list.innerHTML = '<div class="text-center py-3"><div class="spinner-border spinner-border-sm text-primary"></div> Loading functions...</div>';
+    try {
+        _vaAllFunctions = await _ucFetchFunctions(catalog, schema);
+        const searchInput = document.getElementById('vaFunctionSearch');
+        if (searchInput) searchInput.disabled = _vaAllFunctions.length === 0;
+        if (!_vaAllFunctions.length) {
+            if (list) list.innerHTML = '<div class="text-muted p-3 text-center">No functions found in this schema</div>';
+            return;
+        }
+        _renderVaFunctionList(_vaAllFunctions);
+    } catch (err) {
+        console.error('[VirtualAttribute] Error loading functions:', err);
+        if (list) list.innerHTML = '<div class="text-danger p-2"><i class="bi bi-exclamation-triangle"></i> Failed to load functions</div>';
+    }
+}
+
+function _renderVaFunctionList(functions) {
+    const list = document.getElementById('vaFunctionList');
+    if (!list) return;
+    const assigned = new Set(sharedPanelVirtualAttributes.map(g => g.fullName));
+    list.innerHTML = functions.map(fn => {
+        const fullName = fn.full_name || `${_vaSelCatalog}.${_vaSelSchema}.${fn.name}`;
+        // Same single-parameter rule as actions: the one argument is the entity ID.
+        const singleParam = Number(fn.param_count) === 1;
+        const alreadyAssigned = assigned.has(fullName);
+        const eligible = singleParam && !alreadyAssigned;
+        const badge = fn.returns_table
+            ? '<span class="badge bg-info text-dark">Table</span>'
+            : '<span class="badge bg-secondary">Scalar</span>';
+        const returns = fn.returns_table
+            ? (fn.return_columns || []).map(c => `${c.name}${c.data_type ? ` ${c.data_type}` : ''}`).join(', ')
+            : (fn.return_type || '');
+        let hint;
+        if (!singleParam) {
+            hint = `<small class="text-warning"><i class="bi bi-exclamation-triangle me-1"></i>Needs exactly 1 parameter (has ${Number(fn.param_count) || 0})</small>`;
+        } else if (alreadyAssigned) {
+            hint = '<small class="text-warning"><i class="bi bi-check2-circle me-1"></i>Already assigned to this entity</small>';
+        } else {
+            // The output count is what the user is really choosing here: it is
+            // the number of virtual attributes the function will create.
+            const count = _ucOutputCount(fn);
+            const creates = count === null
+                ? ''
+                : ` — creates ${count} attribute${count === 1 ? '' : 's'}`;
+            hint = `<small class="text-muted">returns: ${escapeHtml(returns || 'unknown')}${creates}</small>`;
+        }
+        return `
+            <button type="button" class="list-group-item list-group-item-action d-flex align-items-center gap-2"
+                    ${eligible ? `onclick='_vaSelectFunction(${JSON.stringify(fn).replace(/'/g, "&#39;")})'` : 'disabled'}>
+                <i class="bi bi-magic text-primary"></i>
+                <div class="flex-grow-1">
+                    <div class="fw-semibold">${escapeHtml(fn.name)} ${badge} ${_ucOutputBadge(fn)}</div>
+                    ${hint}
+                </div>
+                ${eligible ? '<i class="bi bi-chevron-right text-muted"></i>' : ''}
+            </button>
+        `;
+    }).join('');
+}
+
+function _filterVaFunctions() {
+    const q = (document.getElementById('vaFunctionSearch')?.value || '').toLowerCase();
+    const filtered = _vaAllFunctions.filter(fn =>
+        (fn.name || '').toLowerCase().includes(q) ||
+        (fn.comment || '').toLowerCase().includes(q)
+    );
+    _renderVaFunctionList(filtered);
+}
+
+function _vaSelectFunction(fn) {
+    const fullName = fn.full_name || `${_vaSelCatalog}.${_vaSelSchema}.${fn.name}`;
+    if (sharedPanelVirtualAttributes.some(g => g.fullName === fullName)) {
+        showNotification(`Function already assigned: ${fullName}`, 'warning', 3000);
+        return;
+    }
+    const { attributes, renamed } = _vaDeriveAttributes(fn);
+    if (!attributes.length) {
+        showNotification(
+            `${fn.name} exposes no usable return column — cannot create virtual attributes`,
+            'warning', 4000
+        );
+        return;
+    }
+    sharedPanelVirtualAttributes.push({
+        catalog: _vaSelCatalog,
+        schema: _vaSelSchema,
+        function: fn.name,
+        fullName,
+        description: String(fn.comment || '').trim() || null,
+        returns_table: Boolean(fn.returns_table),
+        attributes,
+    });
+    markPanelDirty();
+    renderSharedEntityVirtualAttributes(false);
+    closeVirtualAttributeSelectorModal();
+    if (renamed.length) {
+        showNotification(
+            `Name already used on this entity, renamed: ${renamed.join(', ')}`,
+            'warning', 5000
+        );
+    } else {
+        showNotification(
+            `${attributes.length} virtual attribute${attributes.length === 1 ? '' : 's'} added from ${fn.name}`,
+            'success', 3000
+        );
+    }
+}
+
+function closeVirtualAttributeSelectorModal() {
+    _ucClosePickerModal('virtualAttributeSelectorModal');
+}
+
+// =====================================================
 // CROSS-PROJECT BRIDGES
 // =====================================================
 
@@ -928,24 +2685,18 @@ function renderSharedEntityBridges(viewOnly = false) {
     const container = panelGetById('sharedEntityBridgesContent');
     if (!container) return;
 
+    _updatePanelSection('sharedEntityBridges', { count: sharedPanelBridges.length });
     if (sharedPanelBridges.length > 0) {
-        container.innerHTML = sharedPanelBridges.map((bridge, idx) => `
-            <div class="d-flex align-items-center gap-2 ${idx > 0 ? 'mt-1 pt-1 border-top' : ''}">
-                <div class="flex-grow-1">
-                    <small class="d-block">
-                        <i class="bi bi-signpost-2 text-info"></i>
-                        <span class="fw-semibold ms-1">${escapeHtml(bridge.target_class_name || '')}</span>
-                    </small>
-                    <small class="text-muted d-block ms-3">
-                        <i class="bi bi-folder2-open me-1"></i>${escapeHtml(bridge.target_domain || bridge.target_project || '')}
-                        ${bridge.label ? ` &mdash; ${escapeHtml(bridge.label)}` : ''}
-                    </small>
-                </div>
-                ${!viewOnly ? `<button type="button" class="btn btn-sm btn-outline-danger py-0 px-1" onclick="removeSharedEntityBridge(${idx})" title="Remove bridge"><i class="bi bi-x"></i></button>` : ''}
-            </div>
-        `).join('');
+        container.innerHTML = sharedPanelBridges.map((bridge, idx) => {
+            const domain = bridge.target_domain || bridge.target_project || '';
+            return panelItemRow({
+                icon: 'bi-signpost-2', title: bridge.target_class_name || '',
+                meta: bridge.label ? `${domain} — ${bridge.label}` : domain,
+                removeOnclick: `removeSharedEntityBridge(${idx})`, removeTitle: 'Remove bridge', viewOnly,
+            });
+        }).join('');
     } else {
-        container.innerHTML = '<small class="text-muted">No bridges to other domains</small>';
+        container.innerHTML = panelEmptyState('No bridges to other domains yet.', 'Add a bridge', 'openBridgeSelectorModal()', viewOnly);
     }
 }
 
@@ -1043,7 +2794,7 @@ async function openBridgeSelectorModal() {
         list.innerHTML = bridgeRows.map(p => `
             <button type="button" class="list-group-item list-group-item-action d-flex align-items-center gap-2"
                     onclick="_bridgeSelectDomain('${escapeHtml(p.name)}')">
-                <i class="bi bi-folder2-open text-primary"></i>
+                <i class="bi bi-box text-primary"></i>
                 <div class="flex-grow-1">
                     <div class="fw-semibold">${escapeHtml(p.name)}</div>
                     ${p.description ? `<small class="text-muted">${escapeHtml(p.description)}</small>` : ''}
@@ -1117,7 +2868,7 @@ function _bridgeSelectClass(cls) {
     document.getElementById('bridgeStepClass').style.display = 'none';
     document.getElementById('bridgeStepLabel').style.display = '';
     document.getElementById('bridgeSummary').innerHTML =
-        `<i class="bi bi-folder2-open me-1"></i>${escapeHtml(_bridgePendingDomain)} <i class="bi bi-arrow-right mx-1"></i> ${cls.emoji || '📦'} ${escapeHtml(cls.name)}`;
+        `<i class="bi bi-box me-1"></i>${escapeHtml(_bridgePendingDomain)} <i class="bi bi-arrow-right mx-1"></i> ${cls.emoji || '📦'} ${escapeHtml(cls.name)}`;
 }
 
 function _bridgeBackToDomains() {
@@ -1572,7 +3323,7 @@ function applyManualDashboardUrl() {
     selectDashboard(url, 'Custom Dashboard');
 }
 
-async function saveSharedEntity() {
+async function saveSharedEntity(options = {}) {
     const name = panelGetById('sharedEntityName')?.value.trim();
     const labelRaw = panelGetById('sharedEntityLabel')?.value.trim();
     const label = labelRaw || name;
@@ -1588,7 +3339,9 @@ async function saveSharedEntity() {
     
     if (!name) { showNotification('Please enter an entity name', 'warning'); return; }
 
-    const duplicateEntity = (OntologyState.config.classes || []).some((c, i) => c.name === name && i !== sharedPanelEditIndex);
+    // Same stale-index guard as saveSharedRelationship: skip when only non-name fields changed.
+    const duplicateEntity = (name !== sharedPanelOriginalName || sharedPanelEditIndex < 0)
+        && (OntologyState.config.classes || []).some((c, i) => c.name === name && i !== sharedPanelEditIndex);
     if (duplicateEntity) { showNotification(`An entity named "${name}" already exists`, 'warning'); return; }
     
     const validAttributes = sharedPanelOwnAttributes.filter(a => a.name?.trim()).map(a => ({ name: a.name.trim(), localName: a.name.trim() }));
@@ -1606,16 +3359,26 @@ async function saveSharedEntity() {
         dataProperties: validAttributes,
         dashboard: sharedPanelDashboardUrl || undefined,
         dashboardParams: Object.keys(sharedPanelDashboardParams).length > 0 ? sharedPanelDashboardParams : undefined,
-        bridges: sharedPanelBridges.length > 0 ? sharedPanelBridges : undefined
+        bridges: sharedPanelBridges.length > 0 ? sharedPanelBridges : undefined,
+        datasets: sharedPanelDatasets.length > 0 ? sharedPanelDatasets : undefined,
+        dataset: sharedPanelDatasets.length > 0 ? sharedPanelDatasets[0] : undefined,
+        actions: (sharedPanelActions.length + sharedPanelJobs.length) > 0
+            ? sharedPanelActions.concat(sharedPanelJobs) : undefined,
+        business_rules: sharedPanelBusinessRules.length > 0 ? sharedPanelBusinessRules : undefined,
+        virtualAttributes: sharedPanelVirtualAttributes.length > 0 ? sharedPanelVirtualAttributes : undefined
     };
     
     console.log('[SharedPanel] Saving - classData.dashboardParams:', JSON.stringify(classData.dashboardParams));
+
+    const isNew = sharedPanelEditIndex < 0;
+    const existingEntity = isNew ? null : (OntologyState.config.classes[sharedPanelEditIndex] || {});
+    const oldName = existingEntity?.name || sharedPanelOriginalName;
+    const isRename = !isNew && oldName !== name;
+    const parentChanged = !isNew && (existingEntity?.parent || undefined) !== classData.parent;
     
     if (sharedPanelEditIndex >= 0) {
-        const existing = OntologyState.config.classes[sharedPanelEditIndex] || {};
-        const oldName = existing.name;
         // Preserve server-assigned URI so the backend prune doesn't orphan mappings.
-        if (existing.uri) classData.uri = existing.uri;
+        if (existingEntity.uri) classData.uri = existingEntity.uri;
         OntologyState.config.classes[sharedPanelEditIndex] = classData;
         if (oldName !== name) {
             OntologyState.config.classes.forEach(c => { if (c.parent === oldName) c.parent = name; });
@@ -1627,13 +3390,19 @@ async function saveSharedEntity() {
         showNotification('Entity added', 'success', 2000);
     }
     
-    await window.saveConfigToSession();
+    await window.saveConfigToSession({ keepalive: options.keepalive });
     
     // Save entity constraints to the ONLY storage location: session_data/ontology/constraints
     await saveEntityConstraintsToServer(name, disjointWith, equivalentTo);
     
     await autoGenerateOwl();
-    if (sharedPanelOnSaveCallback) sharedPanelOnSaveCallback();
+    if (sharedPanelOnSaveCallback) {
+        sharedPanelOnSaveCallback({
+            entityName: name,
+            previousName: oldName,
+            requiresMapRebuild: isNew || isRename || parentChanged
+        });
+    }
     if (typeof updateClassesList === 'function') updateClassesList();
     
     // Refresh ConstraintsModule if loaded
@@ -1743,8 +3512,6 @@ async function openRelationshipPanel(options = {}) {
     }
     
     panel.querySelector('#sharedPanelTitle').innerHTML = '<i class="bi bi-plus-circle"></i> <span id="sharedPanelItemName">Add Relationship</span>';
-    panel.querySelector('#sharedSavePanelBtn').style.display = '';
-    
     await renderRelationshipForm(panel, null);
     attachDirtyTracking();
 }
@@ -1770,6 +3537,9 @@ async function openRelationshipPanelForEdit(idx, options = {}) {
     sharedPanelViewOnly = false;
     sharedPanelOnSaveCallback = options.onSave || null;
     
+    // Jump straight to a specific tab (e.g. Designer context-menu shortcuts)
+    if (options.activeTab) _relPanelActiveTab = options.activeTab;
+    
     openSharedPanel();
     
     const panel = sharedPanelCurrentSection?.querySelector('.shared-detail-panel');
@@ -1778,9 +3548,7 @@ async function openRelationshipPanelForEdit(idx, options = {}) {
         return;
     }
     
-    panel.querySelector('#sharedPanelTitle').innerHTML = `<i class="bi bi-pencil"></i> <span id="sharedPanelItemName">${prop.name}</span>`;
-    panel.querySelector('#sharedSavePanelBtn').style.display = '';
-    
+    panel.querySelector('#sharedPanelTitle').innerHTML = `<span id="sharedPanelItemName">${prop.name}</span>`;
     await renderRelationshipForm(panel, prop);
     attachDirtyTracking();
 }
@@ -1795,20 +3563,79 @@ async function openRelationshipPanelForView(idx, options = {}) {
     sharedPanelViewOnly = true;
     sharedPanelOnSaveCallback = null;
     
+    // Jump straight to a specific tab (e.g. Designer context-menu shortcuts)
+    if (options.activeTab) _relPanelActiveTab = options.activeTab;
+    
     openSharedPanel();
     
     const panel = sharedPanelCurrentSection?.querySelector('.shared-detail-panel');
     if (!panel) return;
     
     panel.querySelector('#sharedPanelTitle').innerHTML = `<i class="bi bi-eye"></i> <span id="sharedPanelItemName">${prop.name}</span>`;
-    panel.querySelector('#sharedSavePanelBtn').style.display = 'none';
-    
     await renderRelationshipForm(panel, prop, true);
+}
+
+/**
+ * One clickable card of the graphical direction picker: the two endpoint chips
+ * with the arrow between them, drawn the way the canvas will draw the link.
+ * @param {string} value - 'forward' | 'reverse'
+ * @param {string} icon - Bootstrap Icons class for the arrow
+ * @param {boolean} viewOnly - render as a non-interactive preview
+ * @returns {string} HTML
+ */
+function _relDirectionOption(value, icon, viewOnly) {
+    return `
+        <button type="button" class="rel-direction-option" data-direction="${value}"
+                role="radio" aria-checked="false" ${viewOnly ? 'disabled' : ''}>
+            <span class="rel-direction-node" data-rel-node="domain">Source</span>
+            <span class="rel-direction-arrow">
+                <span class="rel-direction-name" data-rel-node="name"></span>
+                <i class="bi ${icon}"></i>
+            </span>
+            <span class="rel-direction-node" data-rel-node="range">Target</span>
+        </button>
+    `;
+}
+
+/**
+ * Select *direction* in the picker and mirror it into the hidden input that
+ * saveSharedRelationship() reads.
+ * @param {string} direction - 'forward' | 'reverse'
+ */
+function setSharedRelDirection(direction) {
+    const value = direction === 'reverse' ? 'reverse' : 'forward';
+    const input = panelGetById('sharedRelDirection');
+    if (input) input.value = value;
+    panelGetById('sharedRelDirectionPicker')?.querySelectorAll('.rel-direction-option')
+        .forEach(option => {
+            const selected = option.dataset.direction === value;
+            option.classList.toggle('selected', selected);
+            option.setAttribute('aria-checked', String(selected));
+        });
+}
+
+/**
+ * Keep the picker's endpoint chips in sync with the Source / Target / Name
+ * fields, so both cards always read as the relationship being edited.
+ */
+function refreshSharedRelDirectionLabels() {
+    const picker = panelGetById('sharedRelDirectionPicker');
+    if (!picker) return;
+    const text = {
+        domain: panelGetById('sharedRelDomain')?.value || 'Source',
+        range: panelGetById('sharedRelRange')?.value || 'Target',
+        name: panelGetById('sharedRelName')?.value.trim() || ''
+    };
+    Object.entries(text).forEach(([role, label]) => {
+        picker.querySelectorAll(`[data-rel-node="${role}"]`).forEach(el => {
+            el.textContent = label;
+        });
+    });
 }
 
 async function renderRelationshipForm(panel, prop, viewOnly = false) {
     const body = panel.querySelector('#sharedPanelBody');
-    const classOptions = OntologyState.config.classes.map(c => `<option value="${c.name}">${c.emoji || '📦'} ${c.name}</option>`).join('');
+    const classOptions = OntologyState.config.classes.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.emoji || '📦')} ${escapeHtml(c.name)}</option>`).join('');
     const disabled = viewOnly ? 'disabled' : '';
     
     // Load constraints from server (the ONLY source of truth for constraints)
@@ -1844,19 +3671,19 @@ async function renderRelationshipForm(panel, prop, viewOnly = false) {
     body.innerHTML = `
         <div id="sharedRelAssignmentLink"></div>
         <form id="sharedRelationshipForm">
-            <ul class="form-tabs-nav">
-                <li><a class="form-tab-link ${_rTab === 'details' ? 'active' : ''}" data-form-tab="details" href="#" onclick="event.preventDefault(); switchFormTab(this)"><i class="bi bi-info-circle me-1"></i>Details</a></li>
-                <li><a class="form-tab-link ${_rTab === 'constraints' ? 'active' : ''}" data-form-tab="constraints" href="#" onclick="event.preventDefault(); switchFormTab(this)"><i class="bi bi-sliders me-1"></i>Constraints</a></li>
-            </ul>
+            ${renderFormTabsNav([
+                { id: 'details', icon: 'bi-info-circle', label: 'General' },
+                { id: 'constraints', icon: 'bi-sliders', label: 'Constraints' },
+            ], _rTab)}
 
             <div class="form-tab-pane ${_rTab === 'details' ? 'active' : ''}" data-form-tab-content="details">
                 <div class="mb-3">
                     <label for="sharedRelName" class="form-label">Name <span class="text-danger">*</span></label>
-                    <input type="text" class="form-control form-control-sm" id="sharedRelName" value="${prop?.name || ''}" ${disabled} required>
+                    <input type="text" class="form-control form-control-sm" id="sharedRelName" value="${escapeHtml(prop?.name || '')}" ${disabled} required>
                 </div>
                 <div class="mb-3">
                     <label for="sharedRelLabel" class="form-label">Label</label>
-                    <input type="text" class="form-control form-control-sm" id="sharedRelLabel" value="${prop?.label || prop?.name || ''}" ${disabled} placeholder="Defaults to name if empty">
+                    <input type="text" class="form-control form-control-sm" id="sharedRelLabel" value="${escapeHtml(prop?.label || prop?.name || '')}" ${disabled} placeholder="Defaults to name if empty">
                 </div>
                 <div class="mb-3">
                     <label for="sharedRelDomain" class="form-label">Source (Domain) <span class="text-danger">*</span></label>
@@ -1871,15 +3698,17 @@ async function renderRelationshipForm(panel, prop, viewOnly = false) {
                     </select>
                 </div>
                 <div class="mb-3">
-                    <label for="sharedRelDirection" class="form-label">Direction</label>
-                    <select class="form-select form-select-sm" id="sharedRelDirection" ${disabled}>
-                        <option value="forward">Forward →</option>
-                        <option value="reverse">Reverse ←</option>
-                    </select>
+                    <label class="form-label">Direction</label>
+                    <input type="hidden" id="sharedRelDirection" value="${escapeHtml(prop?.direction || 'forward')}">
+                    <div class="rel-direction-picker" id="sharedRelDirectionPicker" role="radiogroup" aria-label="Relationship direction">
+                        ${_relDirectionOption('forward', 'bi-arrow-right', viewOnly)}
+                        ${_relDirectionOption('reverse', 'bi-arrow-left', viewOnly)}
+                    </div>
+                    <div class="form-text small mt-1">Which way the triple is written — the canvas draws the arrowhead on the side it points to</div>
                 </div>
                 <div class="mb-3">
                     <label for="sharedRelDescription" class="form-label">Description</label>
-                    <textarea class="form-control form-control-sm" id="sharedRelDescription" rows="2" ${disabled}>${prop?.comment || prop?.description || ''}</textarea>
+                    <textarea class="form-control form-control-sm" id="sharedRelDescription" rows="2" ${disabled}>${escapeHtml(prop?.comment || prop?.description || '')}</textarea>
                 </div>
             </div>
 
@@ -1889,58 +3718,47 @@ async function renderRelationshipForm(panel, prop, viewOnly = false) {
                     <div class="row g-2">
                         <div class="col-6">
                             <div class="input-group input-group-sm">
-                                <span class="input-group-text" title="Minimum cardinality">Min</span>
+                                <span class="input-group-text">Min</span>
                                 <input type="number" class="form-control" id="sharedRelMinCard" 
                                        value="${minCard}" min="0" placeholder="0" ${disabled}>
                             </div>
+                            <div class="form-text small">Minimum number of values required per subject (0 = optional)</div>
                         </div>
                         <div class="col-6">
                             <div class="input-group input-group-sm">
-                                <span class="input-group-text" title="Maximum cardinality">Max</span>
+                                <span class="input-group-text">Max</span>
                                 <input type="number" class="form-control" id="sharedRelMaxCard" 
                                        value="${maxCard}" min="0" placeholder="*" ${disabled}>
                             </div>
+                            <div class="form-text small">Maximum number of values allowed; leave empty for unlimited (*)</div>
                         </div>
                     </div>
-                    <div class="form-text small">Leave Max empty for unlimited (*)</div>
                 </div>
                 <div class="mb-2">
                     <label class="form-label small text-muted mb-1">Property Characteristics</label>
-                    <div class="d-flex flex-wrap gap-2">
-                        <div class="form-check form-check-inline">
-                            <input class="form-check-input" type="checkbox" id="sharedRelFunctional" 
-                                   ${isFunctional ? 'checked' : ''} ${disabled}>
-                            <label class="form-check-label small" for="sharedRelFunctional" 
-                                   title="Each subject can have at most one value for this property">
-                                Functional
-                            </label>
-                        </div>
-                        <div class="form-check form-check-inline">
-                            <input class="form-check-input" type="checkbox" id="sharedRelInverseFunctional" 
-                                   ${isInverseFunctional ? 'checked' : ''} ${disabled}>
-                            <label class="form-check-label small" for="sharedRelInverseFunctional"
-                                   title="Each value can be linked to at most one subject">
-                                Inverse Functional
-                            </label>
-                        </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" id="sharedRelFunctional" 
+                               ${isFunctional ? 'checked' : ''} ${disabled}>
+                        <label class="form-check-label small fw-semibold" for="sharedRelFunctional">Functional</label>
+                        <div class="form-text small mt-0">Each subject can have at most one value for this relationship (forces Max cardinality to 1)</div>
                     </div>
-                    <div class="d-flex flex-wrap gap-2 mt-1">
-                        <div class="form-check form-check-inline">
-                            <input class="form-check-input" type="checkbox" id="sharedRelSymmetric" 
-                                   ${isSymmetric ? 'checked' : ''} ${disabled}>
-                            <label class="form-check-label small" for="sharedRelSymmetric"
-                                   title="If A relates to B, then B also relates to A">
-                                Symmetric
-                            </label>
-                        </div>
-                        <div class="form-check form-check-inline">
-                            <input class="form-check-input" type="checkbox" id="sharedRelTransitive" 
-                                   ${isTransitive ? 'checked' : ''} ${disabled}>
-                            <label class="form-check-label small" for="sharedRelTransitive"
-                                   title="If A relates to B and B relates to C, then A relates to C">
-                                Transitive
-                            </label>
-                        </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" id="sharedRelInverseFunctional" 
+                               ${isInverseFunctional ? 'checked' : ''} ${disabled}>
+                        <label class="form-check-label small fw-semibold" for="sharedRelInverseFunctional">Inverse Functional</label>
+                        <div class="form-text small mt-0">Each target value can be linked back to at most one subject (this relationship is one-to-one on the target side)</div>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" id="sharedRelSymmetric" 
+                               ${isSymmetric ? 'checked' : ''} ${disabled}>
+                        <label class="form-check-label small fw-semibold" for="sharedRelSymmetric">Symmetric</label>
+                        <div class="form-text small mt-0">If A is related to B, then B is automatically related to A too (the relationship reads the same in both directions)</div>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="sharedRelTransitive" 
+                               ${isTransitive ? 'checked' : ''} ${disabled}>
+                        <label class="form-check-label small fw-semibold" for="sharedRelTransitive">Transitive</label>
+                        <div class="form-text small mt-0">If A is related to B, and B is related to C, then A is automatically related to C (chains propagate through the relationship)</div>
                     </div>
                 </div>
             </div>
@@ -1950,7 +3768,18 @@ async function renderRelationshipForm(panel, prop, viewOnly = false) {
     if (prop) {
         panelGetById('sharedRelDomain').value = prop.domain || '';
         panelGetById('sharedRelRange').value = prop.range || '';
-        panelGetById('sharedRelDirection').value = prop.direction || 'forward';
+    }
+
+    setSharedRelDirection(prop?.direction || 'forward');
+    refreshSharedRelDirectionLabels();
+    if (!viewOnly) {
+        panelGetById('sharedRelDirectionPicker')?.addEventListener('click', (event) => {
+            const option = event.target.closest('.rel-direction-option');
+            if (option) setSharedRelDirection(option.dataset.direction);
+        });
+        ['sharedRelDomain', 'sharedRelRange', 'sharedRelName'].forEach(id => {
+            panelGetById(id)?.addEventListener('input', refreshSharedRelDirectionLabels);
+        });
     }
     
     // Add event listener to sync Functional checkbox with Max cardinality
@@ -1976,7 +3805,7 @@ async function renderRelationshipForm(panel, prop, viewOnly = false) {
     }
 }
 
-async function saveSharedRelationship() {
+async function saveSharedRelationship(options = {}) {
     const name = panelGetById('sharedRelName')?.value.trim();
     const labelRaw = panelGetById('sharedRelLabel')?.value.trim();
     const label = labelRaw || name;
@@ -1995,7 +3824,11 @@ async function saveSharedRelationship() {
     
     if (!name) { showNotification('Please enter a relationship name', 'warning'); return; }
 
-    const duplicateRel = (OntologyState.config.properties || []).some((p, i) => p.name === name && i !== sharedPanelEditIndex);
+    // When the name is unchanged (direction/domain/range edit) the entry cannot be a
+    // duplicate of itself — skip the index-based check, which can be stale when
+    // syncDesignToOntology has reordered the properties array since the panel opened.
+    const duplicateRel = (name !== sharedPanelOriginalName || sharedPanelEditIndex < 0)
+        && (OntologyState.config.properties || []).some((p, i) => p.name === name && i !== sharedPanelEditIndex);
     if (duplicateRel) { showNotification(`A relationship named "${name}" already exists`, 'warning'); return; }
 
     if (!domain) { showNotification('Please select a source entity', 'warning'); return; }
@@ -2026,12 +3859,15 @@ async function saveSharedRelationship() {
         direction
         // NOTE: constraints are stored ONLY in session_data/ontology/constraints, not here
     };
-    const isRename = sharedPanelEditIndex >= 0 && sharedPanelOriginalName && sharedPanelOriginalName !== name;
+    const isNew = sharedPanelEditIndex < 0;
+    const existingProperty = isNew ? null : (OntologyState.config.properties[sharedPanelEditIndex] || {});
+    const isRename = !isNew && sharedPanelOriginalName && sharedPanelOriginalName !== name;
+    const endpointsChanged = !isNew
+        && (existingProperty.domain !== domain || existingProperty.range !== range);
     
     if (sharedPanelEditIndex >= 0) {
-        const existingProp = OntologyState.config.properties[sharedPanelEditIndex] || {};
         // Preserve server-assigned URI so the backend prune doesn't orphan mappings.
-        if (existingProp.uri) propertyData.uri = existingProp.uri;
+        if (existingProperty.uri) propertyData.uri = existingProperty.uri;
         OntologyState.config.properties[sharedPanelEditIndex] = propertyData;
         showNotification('Relationship updated', 'success', 2000);
     } else {
@@ -2039,7 +3875,7 @@ async function saveSharedRelationship() {
         showNotification('Relationship added', 'success', 2000);
     }
     
-    await window.saveConfigToSession();
+    await window.saveConfigToSession({ keepalive: options.keepalive });
     if (isRename) {
         try { await fetch('/ontology/update-relationship-references', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ old_name: sharedPanelOriginalName, new_name: name }) }); } catch (e) {}
     }
@@ -2048,14 +3884,27 @@ async function saveSharedRelationship() {
     await saveRelationshipConstraintsToServer(name, domain, constraints);
     
     await autoGenerateOwl();
-    if (sharedPanelOnSaveCallback) sharedPanelOnSaveCallback();
+    if (sharedPanelOnSaveCallback) {
+        sharedPanelOnSaveCallback({
+            relationshipName: name,
+            previousName: sharedPanelOriginalName,
+            requiresMapRebuild: isNew || isRename || endpointsChanged
+        });
+    }
     if (typeof updatePropertiesList === 'function') updatePropertiesList();
     
     // Refresh ConstraintsModule if loaded
     if (typeof ConstraintsModule !== 'undefined' && ConstraintsModule.loadConstraints) {
         ConstraintsModule.loadConstraints();
     }
-    
+
+    // Targeted in-place canvas updates — immediately flip the arrow in whichever
+    // view is currently active. Both calls are no-ops when the view was never opened.
+    const lookupName = sharedPanelOriginalName || name;
+    if (typeof refreshRelationshipInDesigner === 'function') {
+        refreshRelationshipInDesigner(lookupName, direction);
+    }
+
     closeSharedPanel();
 }
 
@@ -2153,37 +4002,117 @@ async function saveRelationshipConstraintsToServer(propertyName, domainClass, co
 // SAVE HANDLER
 // =====================================================
 
-async function saveSharedPanelItem() {
+async function saveSharedPanelItem(options = {}) {
     if (sharedPanelViewOnly) return;
-    if (sharedPanelEditType === 'entity') await saveSharedEntity();
-    else if (sharedPanelEditType === 'relationship') await saveSharedRelationship();
+    if (sharedPanelEditType === 'entity') await saveSharedEntity(options);
+    else if (sharedPanelEditType === 'relationship') await saveSharedRelationship(options);
     sharedPanelDirty = false;
 }
+
+/**
+ * Commit the panel's pending edit while the page is being torn down.
+ *
+ * The panel is an edit buffer: closing it, switching section or opening
+ * another item all flush it first. Leaving the page did not, so a pending
+ * edit — a removed virtual attribute, a renamed entity — was dropped, and the
+ * registry auto-save on unload then persisted the state that never heard about
+ * it. This closes that gap.
+ *
+ * Deliberately not awaited: only the synchronous prefix of the save can run
+ * before teardown. That prefix commits the change to `OntologyState.config`
+ * and dispatches the session save with `keepalive`, which is the part that
+ * must not be lost. The tail (constraints, OWL regeneration, notifications)
+ * is skipped — the OWL is regenerated from the config on the next load.
+ */
+function flushSharedPanelOnUnload() {
+    if (!sharedPanelDirty || sharedPanelViewOnly) return;
+    try {
+        saveSharedPanelItem({ keepalive: true });
+        console.log('[UNLOAD] Pending panel edit flushed to session');
+    } catch (err) {
+        console.warn('[UNLOAD] Could not flush the pending panel edit:', err);
+    }
+    sharedPanelDirty = false;
+}
+
+window.addEventListener('beforeunload', flushSharedPanelOnUnload);
+window.addEventListener('pagehide', flushSharedPanelOnUnload);
+window.flushSharedPanelOnUnload = flushSharedPanelOnUnload;
+
+document.addEventListener('DOMContentLoaded', () => {
+    ensureDetailPanels();
+});
 
 // =====================================================
 // COMPATIBILITY FUNCTIONS
 // =====================================================
 
-function editClassByName(className) {
+function _isOntologyMapActive() {
+    return document.getElementById('map-section')?.classList.contains('active');
+}
+
+function refreshMapAfterEntitySave(changeInfo) {
+    if (!_isOntologyMapActive() || typeof initOntologyMap !== 'function') return;
+    if (!changeInfo) {
+        initOntologyMap();
+        return;
+    }
+    if (changeInfo.requiresMapRebuild) {
+        initOntologyMap();
+        return;
+    }
+    const refreshed = typeof refreshMapNodeFromConfig === 'function'
+        && refreshMapNodeFromConfig(changeInfo.entityName);
+    if (!refreshed) initOntologyMap();
+}
+
+function refreshMapAfterRelationshipSave(changeInfo) {
+    if (!_isOntologyMapActive() || typeof initOntologyMap !== 'function') return;
+    if (!changeInfo) {
+        initOntologyMap();
+        return;
+    }
+    if (changeInfo.requiresMapRebuild) {
+        initOntologyMap();
+        return;
+    }
+    const refreshed = typeof refreshMapRelationshipFromConfig === 'function'
+        && refreshMapRelationshipFromConfig(changeInfo.relationshipName);
+    if (!refreshed) initOntologyMap();
+}
+
+function editClassByName(className, activeTab) {
     const idx = OntologyState.config.classes.findIndex(cls => cls.name === className);
     if (idx >= 0) {
-        if (_canEditOntologyPanel()) openEntityPanelForEdit(idx, { onSave: () => { if (typeof initOntologyMap === 'function' && document.getElementById('map-section')?.classList.contains('active')) initOntologyMap(); } });
-        else openEntityPanelForView(idx);
+        const opts = { onSave: refreshMapAfterEntitySave };
+        if (activeTab) opts.activeTab = activeTab;
+        if (_canEditOntologyPanel()) openEntityPanelForEdit(idx, opts);
+        else openEntityPanelForView(idx, opts);
     }
 }
 
-function editClass(idx) { openEntityPanelForEdit(idx, { onSave: () => { if (typeof initOntologyMap === 'function' && document.getElementById('map-section')?.classList.contains('active')) initOntologyMap(); } }); }
+function editClass(idx, activeTab) {
+    const opts = { onSave: refreshMapAfterEntitySave };
+    if (activeTab) opts.activeTab = activeTab;
+    openEntityPanelForEdit(idx, opts);
+}
 function viewClass(idx) { openEntityPanelForView(idx); }
 
-function editPropertyByName(propertyName) {
+function editPropertyByName(propertyName, activeTab) {
     const idx = OntologyState.config.properties.findIndex(prop => prop.name === propertyName);
     if (idx >= 0) {
-        if (_canEditOntologyPanel()) openRelationshipPanelForEdit(idx, { onSave: () => { if (typeof initOntologyMap === 'function' && document.getElementById('map-section')?.classList.contains('active')) initOntologyMap(); } });
-        else openRelationshipPanelForView(idx);
+        const opts = { onSave: refreshMapAfterRelationshipSave };
+        if (activeTab) opts.activeTab = activeTab;
+        if (_canEditOntologyPanel()) openRelationshipPanelForEdit(idx, opts);
+        else openRelationshipPanelForView(idx, opts);
     }
 }
 
-function editProperty(idx) { openRelationshipPanelForEdit(idx, { onSave: () => { if (typeof initOntologyMap === 'function' && document.getElementById('map-section')?.classList.contains('active')) initOntologyMap(); } }); }
+function editProperty(idx, activeTab) {
+    const opts = { onSave: refreshMapAfterRelationshipSave };
+    if (activeTab) opts.activeTab = activeTab;
+    openRelationshipPanelForEdit(idx, opts);
+}
 function viewProperty(idx) { openRelationshipPanelForView(idx); }
 
 
@@ -2227,7 +4156,7 @@ async function openMetadataAttributePicker() {
     document.getElementById('metaAttrFooter').style.display = 'none';
     
     const tableList = document.getElementById('metaAttrTableList');
-    tableList.innerHTML = '<div class="text-muted small p-2"><i class="bi bi-hourglass-split me-1"></i>Loading data sources...</div>';
+    tableList.innerHTML = '<div class="text-muted small p-2"><i class="bi bi-hourglass-split me-1"></i>Loading data assets...</div>';
     
     metaAttrPickerModal.show();
     
@@ -2236,7 +4165,7 @@ async function openMetadataAttributePicker() {
         const data = await response.json();
         
         if (!data.success || !data.has_metadata || !data.metadata?.tables?.length) {
-            tableList.innerHTML = '<div class="text-muted small p-2"><i class="bi bi-exclamation-circle me-1"></i>No data sources loaded. Load data sources in Domain settings first.</div>';
+            tableList.innerHTML = '<div class="text-muted small p-2"><i class="bi bi-exclamation-circle me-1"></i>No data assets loaded. Load data assets in Domain settings first.</div>';
             return;
         }
         
@@ -2244,7 +4173,7 @@ async function openMetadataAttributePicker() {
         renderMetaAttrTableList();
         
     } catch (error) {
-        tableList.innerHTML = `<div class="text-danger small p-2"><i class="bi bi-exclamation-triangle me-1"></i>${error.message}</div>`;
+        tableList.innerHTML = `<div class="text-danger small p-2"><i class="bi bi-exclamation-triangle me-1"></i>${escapeHtml(error.message)}</div>`;
     }
 }
 
@@ -2275,13 +4204,13 @@ function renderMetaAttrTableList() {
         const alreadyCount = table.columns ? table.columns.filter(c => allAttrs.has(columnToCamelCase(c.name).toLowerCase())).length : 0;
         
         html += `
-            <a href="#" class="list-group-item list-group-item-action py-2 px-2" onclick="metaAttrSelectTable('${tableFqn.replace(/'/g, "\\'")}'); return false;">
+            <a href="#" class="list-group-item list-group-item-action py-2 px-2" onclick="metaAttrSelectTable('${escapeHtml(tableFqn.replace(/\\/g, '\\\\').replace(/'/g, "\\'"))}'); return false;">
                 <div class="d-flex justify-content-between align-items-center">
-                    <span class="small fw-semibold"><i class="bi bi-table me-1 text-primary"></i>${displayName}</span>
+                    <span class="small fw-semibold"><i class="bi bi-table me-1 text-primary"></i>${escapeHtml(displayName)}</span>
                     <span class="badge bg-secondary">${colCount} col</span>
                 </div>
-                ${dataSource ? `<small class="text-muted d-block" style="font-size: 0.7rem;">${dataSource}</small>` : ''}
-                ${table.comment ? `<small class="text-muted d-block" style="font-size: 0.7rem;">${table.comment}</small>` : ''}
+                ${dataSource ? `<small class="text-muted d-block" style="font-size: 0.7rem;">${escapeHtml(dataSource)}</small>` : ''}
+                ${table.comment ? `<small class="text-muted d-block" style="font-size: 0.7rem;">${escapeHtml(table.comment)}</small>` : ''}
                 ${alreadyCount > 0 ? `<small class="text-info" style="font-size: 0.65rem;">${alreadyCount} column(s) already as attributes</small>` : ''}
             </a>
         `;
@@ -2328,18 +4257,18 @@ function metaAttrSelectTable(tableName) {
         
         html += `
             <label class="list-group-item list-group-item-action py-1 px-2 d-flex align-items-start gap-2 ${labelClass}" style="cursor: ${alreadyExists ? 'default' : 'pointer'};">
-                <input class="form-check-input mt-1 metaAttrColCheck" type="checkbox" value="${col.name}" 
-                       data-camel="${camelName}" ${disabled}
-                       onchange="metaAttrToggleColumn('${col.name.replace(/'/g, "\\'")}', this.checked)">
+                <input class="form-check-input mt-1 metaAttrColCheck" type="checkbox" value="${escapeHtml(col.name)}" 
+                       data-camel="${escapeHtml(camelName)}" ${disabled}
+                       onchange="metaAttrToggleColumn('${escapeHtml(col.name.replace(/\\/g, '\\\\').replace(/'/g, "\\'"))}', this.checked)">
                 <div class="flex-grow-1">
                     <div class="small">
-                        <span class="fw-semibold">${col.name}</span>
+                        <span class="fw-semibold">${escapeHtml(col.name)}</span>
                         <i class="bi bi-arrow-right mx-1 text-muted" style="font-size: 0.65rem;"></i>
-                        <code class="text-primary" style="font-size: 0.75rem;">${camelName}</code>
+                        <code class="text-primary" style="font-size: 0.75rem;">${escapeHtml(camelName)}</code>
                         ${badge}
                     </div>
                     <div style="font-size: 0.65rem;" class="text-muted">
-                        ${col.type || ''}${col.comment ? ' — ' + col.comment : ''}
+                        ${escapeHtml(col.type || '')}${col.comment ? ' — ' + escapeHtml(col.comment) : ''}
                     </div>
                 </div>
             </label>
@@ -2435,7 +4364,7 @@ function metaAttrApplySelection() {
     }
     
     if (addedCount > 0) {
-        showNotification(`Added ${addedCount} attribute(s) from data sources`, 'success', 2000);
+        showNotification(`Added ${addedCount} attribute(s) from data assets`, 'success', 2000);
     } else {
         showNotification('All selected columns already exist as attributes', 'info', 2000);
     }

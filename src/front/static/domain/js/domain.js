@@ -25,7 +25,7 @@ function enforceCamelCase(value) {
 // Configure sidebar navigation
 window.SIDEBAR_NAV_MANUAL_INIT = true;
 document.addEventListener('DOMContentLoaded', function() {
-    // Show the global domain-loading overlay while the Domain Information
+    // Show the global domain-loading overlay while the Domain → General
     // page boots up after a "New Domain" action. domain-information.js
     // hides it once its Promise.all (info + version-status + LLM
     // endpoints) resolves. Flag is set by domainNew() in navbar.js right
@@ -50,9 +50,17 @@ document.addEventListener('DOMContentLoaded', function() {
             if (section === 'validation') {
                 loadValidationDetails();
             }
+            // Load review/validation workflow when switching to review section
+            if (section === 'review' && typeof window.loadDomainReview === 'function') {
+                window.loadDomainReview();
+            }
             // Load versions when switching to versions section
             if (section === 'versions' && typeof loadVersionsList === 'function') {
                 loadVersionsList();
+            }
+            // Load the unified audit trail when switching to audit section
+            if (section === 'audit' && typeof window.loadDomainAudit === 'function') {
+                window.loadDomainAudit();
             }
             // Load OWL content when switching to owl-content section
             if (section === 'owl-content' && typeof window.loadOwlContent === 'function') {
@@ -67,6 +75,8 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // Load initial data
     loadDomainInfo();
+
+    initMcpPolicyTab();
 
     var domainFileInput = document.getElementById('domainFileInput');
     if (domainFileInput) {
@@ -92,12 +102,15 @@ async function loadDomainInfo() {
             const nameEl = document.getElementById('domainName');
             const descEl = document.getElementById('domainDescription');
             const authorEl = document.getElementById('domainAuthor');
+            const quorumEl = document.getElementById('domainReviewQuorum');
             const baseUriEl = document.getElementById('domainBaseUri');
             const autoToggle = document.getElementById('baseUriCustomToggle');
             
             if (nameEl) nameEl.value = data.info.name || 'NewDomain';
             if (descEl) descEl.value = data.info.description || '';
             if (authorEl) authorEl.value = data.info.author || '';
+            if (quorumEl) quorumEl.value = data.info.review_quorum || 1;
+            applyMcpPolicy(data.info.mcp_policy);
             
             if (authorEl && !authorEl.value) {
                 loadCurrentUserAsAuthor(authorEl);
@@ -256,9 +269,14 @@ async function saveDomainInfo() {
     const nameEl = document.getElementById('domainName');
     const descEl = document.getElementById('domainDescription');
     const authorEl = document.getElementById('domainAuthor');
+    const quorumEl = document.getElementById('domainReviewQuorum');
     const versionEl = document.getElementById('domainVersionSelect');
     const baseUriEl = document.getElementById('domainBaseUri');
     const llmEndpointEl = document.getElementById('domainLlmEndpoint');
+    const llmEndpointKindEl = document.getElementById('domainLlmEndpointKind');
+    const graphBackendEl = document.getElementById('domainGraphBackend');
+    const neo4jDbEl = document.getElementById('domainNeo4jDatabase');
+    const materializationEl = document.getElementById('domainLakehouseMaterialization');
 
     if (!nameEl || !descEl || !authorEl) {
         showNotification('Form fields not found', 'error');
@@ -275,15 +293,33 @@ async function saveDomainInfo() {
         return;
     }
 
-    const domainInfoPayload = {
-        name: domainName,
-        version: versionEl ? versionEl.value : '1',
-        description: descEl.value.trim(),
-        author: authorEl.value.trim(),
-        base_uri: baseUriEl ? baseUriEl.value.trim() : '',
-        base_uri_auto: _baseUriAutoMode,
-        llm_endpoint: llmEndpointEl ? llmEndpointEl.value : '',
-    };
+    if (typeof validateDomainInfoForm === 'function' && !validateDomainInfoForm()) {
+        return;
+    }
+
+    // Shared with the pre-UC-save auto-save in navbar.js so both paths always
+    // send the same field set.
+    const domainInfoPayload = typeof buildDomainInfoPayload === 'function'
+        ? buildDomainInfoPayload()
+        : {
+            name: domainName,
+            version: versionEl ? versionEl.value : '1',
+            description: descEl.value.trim(),
+            author: authorEl.value.trim(),
+            base_uri: baseUriEl ? baseUriEl.value.trim() : '',
+            base_uri_auto: _baseUriAutoMode,
+            llm_endpoint: llmEndpointEl ? llmEndpointEl.value : '',
+            llm_endpoint_kind: llmEndpointKindEl ? llmEndpointKindEl.value : '',
+            review_quorum: quorumEl ? Math.max(1, parseInt(quorumEl.value, 10) || 1) : 1,
+            graph_backend: graphBackendEl ? graphBackendEl.value : 'lakebase',
+            neo4j_connection: (graphBackendEl && graphBackendEl.value === 'neo4j' && neo4jDbEl)
+                ? neo4jDbEl.value : '',
+            lakehouse_materialization: (graphBackendEl && graphBackendEl.value === 'databricks' && materializationEl)
+                ? materializationEl.value : 'view',
+            graph_cache_enabled: (graphBackendEl && (graphBackendEl.value === 'databricks' || graphBackendEl.value === 'lakebase'))
+                ? ((document.getElementById('domainGraphCacheEnabled') || {}).checked !== false)
+                : undefined,
+        };
     
     try {
         showNotification('Saving domain info...', 'info', 1000);
@@ -299,6 +335,17 @@ async function saveDomainInfo() {
         
         if (data.success) {
             showNotification('Domain info saved successfully!', 'success');
+            window.OB?.updateLlmAvailability(
+                Boolean((data.info?.llm_endpoint || '').trim())
+            );
+            // Keep the selector's baseline in step so a later refresh of the
+            // Settings connection list re-selects what was just persisted.
+            if (neo4jDbEl) {
+                neo4jDbEl.dataset.savedValue = domainInfoPayload.neo4j_connection;
+            }
+            if (materializationEl) {
+                materializationEl.dataset.savedValue = domainInfoPayload.lakehouse_materialization;
+            }
             // ``refreshNavbarIndicators`` invalidates ``/navbar/state``
             // and ``/domain/info`` then re-fetches — no separate
             // ``invalidateDomainCaches`` call (would double-invalidate).
@@ -326,10 +373,6 @@ async function saveDomainInfo() {
 }
 
 // Note: save-to-local helpers live in domain template partials when present.
-
-function loadDomainFromFile() {
-    document.getElementById('domainFileInput').click();
-}
 
 async function handleDomainFileUpload(input) {
     const file = input.files[0];
@@ -395,82 +438,56 @@ async function newDomain() {
 }
 
 /**
- * Save domain from settings page with validation
- * For new domains, requires Domain Name and Base URI
+ * Wire the MCP tab's "select all" checkbox to the per-tool checkboxes.
+ *
+ * The checkboxes themselves are rendered server-side from the catalog in
+ * back/core/mcp_tools.py; only the tri-state summary is computed here.
  */
-async function saveDomainFromSettings() {
-    const nameEl = document.getElementById('domainName');
-    const baseUriEl = document.getElementById('domainBaseUri');
-    
-    // Get values
-    const domainName = nameEl ? nameEl.value.trim() : '';
-    const baseUri = baseUriEl ? baseUriEl.value.trim() : '';
-    
-    // Clear previous validation states
-    if (nameEl) nameEl.classList.remove('is-invalid');
-    if (baseUriEl) baseUriEl.classList.remove('is-invalid');
-    
-    // Validate required fields
-    let hasErrors = false;
-    
-    if (!domainName) {
-        if (nameEl) {
-            nameEl.classList.add('is-invalid');
-            nameEl.focus();
-        }
-        showNotification('Domain Name is required', 'warning');
-        hasErrors = true;
-    } else if (!/^[A-Z][a-zA-Z0-9]*$/.test(domainName)) {
-        if (nameEl) {
-            nameEl.classList.add('is-invalid');
-            if (!hasErrors) nameEl.focus();
-        }
-        showNotification('Domain Name must be CamelCase and alphanumeric only (e.g. MyOntologyDomain)', 'warning');
-        hasErrors = true;
-    }
-    
-    if (!baseUri) {
-        if (baseUriEl) {
-            baseUriEl.classList.add('is-invalid');
-            if (!hasErrors) baseUriEl.focus();
-        }
-        if (!hasErrors) {
-            showNotification('Base URI is required', 'warning');
-        } else {
-            showNotification('Domain Name and Base URI are required', 'warning');
-        }
-        hasErrors = true;
-    }
-    
-    // Validate Base URI format
-    if (baseUri && !isValidUri(baseUri)) {
-        if (baseUriEl) {
-            baseUriEl.classList.add('is-invalid');
-            if (!hasErrors) baseUriEl.focus();
-        }
-        showNotification('Base URI must be a valid URI (e.g., https://example.org/ontology#)', 'warning');
-        hasErrors = true;
-    }
-    
-    if (hasErrors) {
-        return;
-    }
-    
-    // Remove validation states on input
-    if (nameEl) {
-        nameEl.addEventListener('input', () => nameEl.classList.remove('is-invalid'), { once: true });
-    }
-    if (baseUriEl) {
-        baseUriEl.addEventListener('input', () => baseUriEl.classList.remove('is-invalid'), { once: true });
-    }
-    
-    // Save domain info to session and open Unity Catalog save dialog
-    // (saveDomainInfo only saves to session; domainSave opens the UC dialog for actual persistence)
-    if (typeof domainSave === 'function') {
-        await domainSave();
+function initMcpPolicyTab() {
+    const selectAll = document.getElementById('mcpToolsSelectAll');
+    const tools = Array.from(document.querySelectorAll('.js-mcp-tool'));
+    if (!selectAll || !tools.length) return;
+
+    selectAll.addEventListener('change', () => {
+        // Never re-check a locked tool (graph tools on a "No Backend" domain).
+        tools.forEach(el => { if (!el.disabled) el.checked = selectAll.checked; });
+        selectAll.indeterminate = false;
+    });
+    tools.forEach(el => el.addEventListener('change', syncMcpSelectAll));
+    syncMcpSelectAll();
+}
+
+/** Refresh the "select all" tri-state from the individual tool checkboxes. */
+function syncMcpSelectAll() {
+    const selectAll = document.getElementById('mcpToolsSelectAll');
+    const tools = Array.from(document.querySelectorAll('.js-mcp-tool'));
+    if (!selectAll || !tools.length) return;
+    const checked = tools.filter(el => el.checked).length;
+    selectAll.checked = checked === tools.length;
+    selectAll.indeterminate = checked > 0 && checked < tools.length;
+}
+
+/**
+ * Render a persisted MCP policy into the tab.
+ *
+ * Keeps the tab in sync with the session domain after /domain/info reloads
+ * (e.g. switching domains), which would otherwise leave the server-rendered
+ * markup showing the previous domain's policy.
+ */
+function applyMcpPolicy(policy) {
+    const disabled = (policy && policy.disabled_tools) || [];
+    const context = (policy && policy.context) || {};
+    document.querySelectorAll('.js-mcp-tool').forEach(el => {
+        el.checked = !disabled.includes(el.dataset.toolName);
+    });
+    document.querySelectorAll('.js-mcp-context').forEach(el => {
+        el.value = context[el.dataset.featureName] || 'normal';
+    });
+    // Re-lock the graph tools when the reloaded domain is ontology-only.
+    if (typeof applyGraphlessConstraints === 'function') {
+        applyGraphlessConstraints();
     } else {
-        await saveDomainInfo();
-        showNotification('Domain info saved. Use the menu "Save Domain" to persist to Unity Catalog.', 'info', 4000);
+        syncMcpSelectAll();
     }
 }
 

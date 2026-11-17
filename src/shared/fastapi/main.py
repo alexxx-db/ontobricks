@@ -5,6 +5,8 @@ This is the main FastAPI application (UI, GraphQL, health).
 Run with: uvicorn shared.fastapi.main:app --reload --port 8000
 """
 
+import os
+
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,12 +15,18 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from contextlib import asynccontextmanager
-import os
 
 from shared.config.settings import get_settings
 from shared.config.constants import APP_VERSION, SESSION_COOKIE_NAME
-from back.objects.session import FileSessionMiddleware
+from back.objects.session import FileSessionMiddleware, reap_expired_sessions
+from back.core.databricks.ActingIdentity import ActingIdentity
+from back.core.databricks.request_identity import (
+    RequestIdentity,
+    set_request_identity,
+    reset_request_identity,
+)
 from back.core.logging import setup_logging, get_logger
+from shared.fastapi.ui_branding import UIBrandingMiddleware
 
 setup_logging()
 logger = get_logger(__name__)
@@ -65,7 +73,7 @@ tags_metadata = [
 API_DESCRIPTION = """
 # OntoBricks API
 
-**Knowledge Graph Builder for Databricks**
+**Graph Viewer Builder for Databricks**
 
 OntoBricks enables you to build knowledge graphs from Databricks tables using ontologies 
 and R2RML mappings. Design an ontology, map it to your data, and materialize triples 
@@ -76,7 +84,7 @@ into a Delta triple store for visual exploration and quality validation.
 - 🏗️ **Ontology Design** - Visual ontology editor with OWL export
 - 🔗 **Data Mapping** - Map ontology concepts to Databricks tables
 - 🔍 **SPARQL Queries** - Query data using W3C standard SPARQL
-- 📊 **Digital Twin Knowledge Graph** - Interactive sigma.js WebGL graph exploration with SPARQL-based quality checks
+- 📊 **Knowledge Graph Graph Viewer** - Interactive sigma.js WebGL graph exploration with SPARQL-based quality checks
 - 📦 **Domain Management** - Save/load domains to Unity Catalog volumes
 - 🔮 **GraphQL API** - Auto-generated typed schema from ontology with nested entity traversal
 
@@ -103,6 +111,12 @@ async def lifespan(app: FastAPI):
     """Application lifespan - startup and shutdown events."""
     settings = get_settings()
     os.makedirs(settings.session_dir, exist_ok=True)
+    try:
+        reaped = reap_expired_sessions(settings.session_dir, settings.session_max_age)
+        if reaped:
+            logger.info("Removed %d expired session file(s) at startup", reaped)
+    except Exception as e:
+        logger.warning("Session sweep failed, continuing startup: %s", e)
     logger.info("OntoBricks FastAPI starting — session_dir=%s", settings.session_dir)
     logger.info("App docs: /docs | External REST: /api/docs")
 
@@ -141,6 +155,21 @@ _PERM_BYPASS_PREFIXES = (
 
 _VIEWER_BLOCKED_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+# Read-only endpoints that take their parameters as a POST body. Viewers
+# need them to search/expand the Explorer and to run Graph Chat (the agent
+# loopbacks ``query_graphql`` to ``/dtwin/graphql/execute``). None of them
+# persists domain content; Graph Chat write actions go through
+# ``/dtwin/nodes/action/request`` and ``/confirm``, which stay blocked.
+# ``/sync/load`` stays blocked: it is a builder-only data-refresh operation.
+_VIEWER_READ_ONLY_POSTS = frozenset(
+    {
+        "/dtwin/sync/filter",
+        "/dtwin/assistant/chat",
+        "/dtwin/assistant/chat/stream",
+        "/dtwin/graphql/execute",
+    }
+)
+
 _PERM_ADMIN_ONLY_PREFIXES = (
     "/settings",
 )
@@ -148,22 +177,30 @@ _PERM_ADMIN_ONLY_PREFIXES = (
 # Endpoints under an admin-only prefix that non-admins must still be
 # able to reach (read-only status endpoints consumed by the regular
 # app flow, e.g. checking warehouse / registry configuration before
-# opening the Load Domain dialog, or listing domains for the
-# Registry Browse page). Map is exact-path → allowed HTTP methods,
+# opening the Load Domain dialog, listing domains for the Registry
+# Browse page, or browsing catalogs/schemas for Add Data Source).
+# Map is exact-path → allowed HTTP methods,
 # so write variants at the same path (e.g. ``POST /settings/registry``
 # to change the registry location) remain admin-only, and so do
 # deletes on sub-paths like ``/settings/registry/domains/<name>``.
 _PERM_ADMIN_ONLY_EXCEPTIONS = {
     "/settings/current": {"GET"},
+    "/settings/catalogs": {"GET"},
+    "/settings/schemas": {"GET"},
     "/settings/registry": {"GET"},
     "/settings/registry/domains": {"GET"},
     "/settings/registry/bridges": {"GET"},
-    # Graph DB engine is global; non-admins need read access so the Settings UI
-    # (and tab refresh) match persisted state. Writes remain POST + admin-only.
-    "/settings/graph-engine": {"GET"},
+    # Graph DB engine *connection* config is global; non-admins need read access
+    # so the Settings UI (and tab refresh) match persisted state. Writes remain
+    # POST + admin-only. The backend *selection* moved per-domain.
+    "/settings/delta-warehouse": {"GET"},
     "/settings/graph-engine-config": {"GET"},
     "/settings/graph-engine/lakebase-health": {"GET"},
     "/settings/graph-engine/uc-catalogs": {"GET"},
+}
+
+_PERM_ADMIN_ONLY_PREFIX_EXCEPTIONS = {
+    "/settings/schemas/": {"GET"},
 }
 
 # Routes that operate on a specific domain (the session's current domain).
@@ -185,7 +222,125 @@ _DOMAIN_SCOPED_EXCEPTIONS = (
     "/domain/list-projects",
     "/domain/list-versions",
     "/domain/load-from-uc",
+    # Authorization is resolved against the *target* domain inside the
+    # handler (a Builder may manage status for a domain they have not
+    # loaded), so it must not be gated by the *session* domain's role.
+    "/domain/set-version-status",
+    # Closing only releases the caller's own edit lock and resets their
+    # session — any user with app access (viewers included) may close the
+    # domain they have open, so it is not gated by the session domain role.
+    "/domain/close",
 )
+
+# ----------------------------------------------------------------------
+# Lifecycle status edit-gate
+# ----------------------------------------------------------------------
+# A domain version's *design* is only editable while its lifecycle status
+# is ``DRAFT``. Once it moves to ``IN-REVIEW`` or ``PUBLISHED`` the
+# design-mutating endpoints below are blocked server-side (authoritative)
+# for *all* roles. Read / query / generate / validate endpoints stay open
+# so a locked version can still be browsed, queried and inspected.
+#
+# Data-refresh ops (KG build/sync, reasoning materialise) are NOT gated
+# on the lifecycle status: they re-materialise triples from source data
+# using the frozen design but do not change the design itself. A PUBLISHED
+# domain's graph can therefore be refreshed without reverting to DRAFT.
+
+# Write methods on these prefixes are pure model-editing surfaces.
+_STATUS_GATE_EDIT_PREFIXES = (
+    "/ontology/",
+    "/mapping/",
+)
+
+# Specific mutating endpoints outside the editing prefixes (domain
+# metadata/layout saves, document uploads) that persist into the loaded
+# version's *design*.
+# NOTE: KG data-refresh ops (/dtwin/sync/start, /dtwin/sync/load,
+# /dtwin/reasoning/materialize) are intentionally NOT listed here — they
+# re-materialise triples from source data using the frozen design but do
+# not mutate the design itself. They must remain usable on PUBLISHED /
+# IN-REVIEW versions so the graph can be refreshed without reverting to
+# DRAFT. They remain builder-gated via their endpoint role decorators.
+_STATUS_GATE_EDIT_PATHS = (
+    "/domain/save",
+    "/domain/info",
+    "/domain/import",
+    "/domain/reset",
+    "/domain/clear",
+    "/domain/config",
+    "/domain/map-layout",
+    "/domain/save-to-uc",
+    "/domain/design-views/create",
+    "/domain/design-views/rename",
+    "/domain/design-views/delete",
+    "/domain/metadata/",
+    "/domain/documents/",
+)
+
+# Non-mutating POST endpoints that live under an editing prefix but only
+# compute / validate / generate suggestions (no persistence). These stay
+# open regardless of status so a locked version remains fully inspectable.
+_STATUS_GATE_OPEN_SUFFIXES = (
+    "/generate",
+    "/generate-owl",
+    "/generate-async",
+    "/generate-sql",
+    "/parse-owl",
+    "/parse-rdfs",
+    "/parse-r2rml",
+    "/load-owl-file",
+    "/analyze-import",
+    "/validate",
+    "/validate-sql",
+    "/test-query",
+    "/tables",
+    "/table-columns",
+    "/schema-context",
+    "/analyze",
+    "/chat",
+    "/invoke",
+    "/probe-write",
+)
+
+# Status values that allow editing the version content.
+_STATUS_EDITABLE = "DRAFT"
+
+# Wizard sub-routes that are the exception to the blanket "/wizard/"
+# exemption below: unlike the rest of the staged-Generate wizard (detect,
+# draft read/update/discard), which only stages a session-scoped draft and
+# never touches the persisted ontology, `.../generate/complete` runs the
+# deterministic append-only merge and calls `domain.save()` — a genuine
+# design mutation. It must be gated exactly like any other `/ontology/`
+# write, so it is checked (and matched) before the wizard exemption.
+_STATUS_GATE_WIZARD_EDIT_SUFFIXES = (
+    "/wizard/generate/complete",
+)
+
+
+def _viewer_write_blocked(method: str, path: str) -> bool:
+    """True when a Viewer must not use this method/path."""
+    if method not in _VIEWER_BLOCKED_METHODS:
+        return False
+    return not (method == "POST" and path in _VIEWER_READ_ONLY_POSTS)
+
+
+def _is_status_gated_edit(path: str, method: str) -> bool:
+    """True when *path*/*method* mutates the loaded version's content."""
+    if method not in _VIEWER_BLOCKED_METHODS:
+        return False
+    if any(path.endswith(suffix) for suffix in _STATUS_GATE_OPEN_SUFFIXES):
+        return False
+    if any(path.endswith(suffix) for suffix in _STATUS_GATE_WIZARD_EDIT_SUFFIXES):
+        return True
+    if "/wizard/" in path:
+        return False
+    if any(path.startswith(p) for p in _STATUS_GATE_EDIT_PREFIXES):
+        return True
+    if any(
+        path == p or path.startswith(p) for p in _STATUS_GATE_EDIT_PATHS
+    ):
+        return True
+    return False
 
 
 class PermissionMiddleware(BaseHTTPMiddleware):
@@ -201,12 +356,16 @@ class PermissionMiddleware(BaseHTTPMiddleware):
       ``/mapping``, ``/dtwin``) additionally requires a non-empty entry
       in the domain's ``.domain_permissions.json``.  Admins bypass this.
     - **Viewer write-block**: a viewer team entry allows GETs on domain
-      routes but not writes.
+      routes but not writes, except POST to the exact paths in
+      :data:`_VIEWER_READ_ONLY_POSTS` (Explorer filter, Graph Chat, and
+      GraphQL execute).
     - **Admin-only prefix** (`/settings`) is gated to admins even for
       app users. A small allow-list (see
-      :data:`_PERM_ADMIN_ONLY_EXCEPTIONS`) keeps the read-only status
-      endpoints that the regular app flow needs (warehouse/registry
-      config) open to non-admins.
+      :data:`_PERM_ADMIN_ONLY_EXCEPTIONS` and
+      :data:`_PERM_ADMIN_ONLY_PREFIX_EXCEPTIONS`) keeps the read-only
+      endpoints the regular app flow needs (warehouse/registry status
+      and Unity Catalog catalog/schema browse for **Add Data Source**)
+      open to non-admins. Settings writes stay admin-only.
 
     Only active when running as a Databricks App (``DATABRICKS_APP_PORT``
     is set).  In local-dev mode every request passes through as admin.
@@ -228,16 +387,54 @@ class PermissionMiddleware(BaseHTTPMiddleware):
         request.state.user_email = email
 
         if not is_databricks_app():
+            # Local / PAT dev has no proxy identity header, so resolve the
+            # developer's e-mail once via SCIM /Me. Without this, audit
+            # attribution (review sign-offs, status changes) records an
+            # empty actor and sign-off counts stay stuck at 0/N.
+            if not email:
+                from back.core.databricks import get_local_user_email
+
+                request.state.user_email = get_local_user_email()
             request.state.user_role = "admin"
             request.state.user_domain_role = "admin"
-            return await call_next(request)
+            request.state.user_token = ""
+            _tok = set_request_identity(
+                RequestIdentity(
+                    email=request.state.user_email,
+                    user_token="",
+                    app_role="admin",
+                    domain_role="admin",
+                )
+            )
+            try:
+                return await call_next(request)
+            finally:
+                reset_request_identity(_tok)
 
-        path = request.url.path
+        email, user_token = self._apply_acting_identity(request, email)
+
+        # Raw routed path, not request.url.path: the latter is reconstructed
+        # from the Host header and could be poisoned (BadHost / CVE-2026-48710).
+        path = request.scope["path"]
 
         if any(path.startswith(p) for p in _PERM_BYPASS_PREFIXES):
+            # These prefixes skip the session role gate (programmatic /api,
+            # GraphQL, static, health, docs) so M2M / MCP callers are not
+            # 302-redirected to /access-denied. We still stamp the forwarded
+            # end-user identity so Lakehouse / Unity Catalog reads run
+            # on-behalf-of the caller (OBO) when a Databricks Apps user token
+            # is attached — e.g. the MCP companion forwarding the signed-in
+            # user's acting token. This mirrors Explorer / Graph Chat on the
+            # internal routes. No token → SP fallback, unchanged.
             request.state.user_role = ""
             request.state.user_domain_role = ""
-            return await call_next(request)
+            _tok = set_request_identity(
+                RequestIdentity(email=email, user_token=user_token)
+            )
+            try:
+                return await call_next(request)
+            finally:
+                reset_request_identity(_tok)
 
         try:
             role, domain_role = self._resolve_roles(request, email)
@@ -299,13 +496,22 @@ class PermissionMiddleware(BaseHTTPMiddleware):
             if (
                 is_domain_scoped
                 and domain_role == ROLE_VIEWER
-                and request.method in _VIEWER_BLOCKED_METHODS
+                and _viewer_write_blocked(request.method, path)
             ):
                 return self._forbidden_json(
                     request, "Viewer role does not allow write operations"
                 )
 
             allowed_methods = _PERM_ADMIN_ONLY_EXCEPTIONS.get(path)
+            if allowed_methods is None:
+                allowed_methods = next(
+                    (
+                        methods
+                        for prefix, methods in _PERM_ADMIN_ONLY_PREFIX_EXCEPTIONS.items()
+                        if path.startswith(prefix)
+                    ),
+                    None,
+                )
             is_admin_only = any(
                 path.startswith(p) for p in _PERM_ADMIN_ONLY_PREFIXES
             ) and not (
@@ -318,7 +524,106 @@ class PermissionMiddleware(BaseHTTPMiddleware):
                     )
                 return RedirectResponse("/", status_code=302)
 
-        return await call_next(request)
+        # Lifecycle status edit-gate (applies to all roles, admins
+        # included): block mutating edits unless the loaded version is
+        # DRAFT. Locked versions must be set back to DRAFT to edit.
+        if _is_status_gated_edit(path, request.method):
+            status = self._session_version_status(request)
+            if status and status != _STATUS_EDITABLE:
+                return self._forbidden_json(
+                    request,
+                    f"This version is {status}; set it back to DRAFT to edit.",
+                )
+            # Single-editor lock (authoritative): on an editable (DRAFT)
+            # version only the lock holder may mutate. Admins are NOT
+            # auto-exempt — they must "take over" the lock first, which
+            # preserves the single-writer invariant.
+            holder = self._session_edit_lock_holder(request)
+            if holder:
+                return self._forbidden_json(
+                    request,
+                    f"This version is being edited by {holder}; you have "
+                    "read-only access. Take over editing to make changes.",
+                )
+
+        request.state.user_token = user_token
+        _tok = set_request_identity(
+            RequestIdentity(
+                email=email,
+                user_token=user_token,
+                app_role=role,
+                domain_role=domain_role,
+            )
+        )
+        try:
+            return await call_next(request)
+        finally:
+            reset_request_identity(_tok)
+
+    @staticmethod
+    def _apply_acting_identity(request: Request, email: str) -> tuple[str, str]:
+        """Swap MCP-forwarded acting headers when the proxy identity is the MCP SP.
+
+        Databricks Apps overwrites ``x-forwarded-*`` from the M2M bearer on
+        the MCP → UI hop. Acting headers restore the end user only for that
+        principal (issue #208).
+        """
+        identity = ActingIdentity.resolve(
+            proxy_email=email,
+            proxy_token=request.headers.get("x-forwarded-access-token", "") or "",
+            acting_email=request.headers.get(ActingIdentity.HEADER_EMAIL, "") or "",
+            acting_token=request.headers.get(ActingIdentity.HEADER_TOKEN, "") or "",
+            mcp_sp_client_id=get_settings().mcp_sp_client_id,
+        )
+        request.state.user_email = identity.email
+        request.state.user_token = identity.user_token
+        if identity.swapped:
+            logger.info(
+                "MCP hop: proxy_sp=%s acting_user=%s token=%s",
+                request.headers.get("x-forwarded-email", ""),
+                identity.email,
+                "yes" if identity.user_token else "no",
+            )
+        return identity.email, identity.user_token
+
+    @staticmethod
+    def _session_edit_lock_holder(request: Request) -> str:
+        """Name of *another* user editing the session's loaded version.
+
+        Returns ``""`` when the request must not be blocked (lock free /
+        held by this user / backend unavailable). Only invoked on the
+        already-gated mutating edit routes, so it adds no per-request
+        Lakebase cost to reads.
+        """
+        try:
+            from back.objects.session import SessionManager
+            from back.objects.registry.collab import EditLockService
+
+            session_mgr = SessionManager(request)
+            return EditLockService.blocking_holder(
+                request, session_mgr, get_settings()
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not resolve edit-lock holder: %s", exc)
+            return ""
+
+    @staticmethod
+    def _session_version_status(request: Request) -> str:
+        """Lifecycle status of the request's session-loaded domain version.
+
+        Returns ``"DRAFT"`` (editable) when no domain is loaded or the
+        status cannot be resolved, so a transient error never blocks an
+        edit on a legitimately editable version.
+        """
+        try:
+            from back.objects.session import get_domain, SessionManager
+
+            session_mgr = SessionManager(request)
+            domain = get_domain(session_mgr)
+            return (domain.info or {}).get("status", "DRAFT") or "DRAFT"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not resolve session version status: %s", exc)
+            return "DRAFT"
 
     @staticmethod
     def _forbidden_json(request: Request, message: str) -> JSONResponse:
@@ -356,7 +661,7 @@ class PermissionMiddleware(BaseHTTPMiddleware):
         session_mgr = SessionManager(request)
         domain = get_domain(session_mgr)
         host, token = get_databricks_host_and_token(domain, settings)
-        user_token = request.headers.get("x-forwarded-access-token", "")
+        user_token = getattr(request.state, "user_token", "") or ""
 
         from back.objects.registry import RegistryCfg
 
@@ -403,8 +708,8 @@ def create_app() -> FastAPI:
             "url": "https://github.com/databricks/ontobricks",
         },
         license_info={
-            "name": "Apache 2.0",
-            "url": "https://www.apache.org/licenses/LICENSE-2.0.html",
+            "name": "Databricks License",
+            "url": "https://github.com/databrickslabs/ontobricks/blob/master/LICENSE.txt",
         },
         lifespan=lifespan,
     )
@@ -430,6 +735,9 @@ def create_app() -> FastAPI:
 
     # Permission enforcement (runs after session is available)
     app.add_middleware(PermissionMiddleware)
+
+    # Resolve UI branding once per page request after session setup.
+    app.add_middleware(UIBrandingMiddleware, settings=settings)
 
     # Custom file-based session middleware
     is_app = bool(os.getenv("DATABRICKS_APP_PORT"))

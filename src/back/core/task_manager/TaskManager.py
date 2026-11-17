@@ -6,9 +6,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from back.core.logging import get_logger
-from back.core.task_manager.models import Task, TaskStatus, TaskStep
+from back.core.task_manager.Task import Task, TaskLogEntry, TaskStep
+from back.core.task_manager.TaskStatus import TaskStatus
 
 logger = get_logger(__name__)
+
+_MAX_LOG_ENTRIES = 200
 
 
 def _now_iso() -> str:
@@ -52,6 +55,17 @@ class TaskManager:
         self._max_tasks = 100
         self._initialized = True
 
+    def _append_log(self, task: Task, message: Optional[str]) -> None:
+        """Append a user-visible log line; skip structured iteration payloads."""
+        if not message or message.startswith("__iter__:"):
+            return
+        if task.log_entries and task.log_entries[-1].message == message:
+            return
+        task.log_entries.append(TaskLogEntry(message=message, at=_now_iso()))
+        if len(task.log_entries) > _MAX_LOG_ENTRIES:
+            overflow = len(task.log_entries) - _MAX_LOG_ENTRIES
+            del task.log_entries[:overflow]
+
     def create_task(
         self, name: str, task_type: str, steps: List[Dict[str, str]] = None
     ) -> Task:
@@ -94,6 +108,7 @@ class TaskManager:
         task.started_at = _now_iso()
         task.message = message
         task.progress = 0
+        self._append_log(task, message)
         if task.steps:
             task.steps[0].status = "running"
             task.steps[0].started_at = _now_iso()
@@ -124,6 +139,22 @@ class TaskManager:
         task.progress = max(task.progress, clamped)
         if message:
             task.message = message
+            self._append_log(task, message)
+        return True
+
+    def merge_result(self, task_id: str, patch: Dict[str, Any]) -> bool:
+        """Shallow-merge ``patch`` into a running task's ``result`` dict.
+
+        Used to publish incremental payloads (e.g. detected entity labels)
+        while the worker is still running. Terminal tasks are left untouched.
+        """
+        task = self._tasks.get(task_id)
+        if not task or task.status in self._TERMINAL_STATUSES:
+            return False
+        current = task.result if isinstance(task.result, dict) else {}
+        merged = dict(current)
+        merged.update(patch)
+        task.result = merged
         return True
 
     def advance_step(self, task_id: str, message: str = None) -> bool:
@@ -141,6 +172,7 @@ class TaskManager:
                 task.message = message
             else:
                 task.message = task.steps[task.current_step].description
+            self._append_log(task, task.message)
             logger.info(
                 "Task %s step %s/%s: %s",
                 task_id,
@@ -239,6 +271,7 @@ class TaskManager:
         task.completed_at = _now_iso()
         task.progress = 100
         task.message = message
+        self._append_log(task, message)
         task.result = result
         for step in task.steps:
             if step.status not in ("completed", "skipped"):
@@ -269,6 +302,7 @@ class TaskManager:
         task.completed_at = _now_iso()
         task.error = error
         task.message = f"Failed: {error[:100]}"
+        self._append_log(task, task.message)
         if task.steps and task.current_step < len(task.steps):
             task.steps[task.current_step].status = "failed"
         duration = _format_duration(task.duration_seconds())

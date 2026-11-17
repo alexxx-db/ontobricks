@@ -1,8 +1,9 @@
 """Tests for the SWRL SQL translator and SWRLEngine."""
 
-from back.core.reasoning.models import InferredTriple, ReasoningResult
-from back.core.reasoning.SWRLSQLTranslator import SWRLSQLTranslator
-from back.core.reasoning.SWRLParser import SWRLParser
+from back.core.reasoning.results.InferredTriple import InferredTriple
+from back.core.reasoning.results.ReasoningResult import ReasoningResult
+from back.core.reasoning.swrl.SWRLSQLTranslator import SWRLSQLTranslator
+from back.core.reasoning.swrl.SWRLParser import SWRLParser
 
 
 # -- Atom parser tests ----------------------------------------------------
@@ -115,13 +116,63 @@ class TestSWRLSQLTranslator:
         assert sql is not None
         assert "INSERT INTO triples" in sql
 
+    def test_inference_translates_string_builtin_to_filter(self):
+        params = {
+            "antecedent": (
+                'Customer(?x) \u2227 Contract(?z) \u2227 Meter(?w) '
+                '\u2227 hasContract(?x, ?z) \u2227 hasMeter(?z, ?w) '
+                '\u2227 status(?z, ?status) \u2227 swrlb:contains(?status, "active")'
+            ),
+            "consequent": "owns(?x, ?w)",
+            "base_uri": "http://ex.org",
+            "uri_map": {},
+        }
+
+        sql = self.translator.build_inference_sql("triples", params)
+
+        assert sql is not None
+        assert "object LIKE CONCAT(" in sql
+        assert "'active'" in sql
+        assert "predicate = 'http://ex.org#contains'" not in sql
+
+
+# -- Built-in registry tests -----------------------------------------------
+
+
+class TestBuiltinNumericCasts:
+    """Built-ins cast triple values, which are strings, to numbers or dates.
+
+    Under ANSI mode a bare ``CAST`` aborts the statement on the first value
+    that will not convert, so one malformed row would fail the whole rule
+    instead of simply not matching.
+    """
+
+    def test_no_builtin_emits_a_bare_cast(self):
+        from back.core.reasoning.swrl.SWRLBuiltinRegistry import SWRLBuiltinRegistry
+
+        offenders = [
+            b.name
+            for b in SWRLBuiltinRegistry.all().values()
+            if "CAST(" in b.sql_template.replace("TRY_CAST(", "")
+        ]
+        assert offenders == []
+
+    def test_greater_than_uses_try_cast(self):
+        from back.core.reasoning.swrl.SWRLBuiltinRegistry import SWRLBuiltinRegistry
+
+        builtin = SWRLBuiltinRegistry.get("greaterThan")
+        assert (
+            builtin.sql_template
+            == "TRY_CAST({0} AS DOUBLE) > TRY_CAST({1} AS DOUBLE)"
+        )
+
 
 # -- SWRLEngine tests ------------------------------------------------------
 
 
 class TestSWRLEngine:
     def test_execute_rules_with_mock_store(self):
-        from back.core.reasoning.SWRLEngine import SWRLEngine
+        from back.core.reasoning.swrl.SWRLEngine import SWRLEngine
         from unittest.mock import MagicMock
 
         store = MagicMock()
@@ -155,7 +206,7 @@ class TestSWRLEngine:
         assert len(result.inferred_triples) >= 1
 
     def test_execute_empty_rules(self):
-        from back.core.reasoning.SWRLEngine import SWRLEngine
+        from back.core.reasoning.swrl.SWRLEngine import SWRLEngine
         from unittest.mock import MagicMock
 
         store = MagicMock()

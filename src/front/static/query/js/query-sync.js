@@ -4,18 +4,53 @@
  */
 
 const SYNC_TASK_KEY = 'ontobricks_sync_task';
+const ADJ_REFRESH_TASK_KEY = 'ontobricks_adjacency_refresh_task';
+
+function _syncTripleStoreBackend() {
+    try {
+        const el = document.getElementById('triplestore-config');
+        if (!el) return 'lakebase';
+        return JSON.parse(el.textContent || '{}').triple_store_backend || 'lakebase';
+    } catch (_) {
+        return 'lakebase';
+    }
+}
 
 /** Whether ontology + assignments are both ready */
 let syncIsReady = false;
 
 /** Whether a sync task is currently running */
 let syncIsRunning = false;
+let adjacencyRefreshRunning = false;
 
 /** Whether the triple store table has data */
 let tripleStoreHasData = false;
 
 /**
- * Fetch all Information-page data in a single round-trip and distribute
+ * Whether the last status probe could not reach the graph engine (`has_data`
+ * came back null). A timeout is not evidence of a missing graph, so the badge
+ * must say "status unavailable" rather than send the user off to rebuild a
+ * graph they already have.
+ */
+let tripleStoreStatusUnknown = false;
+
+/**
+ * Whether `/dtwin/sync/info` served the graph status as a "pending" skeleton
+ * (cache miss) so the page could paint without waiting on the ~4-8s COUNT(*)
+ * probe. While true, the KG badges show a "checking" spinner and the real
+ * state is confirmed by a background `checkTripleStoreStatus(true)` call.
+ */
+let tripleStoreStatusPending = false;
+
+/** Whether the current caller may refresh graph data for the loaded version. */
+function _canStartBuild() {
+    const permitted = !(window.OB && typeof window.OB.canRefreshGraph === 'function'
+        && !window.OB.canRefreshGraph());
+    return syncIsReady && permitted && !adjacencyRefreshRunning;
+}
+
+/**
+ * Fetch all Knowledge Graph Overview data in a single round-trip and distribute
  * results to the individual rendering functions.
  *
  * The caller is responsible for showing/hiding the loading overlay so that
@@ -33,16 +68,38 @@ async function loadSyncInfo() {
 
         // --- Triplestore status ---
         var tsStatus = payload.triplestore_status || {};
-        tripleStoreHasData = !!(tsStatus.success && tsStatus.has_data);
-        console.log('[Sync] Consolidated triplestore status -> hasData:', tripleStoreHasData);
-        renderTripleStoreStatus(tsStatus);
+
+        // Cache miss: status was served as a non-blocking "pending" skeleton to
+        // keep the ~4-8s COUNT(*) probe off the first paint. Show a "checking"
+        // state and confirm the live count in the background — do NOT decide
+        // hasData / unknown yet, or the badge would flash "Graph not built".
+        // The rest of loadSyncInfo (rebuild warning, dt_existence, menus) still
+        // runs below; only the status verdict is deferred.
+        var statusPending = !!(payload.triplestore_status_pending || tsStatus.pending);
+        tripleStoreStatusPending = statusPending;
+        if (statusPending) {
+            console.log('[Sync] Triplestore status pending — confirming in background');
+            renderTripleStoreStatus({ success: true, has_data: null, pending: true });
+            setTimeout(function () { checkTripleStoreStatus(true); }, 50);
+        } else {
+            tripleStoreStatusUnknown = !!(tsStatus.success && tsStatus.has_data === null);
+            tripleStoreHasData = !!(tsStatus.success && tsStatus.has_data);
+            console.log('[Sync] Consolidated triplestore status -> hasData:', tripleStoreHasData,
+                tripleStoreStatusUnknown ? '(probe inconclusive)' : '');
+            renderTripleStoreStatus(tsStatus);
+        }
 
         // Guard against cache-staleness inconsistency: the shared cache timestamp
         // can make an old dt_existence entry (graph_has_data=true) appear fresh
         // even after a new status write sets has_data=false.  When the two signals
         // disagree (both ultimately check the same Postgres table), trust the
         // triplestore_status — it is a more targeted, recent check.
-        if (!tripleStoreHasData && payload.dt_existence) {
+        //
+        // Only a *definite* false may do this. A null has_data means the probe
+        // never reached the engine, which is no reason to erase a graph that
+        // dt_existence found; that asymmetry is what showed "Graph not built" on
+        // Analytics while the Build page listed the graph as present.
+        if (tsStatus.has_data === false && payload.dt_existence) {
             if (payload.dt_existence.graph_has_data) {
                 console.warn(
                     '[Sync] dt_existence says Loaded but triplestore_status says no data ' +
@@ -108,7 +165,8 @@ function _applyReadiness(data) {
 
     var syncBtn = document.getElementById('syncStartBtn');
     var loadBtn = document.getElementById('syncLoadBtn');
-    if (syncBtn) syncBtn.disabled = !syncIsReady;
+    var canBuild = _canStartBuild();
+    if (syncBtn) syncBtn.disabled = !canBuild;
     if (loadBtn) loadBtn.disabled = !syncIsReady;
 
     var contentEl = document.getElementById('syncReadinessContent');
@@ -131,19 +189,62 @@ function _applyReadiness(data) {
     }
 }
 
+/** Compact badge spinner used while Build-page artefact probes are in flight. */
+function _archSpinnerBadge(label) {
+    return '<span class="badge bg-light text-muted border" style="font-size:.65rem;" role="status">' +
+        '<span class="spinner-border spinner-border-sm me-1" style="width:.65rem;height:.65rem;border-width:.12em;" aria-hidden="true"></span>' +
+        _escHtml(label || 'Loading') + '</span>';
+}
+
+/** Compact name-line spinner for unresolved Triple Store / Sync / Graph DB FQNs. */
+function _archSpinnerName() {
+    return '<span class="spinner-border spinner-border-sm text-muted" role="status" aria-label="Loading" ' +
+        'style="width:.7rem;height:.7rem;border-width:.12em;"></span>';
+}
+
 /**
- * Apply DT-existence data obtained from the consolidated endpoint.
- * Mirrors _loadDtExistence() rendering without the separate fetch.
+ * Toggle inline retrieval spinners on the Lakebase architecture cards.
+ * Used before the live ``/dtwin/sync/dt-existence`` probe so badges/names do
+ * not flash "Unable to check" / "—" while the probe is still running.
  */
+function _setArchRetrievalLoading(on) {
+    if (!on) return;
+    var badgeIds = ['dtExistView', 'dtLakebaseSyncedUcExists', 'dtLakebaseTableExists'];
+    for (var i = 0; i < badgeIds.length; i++) {
+        var el = document.getElementById(badgeIds[i]);
+        if (el) el.innerHTML = _archSpinnerBadge('Loading');
+    }
+    var nameIds = ['dtViewName', 'dtLakebaseSyncedUc', 'dtLakebaseFullName'];
+    for (var j = 0; j < nameIds.length; j++) {
+        var nameEl = document.getElementById(nameIds[j]);
+        if (!nameEl) continue;
+        var cur = (nameEl.textContent || '').trim();
+        if (!cur || cur === '—' || cur === 'N/A' || cur === 'Not configured' || nameEl.querySelector('.spinner-border')) {
+            nameEl.innerHTML = _archSpinnerName();
+        }
+    }
+}
+
 /**
- * Build page: labels and options depend on global Graph DB engine.
- * Currently only Lakebase is supported; the function keeps a generic
- * shape so future engines can be added without touching call sites.
+ * Build page: labels and options depend on the per-domain Graph DB engine.
  */
+function _setBackendBrandIcon(element, backend) {
+    if (!element) return;
+    element.classList.remove(
+        'ob-icon-postgresql',
+        'ob-icon-lakehouse',
+        'ob-icon-databricks',
+        'ob-icon-neo4j',
+        'd-none'
+    );
+    element.classList.add(_backendBrandIconClass(backend));
+}
+
 function _applyBuildGraphEngineUi(dtExist) {
     var dt = dtExist || {};
     var cfg = window.__TRIPLESTORE_CONFIG || {};
     var eng = dt.graph_engine || cfg.graph_engine || 'lakebase';
+    var pending = dt.pending === true;
     cfg.graph_engine = eng;
     window.__TRIPLESTORE_CONFIG = cfg;
 
@@ -152,34 +253,98 @@ function _applyBuildGraphEngineUi(dtExist) {
     if (fnLk) fnLk.classList.remove('d-none');
 
     var title = document.getElementById('dtGraphBackendTitle');
+    var labels = {
+        'lakebase': 'Graph DB (Lakebase)',
+        'databricks': 'Graph DB (Lakehouse)',
+        'delta': 'Graph DB (Lakehouse)',
+        'neo4j': 'Graph DB (Neo4j)'
+    };
     if (title) {
-        title.textContent = eng === 'lakebase' ? 'Graph DB (Lakebase)' : 'Graph DB Digital Twin';
+        title.textContent = labels[eng] || 'Graph DB Digital Twin';
     }
+    // Toggle the post-Triple-Store cards (Sync + Graph DB) based on engine.
+    // The `dtLakebaseDetails` container wraps both the Sync card and the
+    // Graph DB card. On Lakebase, both show. On Neo4j, the Sync card is
+    // hidden (no UC-synced table on the Neo4j path) but the Graph DB card
+    // remains visible with engine-aware label and metadata.
+    function _renderEngineUi(activeEng) {
+        var container = document.getElementById('dtLakebaseDetails');
+        var titleEl   = document.getElementById('dtGraphBackendTitle');
+        var graphIcon = document.getElementById('dtGraphBackendIcon');
+        var syncRow   = document.getElementById('dtLakebaseSyncedUcRow');
+        var boltRow   = document.getElementById('dtNeo4jBoltCard');
+        var lkBuild   = document.getElementById('dtLakebaseBuildNote');
+        var graphFn   = document.getElementById('dtLakebaseFullName');
+        if (container) container.classList.remove('d-none');
+        if (titleEl)   titleEl.textContent = labels[activeEng] || ('Graph DB (' + activeEng + ')');
+        _setBackendBrandIcon(graphIcon, activeEng);
+        if (activeEng === 'neo4j') {
+            // Show the Bolt writer card and hide Lakebase-only details.
+            if (syncRow) syncRow.classList.add('d-none');
+            if (boltRow) boltRow.classList.remove('d-none');
+            if (lkBuild) lkBuild.classList.add('d-none');
+            // Neo4j Graph DB card: show the marker label (or FQN display) and a
+            // Neo4j-specific build note. No Postgres/UC concepts apply here.
+            if (graphFn) {
+                var neoName = dt.graph_display
+                    || dt.neo4j_marker_label
+                    || cfg.graph_name
+                    || 'Knowledge Graph';
+                if (dt.neo4j_graph_exists == null && dt.pending) {
+                    graphFn.innerHTML = _archSpinnerName();
+                } else {
+                    graphFn.textContent = neoName;
+                }
+            }
+            var neoBuild = document.getElementById('dtNeo4jBuildNote');
+            if (neoBuild) {
+                neoBuild.classList.remove('d-none');
+                var neoDbEl = document.getElementById('fnNeo4jDatabase');
+                var neoLblEl = document.getElementById('fnNeo4jLabel');
+                if (neoDbEl) neoDbEl.textContent = dt.neo4j_database || cfg.neo4j_database || 'neo4j';
+                if (neoLblEl) neoLblEl.textContent = dt.neo4j_marker_label || cfg.graph_name || '…';
+            }
+        } else {
+            if (syncRow) syncRow.classList.remove('d-none');
+            if (boltRow) boltRow.classList.add('d-none');
+            if (lkBuild) lkBuild.classList.remove('d-none');
+            var neoBuild2 = document.getElementById('dtNeo4jBuildNote');
+            if (neoBuild2) neoBuild2.classList.add('d-none');
+        }
+    }
+    _renderEngineUi(eng);
     var sub = document.getElementById('dtGraphStorageSubtitle');
     var primaryRow = document.getElementById('dtGraphPrimaryRow');
     if (sub) sub.classList.add('d-none');
     if (primaryRow) primaryRow.classList.add('d-none');
     var regRow = document.getElementById('dtRegistryArchiveRow');
     if (regRow) regRow.classList.add('d-none');
-    var lkDetails = document.getElementById('dtLakebaseDetails');
-    if (lkDetails) lkDetails.classList.toggle('d-none', eng !== 'lakebase');
 
     if (eng === 'lakebase') {
         var lkDb  = document.getElementById('dtLakebaseDatabase');
         var lkSch = document.getElementById('dtLakebaseSchema');
         var lkTbl = document.getElementById('dtLakebaseTable');
-        var lkUcRow = document.getElementById('dtLakebaseSyncedUcRow');
         var lkUc    = document.getElementById('dtLakebaseSyncedUc');
         if (lkDb)  lkDb.textContent  = dt.lakebase_database || '—';
         if (lkSch) lkSch.textContent = dt.lakebase_schema   || '—';
         if (lkTbl) lkTbl.textContent = dt.lakebase_table    || '—';
         var lkFullName = document.getElementById('dtLakebaseFullName');
+        var db = dt.lakebase_database || '', sch = dt.lakebase_schema || '', tbl = dt.lakebase_table || '';
+        var fullName = '';
+        if (db && sch && tbl) fullName = db + '.' + sch + '.' + tbl;
+        else if (sch && tbl) fullName = sch + '.' + tbl;
+        else fullName = db || sch || tbl || '';
         if (lkFullName) {
-            var db = dt.lakebase_database || '', sch = dt.lakebase_schema || '', tbl = dt.lakebase_table || '';
-            lkFullName.textContent = (db && sch && tbl) ? db + '.' + sch + '.' + tbl : (db || sch || tbl || '—');
+            if (fullName) lkFullName.textContent = fullName;
+            else if (pending) lkFullName.innerHTML = _archSpinnerName();
+            else lkFullName.textContent = '—';
         }
         var hasUcName = !!(dt.lakebase_synced_uc);
-        if (lkUc) lkUc.textContent = dt.lakebase_synced_uc || '—';
+        if (lkUc) {
+            if (hasUcName) lkUc.textContent = dt.lakebase_synced_uc;
+            else if (pending) lkUc.innerHTML = _archSpinnerName();
+            else lkUc.textContent = '—';
+        }
 
         // existence badges for table and UC sync
         var tblExistsEl = document.getElementById('dtLakebaseTableExists');
@@ -188,8 +353,9 @@ function _applyBuildGraphEngineUi(dtExist) {
                 tblExistsEl.innerHTML = '<span class="badge bg-success bg-opacity-10 text-success border border-success" style="font-size:.65rem;"><i class="bi bi-check-circle-fill me-1"></i>Exists</span>';
             } else if (dt.lakebase_table_exists === false) {
                 tblExistsEl.innerHTML = '<span class="badge bg-secondary bg-opacity-10 text-secondary border" style="font-size:.65rem;"><i class="bi bi-dash-circle me-1"></i>Not found</span>';
+            } else if (pending) {
+                tblExistsEl.innerHTML = _archSpinnerBadge('Loading');
             } else {
-                // null/undefined → live probe could not reach Lakebase
                 tblExistsEl.innerHTML = '<span class="badge bg-warning bg-opacity-10 text-warning border border-warning" style="font-size:.65rem;"><i class="bi bi-question-circle me-1"></i>Unable to check</span>';
                 var sp = tblExistsEl.querySelector('span');
                 if (sp) sp.title = dt.lakebase_check_error
@@ -203,8 +369,9 @@ function _applyBuildGraphEngineUi(dtExist) {
                 ucExistsEl.innerHTML = '<span class="badge bg-success bg-opacity-10 text-success border border-success" style="font-size:.65rem;"><i class="bi bi-check-circle-fill me-1"></i>Exists</span>';
             } else if (dt.lakebase_synced_uc_exists === false) {
                 ucExistsEl.innerHTML = '<span class="badge bg-secondary bg-opacity-10 text-secondary border" style="font-size:.65rem;"><i class="bi bi-dash-circle me-1"></i>Not found</span>';
+            } else if (pending) {
+                ucExistsEl.innerHTML = _archSpinnerBadge('Loading');
             } else if (hasUcName) {
-                // name is configured but existence probe didn't return yet / failed
                 ucExistsEl.innerHTML = '<span class="badge bg-warning bg-opacity-10 text-warning border border-warning" style="font-size:.65rem;" title="Could not verify whether the UC sync table exists."><i class="bi bi-question-circle me-1"></i>Unable to check</span>';
             } else {
                 ucExistsEl.innerHTML = '<span class="badge bg-secondary bg-opacity-10 text-secondary border" style="font-size:.65rem;"><i class="bi bi-dash-circle me-1"></i>Not found</span>';
@@ -239,12 +406,32 @@ function _applyDtExistence(data) {
         return '<span class="badge bg-secondary bg-opacity-10 text-secondary border" ' + s + '><i class="bi bi-dash-circle me-1"></i>' + (unknownText || 'N/A') + '</span>';
     }
 
+    var pending = data && data.pending === true;
+    var viewIsNeo4j = (data.graph_engine === 'neo4j')
+        || ((window.__TRIPLESTORE_CONFIG || {}).graph_engine === 'neo4j');
     var viewEl = document.getElementById('dtExistView');
     if (viewEl) {
-        viewEl.innerHTML = _badge(data.view_exists, 'Exists', 'Not found', 'Not configured');
-        if (data.view_check_error) viewEl.title = data.view_check_error;
-        else if (data.view_table) viewEl.title = 'Queried: ' + data.view_table;
-        else viewEl.title = '';
+        if (viewIsNeo4j) {
+            // The SQL VIEW is not part of the Neo4j build path (triples go
+            // straight to the graph over Bolt) — show N/A, never a stuck spinner.
+            viewEl.innerHTML = _badge(null, 'Exists', 'Not found', 'N/A');
+            viewEl.title = 'Not used on the Neo4j path — the graph is written directly over Bolt.';
+        } else if (pending || (data.view_exists == null && !data.view_check_error && data.view_table)) {
+            viewEl.innerHTML = _archSpinnerBadge('Loading');
+            viewEl.title = '';
+        } else {
+            viewEl.innerHTML = _badge(data.view_exists, 'Exists', 'Not found', 'Not configured');
+            if (data.view_check_error) viewEl.title = data.view_check_error;
+            else if (data.view_table) viewEl.title = 'Queried: ' + data.view_table;
+            else viewEl.title = '';
+        }
+    }
+
+    var viewNameEl = document.getElementById('dtViewName');
+    if (viewNameEl) {
+        if (data.view_table) viewNameEl.textContent = data.view_table;
+        else if (pending) viewNameEl.innerHTML = _archSpinnerName();
+        else viewNameEl.textContent = 'Not configured';
     }
 
     var zcCard = document.getElementById('dtZeroCopyCard');
@@ -254,11 +441,38 @@ function _applyDtExistence(data) {
         else if (data.view_exists === false) zcCard.classList.add('border-danger');
     }
 
+    var isNeo4j = (data.graph_engine === 'neo4j')
+        || ((window.__TRIPLESTORE_CONFIG || {}).graph_engine === 'neo4j');
+    // Graph DB existence flag is engine-specific: Neo4j marker-label presence
+    // vs Lakebase Postgres table presence.
+    var graphExists = isNeo4j ? data.neo4j_graph_exists : data.lakebase_table_exists;
+
     var graphCard = document.getElementById('dtGraphCard');
     if (graphCard) {
         graphCard.classList.remove('border-success', 'border-danger');
-        if (data.lakebase_table_exists === true) graphCard.classList.add('border-success');
-        else if (data.lakebase_table_exists === false) graphCard.classList.add('border-danger');
+        if (graphExists === true) graphCard.classList.add('border-success');
+        else if (graphExists === false) graphCard.classList.add('border-danger');
+    }
+
+    // Neo4j: paint the Graph DB card's existence badge (Lakebase paints its own
+    // #dtLakebaseTableExists inside _applyBuildGraphEngineUi).
+    if (isNeo4j) {
+        var neoBadge = document.getElementById('dtLakebaseTableExists');
+        if (neoBadge) {
+            if (pending && graphExists == null && !data.neo4j_check_error) {
+                neoBadge.innerHTML = _archSpinnerBadge('Loading');
+            } else if (graphExists === true) {
+                neoBadge.innerHTML = _badge(true, 'Exists', 'Not found', 'N/A');
+            } else if (graphExists === false) {
+                neoBadge.innerHTML = _badge(false, 'Exists', 'Not built', 'N/A');
+            } else {
+                neoBadge.innerHTML = '<span class="badge bg-warning bg-opacity-10 text-warning border border-warning" style="font-size:.65rem;"><i class="bi bi-question-circle me-1"></i>Unable to check</span>';
+                var nsp = neoBadge.querySelector('span');
+                if (nsp) nsp.title = data.neo4j_check_error
+                    ? String(data.neo4j_check_error)
+                    : 'Could not reach Neo4j to verify the graph.';
+            }
+        }
     }
 
     // Global info: last update & last built
@@ -306,6 +520,7 @@ let _syncSectionLoaded = false;
  * then drops to reveal the fully-populated page in one shot.
  */
 async function initSyncSection() {
+    if (_syncTripleStoreBackend() === 'databricks') return;
     if (_syncSectionLoaded) return;
     _syncSectionLoaded = true;
 
@@ -321,11 +536,17 @@ async function initSyncSection() {
 
         const di = payload && (payload.domain_info || payload.project_info);
         if (di && di.success && di.info) {
-            const prevEng = cfg.graph_engine || 'lakebase';
+            // Prefer the authoritative per-domain backend from /domain/info
+            // (``graph_backend``: lakebase | databricks | neo4j) over whatever the
+            // pre-existence seed left in cfg — otherwise a Neo4j domain paints as
+            // Lakebase until (and unless) dt_existence later corrects it.
+            const backend = di.info.graph_backend || di.info.graph_engine || '';
+            const prevEng = backend || cfg.graph_engine || 'lakebase';
             cfg = {
                 view_table: di.info.view_table || '',
                 graph_name: di.info.graph_name || '',
                 graph_engine: prevEng,
+                neo4j_database: di.info.neo4j_database || '',
                 cache: {},
             };
             window.__TRIPLESTORE_CONFIG = cfg;
@@ -350,42 +571,27 @@ async function initSyncSection() {
         if (payload && payload.dt_existence) {
             _applyBuildGraphEngineUi(payload.dt_existence);
             _applyDtExistence(payload.dt_existence);
+
+            // Existence is served cache-first (or as a pending skeleton) for an
+            // instant paint. Confirm the live Lakebase/UC state in the
+            // background so a cold SQL-warehouse / Lakebase wake-up never blocks
+            // the page. Fire-and-forget: it silently updates the badges in place.
+            if (payload.dt_existence_pending && typeof _loadDtExistence === 'function') {
+                setTimeout(function () { _loadDtExistence(); }, 50);
+            }
         }
 
         var targetLabel = document.getElementById('syncTargetLabel');
         if (targetLabel) {
-            targetLabel.innerHTML = '<i class="bi bi-lightning-charge me-1"></i>Digital Twin';
+            targetLabel.innerHTML = '<i class="bi bi-lightning-charge me-1"></i>Knowledge Graph';
         }
 
         if (typeof refreshNavbarIndicators === 'function') refreshNavbarIndicators();
 
         await checkAndResumeSyncTask();
+        await checkAndResumeAdjacencyRefreshTask();
     } finally {
         if (overlay) overlay.classList.add('d-none');
-    }
-}
-
-/**
- * Check whether the ontology or assignments have changed since the last
- * Digital Twin build. Shows a warning banner when a rebuild is recommended.
- */
-async function checkConfigChanges() {
-    var warning = document.getElementById('syncRebuildWarning');
-    if (!warning) return;
-    try {
-        var resp = await fetch('/dtwin/sync/changes', { credentials: 'same-origin' });
-        var data = await resp.json();
-        if (data.needs_rebuild) {
-            warning.classList.remove('d-none');
-            warning.classList.add('d-flex');
-        } else {
-            warning.classList.remove('d-flex');
-            warning.classList.add('d-none');
-        }
-    } catch (e) {
-        console.warn('[Sync] Failed to check config changes:', e);
-        warning.classList.remove('d-flex');
-        warning.classList.add('d-none');
     }
 }
 
@@ -406,11 +612,18 @@ async function checkTripleStoreStatus(refresh) {
     try {
         const response = await fetch(url, { credentials: 'same-origin' });
         const data = await response.json();
+        // The live probe has answered — clear the "pending" (background-confirm)
+        // state set by loadSyncInfo's cache-miss skeleton.
+        tripleStoreStatusPending = false;
+        tripleStoreStatusUnknown = !!(data.success && data.has_data === null);
         tripleStoreHasData = !!(data.success && data.has_data);
         console.log('[Sync] Triple store status:', data, '-> hasData:', tripleStoreHasData);
         renderTripleStoreStatus(data);
     } catch (e) {
         console.error('[Sync] Error checking triple store status:', e);
+        // The request itself failed, so the graph's state is equally unknown.
+        tripleStoreStatusPending = false;
+        tripleStoreStatusUnknown = true;
         tripleStoreHasData = false;
         renderTripleStoreStatus(null);
     } finally {
@@ -439,12 +652,35 @@ function renderTripleStoreStatus(data) {
 
     area.classList.remove('d-none');
 
+    // Pending: status served as a non-blocking skeleton; the live count is
+    // being confirmed in the background. Show a spinner instead of a verdict.
+    if (data && data.pending) {
+        area.innerHTML =
+            '<div class="small mb-0 py-1 px-2 text-muted">' +
+            '<span class="spinner-border spinner-border-sm me-1" style="width:.8rem;height:.8rem;"></span>' +
+            'Checking graph status…</div>';
+        return;
+    }
+
     if (!data || !data.success) {
         // Error checking status (e.g. Databricks not configured)
         const msg = (data && data.message) ? data.message : 'Unable to check triple store status';
         area.innerHTML =
             '<div class="alert alert-warning small mb-0 py-1 px-2">' +
             '<i class="bi bi-exclamation-triangle me-1"></i>' + msg +
+            '</div>';
+        return;
+    }
+
+    if (data.has_data === null) {
+        // The probe never reached the engine, so neither "not built" nor "empty"
+        // is a claim we can make — say so instead of guessing at a cause.
+        const detail = data.graph_check_error ? ' (' + data.graph_check_error + ')' : '';
+        area.innerHTML =
+            '<div class="alert alert-warning small mb-0 py-1 px-2">' +
+            '<i class="bi bi-question-circle me-1"></i>' +
+            'Could not check the graph status' + detail +
+            ' — a connection problem, not a missing graph.' +
             '</div>';
         return;
     }
@@ -459,9 +695,9 @@ function renderTripleStoreStatus(data) {
         const reason = data.reason || '';
         let msg;
         if (reason.toLowerCase().includes('does not exist')) {
-            msg = 'Digital Twin not built yet. Click <strong>Build</strong> to create the VIEW and graph.';
+            msg = 'Knowledge Graph not built yet. Click <strong>Build</strong> to create the VIEW and graph.';
         } else if (reason.toLowerCase().includes('not configured')) {
-            msg = 'Digital Twin is not configured. Set it in <a href="/domain/#information">Domain Settings</a>.';
+            msg = 'Knowledge Graph is not configured. Set it in <a href="/domain/#information">Domain Settings</a>.';
         } else {
             msg = 'Graph is empty. Run <strong>Synchronize</strong> to generate triples.';
         }
@@ -472,8 +708,25 @@ function renderTripleStoreStatus(data) {
     }
 }
 
+function _syncAdjacencyRefreshVisible(backend) {
+    return backend === 'lakebase';
+}
+
+function _updateSyncAdjacencyActionState() {
+    var btn = document.getElementById('syncAdjacencyRefreshBtn');
+    if (!btn) return;
+    var backend = String(_syncTripleStoreBackend() || 'lakebase').toLowerCase();
+    var visible = _syncAdjacencyRefreshVisible(backend);
+    btn.classList.toggle('d-none', !visible);
+    btn.disabled = !visible
+        || !syncIsReady
+        || !tripleStoreHasData
+        || syncIsRunning
+        || adjacencyRefreshRunning;
+}
+
 /**
- * Enable or disable the Data section sidebar menus (Quality, Triples, Knowledge Graph).
+ * Enable or disable the Data section sidebar menus (Quality, Triples, Graph Viewer).
  *
  * Menus are enabled ONLY when ALL conditions are met:
  *   1. Ontology + assignments are ready (syncIsReady)
@@ -481,9 +734,10 @@ function renderTripleStoreStatus(data) {
  *   3. The triple store has data (tripleStoreHasData)
  */
 function updateDataMenus() {
-    const canAccess = syncIsReady && !syncIsRunning && tripleStoreHasData;
+    const canAccess = syncIsReady && !syncIsRunning && !adjacencyRefreshRunning && tripleStoreHasData;
     console.log('[Sync] updateDataMenus: syncIsReady=' + syncIsReady +
                 ', syncIsRunning=' + syncIsRunning +
+                ', adjacencyRefreshRunning=' + adjacencyRefreshRunning +
                 ', tripleStoreHasData=' + tripleStoreHasData +
                 ' -> canAccess=' + canAccess);
 
@@ -501,12 +755,115 @@ function updateDataMenus() {
             // Set a tooltip explaining why the menu is disabled
             if (syncIsRunning) {
                 link.setAttribute('title', 'Synchronization in progress…');
+            } else if (adjacencyRefreshRunning) {
+                link.setAttribute('title', 'Adjacency refresh in progress…');
             } else if (!syncIsReady) {
                 link.setAttribute('title', 'Ontology and mapping assignments must be configured first');
+            } else if (tripleStoreStatusPending) {
+                link.setAttribute('title', 'Checking graph status…');
             } else if (!tripleStoreHasData) {
                 link.setAttribute('title', 'Triple store is empty — run Sync first');
             }
         }
+    });
+
+    updateKgReadyIndicators();
+    _updateSyncAdjacencyActionState();
+}
+
+/**
+ * Populate every Knowledge Graph readiness indicator (the `[data-kg-status]`
+ * spans injected next to each sub-page title via `_kg_status_indicator.html`).
+ *
+ * Three states, driven by the shared triple-store status:
+ *   - building  -> a "Building…" badge while a sync/build task is running;
+ *   - ready     -> a green "Graph ready" badge once the graph has data;
+ *   - not built -> a message + a "Go to Build" button that jumps to the
+ *                  Build sub-page.
+ */
+/**
+ * Friendly label for the triple-store backend / graph engine in use, from the
+ * injected triplestore-config: "Lakehouse" (Delta), "Neo4j", or "Lakebase".
+ */
+function _kgBackendKey() {
+    var cfg = window.__TRIPLESTORE_CONFIG || {};
+    var backend = String(cfg.triple_store_backend || 'lakebase').toLowerCase();
+    var engine = String(cfg.graph_engine || 'lakebase').toLowerCase();
+    if (backend === 'databricks' || engine === 'delta') return 'databricks';
+    if (backend === 'neo4j' || engine === 'neo4j') return 'neo4j';
+    return 'lakebase';
+}
+
+function _backendBrandIconClass(backend) {
+    var key = String(backend || 'lakebase').toLowerCase();
+    if (key === 'databricks' || key === 'delta' || key === 'lakehouse') {
+        return 'ob-icon-lakehouse';
+    }
+    if (key === 'neo4j') return 'ob-icon-neo4j';
+    return 'ob-icon-postgresql';
+}
+
+function _kgBackendLabel() {
+    var backend = _kgBackendKey();
+    if (backend === 'databricks') return 'Lakehouse';
+    if (backend === 'neo4j') return 'Neo4j';
+    return 'Lakebase';
+}
+
+function _kgBackendIconMarkup() {
+    return '<i class="ob-brand-icon ' + _backendBrandIconClass(_kgBackendKey())
+        + ' ms-1 me-1" aria-hidden="true"></i>';
+}
+
+function updateKgReadyIndicators() {
+    var els = document.querySelectorAll('[data-kg-status]');
+    if (!els.length) return;
+
+    var backend = _kgBackendLabel();
+    var html;
+    if (syncIsRunning) {
+        html = '<span class="badge bg-warning-subtle text-warning border border-warning fw-normal">'
+            + '<span class="spinner-border spinner-border-sm me-1 kg-status-spinner"></span>Building…</span>';
+    } else if (tripleStoreStatusPending) {
+        // Status probe deferred off the first paint; confirming in background.
+        html = '<span class="badge bg-secondary-subtle text-secondary border fw-normal" '
+            + 'title="Confirming the graph status in the background…">'
+            + '<span class="spinner-border spinner-border-sm me-1 kg-status-spinner"></span>Checking…</span>';
+    } else if (tripleStoreHasData) {
+        html = '<span class="badge bg-success bg-opacity-10 text-success border border-success fw-normal" '
+            + 'title="The Knowledge Graph is built and ready to use (backend: ' + backend + ').">'
+            + '<i class="bi bi-check-circle-fill me-1"></i>Graph ready'
+            + '<span class="opacity-75 ms-1">·' + _kgBackendIconMarkup() + backend + '</span></span>';
+    } else if (tripleStoreStatusUnknown) {
+        // The probe could not reach the engine, so we do not know either way.
+        // Offering "Go to Build" here would invite a needless rebuild.
+        html = '<span class="badge bg-warning-subtle text-warning border border-warning fw-normal" '
+            + 'title="Could not reach the ' + backend + ' backend to check the graph. '
+            + 'This is a connection problem, not a missing graph — retry in a moment.">'
+            + '<i class="bi bi-question-circle me-1"></i>Status unavailable'
+            + '<span class="opacity-75 ms-1">·' + _kgBackendIconMarkup() + backend + '</span></span>';
+    } else {
+        html = '<span class="kg-not-built d-inline-flex align-items-center gap-2">'
+            + '<span class="badge bg-secondary-subtle text-secondary border fw-normal">'
+            + '<i class="bi bi-slash-circle me-1"></i>Graph not built</span>'
+            + '<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-2 kg-go-build-btn">'
+            + '<i class="bi bi-fast-forward me-1"></i>Go to Build</button>'
+            + '</span>';
+    }
+
+    els.forEach(function(el) { el.innerHTML = html; });
+}
+
+// One-time delegated handler: any "Go to Build" button jumps to the Build
+// sub-page by triggering its sidebar nav link (data-section="sync").
+if (!window.__kgGoBuildWired) {
+    window.__kgGoBuildWired = true;
+    document.addEventListener('click', function(e) {
+        var btn = e.target.closest && e.target.closest('.kg-go-build-btn');
+        if (!btn) return;
+        e.preventDefault();
+        var link = document.querySelector('[data-section="sync"]');
+        if (link) link.click();
     });
 }
 
@@ -548,9 +905,122 @@ async function checkAndResumeSyncTask() {
     }
 }
 
+async function checkAndResumeAdjacencyRefreshTask() {
+    const taskId = sessionStorage.getItem(ADJ_REFRESH_TASK_KEY);
+    if (!taskId) return;
+    try {
+        const response = await fetch(`/tasks/${taskId}`, { credentials: 'same-origin' });
+        const data = await response.json();
+        if (!data.success || !data.task) {
+            sessionStorage.removeItem(ADJ_REFRESH_TASK_KEY);
+            return;
+        }
+        const task = data.task;
+        if (task.status === 'running' || task.status === 'pending') {
+            adjacencyRefreshRunning = true;
+            showSyncProgress();
+            updateSyncProgress(task.progress || 0, task.current_step_description || task.message || '');
+            updateDataMenus();
+            monitorAdjacencyRefreshTask(taskId);
+            return;
+        }
+    } catch (_) {
+        // best effort resume only
+    }
+    sessionStorage.removeItem(ADJ_REFRESH_TASK_KEY);
+}
+
+async function startSyncAdjacencyRefresh() {
+    const backend = String(_syncTripleStoreBackend() || 'lakebase').toLowerCase();
+    if (!_syncAdjacencyRefreshVisible(backend)) {
+        return;
+    }
+    if (!syncIsReady || !tripleStoreHasData || syncIsRunning || adjacencyRefreshRunning) {
+        return;
+    }
+
+    adjacencyRefreshRunning = true;
+    updateDataMenus();
+    showSyncProgress();
+    updateSyncProgress(0, 'Starting adjacency refresh...');
+
+    try {
+        const response = await fetch('/dtwin/adjacency/refresh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+            credentials: 'same-origin',
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success || !data.task_id) {
+            throw new Error(data.message || data.detail || 'Adjacency refresh failed to start');
+        }
+        sessionStorage.setItem(ADJ_REFRESH_TASK_KEY, data.task_id);
+        if (typeof refreshTasks === 'function') refreshTasks();
+        monitorAdjacencyRefreshTask(data.task_id);
+    } catch (error) {
+        adjacencyRefreshRunning = false;
+        hideSyncProgress();
+        updateDataMenus();
+        showNotification('Adjacency refresh failed to start: ' + (error.message || error), 'error');
+    }
+}
+
+async function monitorAdjacencyRefreshTask(taskId) {
+    const pollInterval = 1500;
+    while (true) {
+        try {
+            await new Promise(r => setTimeout(r, pollInterval));
+            const response = await fetch(`/tasks/${taskId}`, { credentials: 'same-origin' });
+            const data = await response.json();
+            if (!data.success || !data.task) throw new Error('Task not found');
+            const task = data.task;
+            updateSyncProgress(task.progress || 0, task.current_step_description || task.message || '');
+            if (task.status === 'completed') {
+                sessionStorage.removeItem(ADJ_REFRESH_TASK_KEY);
+                adjacencyRefreshRunning = false;
+                hideSyncProgress();
+                showNotification('Adjacency refreshed successfully!', 'success');
+                checkTripleStoreStatus(true);
+                _loadDtExistence();
+                if (typeof refreshDigitalTwinStatus === 'function') refreshDigitalTwinStatus();
+                if (typeof refreshTasks === 'function') refreshTasks();
+                updateDataMenus();
+                break;
+            }
+            if (task.status === 'failed') {
+                sessionStorage.removeItem(ADJ_REFRESH_TASK_KEY);
+                adjacencyRefreshRunning = false;
+                hideSyncProgress();
+                showNotification(
+                    'Adjacency refresh failed: ' + (task.error || task.message || 'Unknown error'),
+                    'error'
+                );
+                updateDataMenus();
+                break;
+            }
+            if (task.status === 'cancelled') {
+                sessionStorage.removeItem(ADJ_REFRESH_TASK_KEY);
+                adjacencyRefreshRunning = false;
+                hideSyncProgress();
+                showNotification('Adjacency refresh was cancelled', 'warning');
+                updateDataMenus();
+                break;
+            }
+        } catch (error) {
+            sessionStorage.removeItem(ADJ_REFRESH_TASK_KEY);
+            adjacencyRefreshRunning = false;
+            hideSyncProgress();
+            showNotification('Adjacency refresh monitoring failed: ' + (error.message || error), 'error');
+            updateDataMenus();
+            break;
+        }
+    }
+}
+
 /**
- * Show a confirmation modal before building the Digital Twin.
- * Always displayed so the domain is saved with the latest changes.
+ * Show a confirmation modal before building an editable Knowledge Graph.
+ * Frozen versions skip this step because their design cannot be saved.
  * Resolves to 'save' (user confirms) or 'cancel'.
  */
 function _showSaveBeforeBuildDialog() {
@@ -570,7 +1040,7 @@ function _showSaveBeforeBuildDialog() {
                             <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
                         </div>
                         <div class="modal-body">
-                            <p>The domain will be saved to the registry before building the Digital Twin.</p>
+                            <p>The domain will be saved to the registry before building the Knowledge Graph.</p>
                             <p class="mb-0 text-muted">
                                 This ensures the triple store, GraphQL API, and other services
                                 use the latest ontology and mapping configuration.
@@ -612,11 +1082,23 @@ function _showSaveBeforeBuildDialog() {
 }
 
 /**
- * Start the synchronization process.
- * Always prompts the user to save the domain first so the registry
- * contains the latest ontology and mapping configuration.
+ * Start the synchronization process. Editable versions are saved first;
+ * frozen versions build directly from their persisted design.
  */
 async function startTripleStoreSync() {
+    if (window.OB && typeof window.OB.canRefreshGraph === 'function'
+            && !window.OB.canRefreshGraph()) {
+        showNotification(
+            'Build is unavailable — builder access and an unlocked domain are required.',
+            'warning'
+        );
+        return;
+    }
+    if (adjacencyRefreshRunning) {
+        showNotification('Adjacency refresh is running. Wait for it to finish first.', 'warning');
+        return;
+    }
+
     const tableEl = document.getElementById('syncTriplestoreTable');
     const triplestoreTable = tableEl ? tableEl.value.trim() : '';
 
@@ -625,17 +1107,21 @@ async function startTripleStoreSync() {
         return;
     }
 
-    const choice = await _showSaveBeforeBuildDialog();
-    if (choice === 'cancel') return;
+    const canEdit = !(window.OB && typeof window.OB.canEditOntology === 'function'
+        && !window.OB.canEditOntology());
+    if (canEdit) {
+        const choice = await _showSaveBeforeBuildDialog();
+        if (choice === 'cancel') return;
 
-    try {
-        if (typeof saveDomainInfoBeforeSave === 'function') {
-            await saveDomainInfoBeforeSave();
+        try {
+            if (typeof saveDomainInfoBeforeSave === 'function') {
+                await saveDomainInfoBeforeSave();
+            }
+            await doDomainSave();
+        } catch (err) {
+            showNotification('Save failed: ' + err.message, 'error');
+            return;
         }
-        await doDomainSave();
-    } catch (err) {
-        showNotification('Save failed: ' + err.message, 'error');
-        return;
     }
 
     // Disable button and menus
@@ -666,7 +1152,7 @@ async function startTripleStoreSync() {
             hideSyncProgress();
             syncIsRunning = false;
             updateDataMenus();
-            if (btn) btn.disabled = !syncIsReady;
+            if (btn) btn.disabled = !_canStartBuild();
             showNotification('Error: ' + (data.message || 'Failed to start sync'), 'error');
             return;
         }
@@ -680,7 +1166,7 @@ async function startTripleStoreSync() {
         hideSyncProgress();
         syncIsRunning = false;
         updateDataMenus();
-        if (btn) btn.disabled = !syncIsReady;
+        if (btn) btn.disabled = !_canStartBuild();
         showNotification('Error: ' + error.message, 'error');
     }
 }
@@ -731,7 +1217,7 @@ async function monitorSyncTask(taskId) {
                 // Refresh artefact existence flags
                 _loadDtExistence();
 
-                // Refresh navbar Digital Twin indicator
+                // Refresh navbar Knowledge Graph indicator
                 if (typeof refreshDigitalTwinStatus === 'function') refreshDigitalTwinStatus();
 
                 if (typeof refreshTasks === 'function') refreshTasks();
@@ -781,7 +1267,10 @@ async function monitorSyncTask(taskId) {
     }
 
     const btn = document.getElementById('syncStartBtn');
-    if (btn) btn.disabled = !syncIsReady;
+    if (btn) {
+        var canBuild = _canStartBuild();
+        btn.disabled = !canBuild;
+    }
 }
 
 /**
@@ -818,277 +1307,30 @@ function updateSyncProgress(percent, stepText) {
 // =====================================================
 // BUILDING DIGITAL TWIN — live log
 // =====================================================
+const _syncTimedBuildLog = TimedTaskLog.create({
+    cardId: "syncBuildLogCard",
+    listId: "syncBuildLogList",
+    totalId: "syncBuildLogTotal",
+    badgeId: "syncBuildLogBadge",
+    exportButtonId: "syncBuildLogExport",
+    title: "OntoBricks — Knowledge Graph Build Log",
+    filenamePrefix: "digital-twin-build",
+});
 
-let _syncBuildLogTickerStarted = false;
-// Latest task payload rendered into the build-log panel. Cached so the
-// Export button can dump it without re-fetching, and so users can save
-// the log of a finished build before navigating away.
-let _syncBuildLogLastTask = null;
-
-/**
- * Show the live build-log card and wipe any previous content. Called when
- * the user clicks Build so the panel slides in next to the Digital Twin
- * card and grows row-by-row as the backend reports each phase.
- */
 function showBuildLog() {
-    const card = document.getElementById('syncBuildLogCard');
-    const list = document.getElementById('syncBuildLogList');
-    const total = document.getElementById('syncBuildLogTotal');
-    const badge = document.getElementById('syncBuildLogBadge');
-    const exportBtn = document.getElementById('syncBuildLogExport');
-    if (!card) return;
-    card.classList.remove('d-none');
-    if (list) list.innerHTML = '<div class="text-muted small py-2"><i class="bi bi-hourglass-split me-1"></i>Waiting for the build to start…</div>';
-    if (total) total.textContent = '';
-    if (badge) {
-        badge.textContent = 'running';
-        badge.className = 'badge bg-primary ms-1';
-    }
-    _syncBuildLogLastTask = null;
-    if (exportBtn) exportBtn.disabled = true;
-    _ensureBuildLogTicker();
+    _syncTimedBuildLog.show();
 }
 
 function hideBuildLog() {
-    const card = document.getElementById('syncBuildLogCard');
-    if (card) card.classList.add('d-none');
+    _syncTimedBuildLog.hide();
 }
 
-/**
- * Render the per-step rows from a Task payload. Steps already include
- * description / status / started_at / completed_at — this function only
- * decorates them with icons, elapsed time and the running sub-message.
- */
 function renderBuildLog(task) {
-    const list = document.getElementById('syncBuildLogList');
-    const total = document.getElementById('syncBuildLogTotal');
-    const badge = document.getElementById('syncBuildLogBadge');
-    const exportBtn = document.getElementById('syncBuildLogExport');
-    if (!list || !task) return;
-    _syncBuildLogLastTask = task;
-    if (exportBtn) exportBtn.disabled = false;
-
-    const steps = Array.isArray(task.steps) ? task.steps : [];
-    if (steps.length === 0) {
-        list.innerHTML = '<div class="text-muted small py-2">No build steps reported.</div>';
-        return;
-    }
-
-    const runningMessage = task.message || '';
-    const rows = steps.map(function (step, idx) {
-        return _renderBuildStepRow(step, idx, runningMessage, task);
-    });
-    list.innerHTML = rows.join('');
-
-    if (total) {
-        const dur = computeTaskDuration(task);
-        total.textContent = dur ? 'Total: ' + dur : '';
-    }
-    if (badge) {
-        if (task.status === 'completed') {
-            badge.textContent = 'done';
-            badge.className = 'badge bg-success ms-1';
-        } else if (task.status === 'failed') {
-            badge.textContent = 'failed';
-            badge.className = 'badge bg-danger ms-1';
-        } else if (task.status === 'cancelled') {
-            badge.textContent = 'cancelled';
-            badge.className = 'badge bg-warning text-dark ms-1';
-        } else {
-            badge.textContent = 'running';
-            badge.className = 'badge bg-primary ms-1';
-        }
-    }
+    _syncTimedBuildLog.render(task);
 }
 
-/**
- * Build the HTML for a single step row. The running step also shows the
- * live ``task.message`` so users see fine-grained progress like
- * "Written 4500/15000 triples…".
- */
-function _renderBuildStepRow(step, idx, runningMessage, task) {
-    const cfg = _getStepConfig(step.status);
-    const desc = escapeHtml(step.description || step.name || ('Step ' + (idx + 1)));
-
-    let detailHtml = '';
-    if (step.status === 'running' && runningMessage) {
-        detailHtml = '<div class="sync-step-detail">' + escapeHtml(runningMessage) + '</div>';
-    } else if (step.status === 'skipped') {
-        detailHtml = '<div class="sync-step-detail text-muted">Not needed for this build</div>';
-    } else if (step.status === 'failed' && runningMessage) {
-        detailHtml = '<div class="sync-step-detail text-danger">' + escapeHtml(runningMessage) + '</div>';
-    }
-
-    const timeHtml = _renderStepTime(step, task);
-
-    return (
-        '<div class="sync-build-row sync-step-' + step.status + '">' +
-            '<span class="sync-step-icon"><i class="bi ' + cfg.icon + ' ' + cfg.colorClass + '"></i></span>' +
-            '<div class="sync-step-body">' +
-                '<div class="sync-step-title">' + desc + '</div>' +
-                detailHtml +
-            '</div>' +
-            '<div class="sync-step-time">' + timeHtml + '</div>' +
-        '</div>'
-    );
-}
-
-/**
- * Pick icon + colour for a step status. ``skipped`` mirrors Bootstrap's
- * muted dash so the row reads as "we didn't need this".
- */
-function _getStepConfig(status) {
-    const map = {
-        pending:   { icon: 'bi-circle',           colorClass: 'text-muted' },
-        running:   { icon: 'bi-arrow-repeat spin-animation', colorClass: 'text-primary' },
-        completed: { icon: 'bi-check-circle-fill', colorClass: 'text-success' },
-        skipped:   { icon: 'bi-dash-circle',       colorClass: 'text-muted' },
-        failed:    { icon: 'bi-x-circle-fill',     colorClass: 'text-danger' }
-    };
-    return map[status] || map.pending;
-}
-
-/**
- * Registry backup is kicked off in a background thread; the TaskManager
- * marks the archive step completed immediately so the build can finish.
- * ``started_at`` and ``completed_at`` are therefore the same tick — show
- * an honest label instead of "0ms".
- */
-/**
- * Render the right-hand time column. Running steps get a live timer so
- * users see the seconds tick during the slower poll cadence; finished
- * steps show their wall-clock duration.
- */
-function _renderStepTime(step, task) {
-    if (step.status === 'completed' || step.status === 'failed' || step.status === 'skipped') {
-        const start = step.started_at;
-        const end = step.completed_at || step.started_at;
-        if (!start) return '<span class="text-muted">—</span>';
-        return '<span class="text-muted small">' + escapeHtml(formatDuration(start, end) || '—') + '</span>';
-    }
-    if (step.status === 'running' && step.started_at) {
-        return '<span class="text-primary small" data-step-elapsed="' + escapeHtml(step.started_at) + '">'
-            + escapeHtml(formatDuration(step.started_at, null) || '0s')
-            + '</span>';
-    }
-    return '<span class="text-muted small">—</span>';
-}
-
-/**
- * Tick the running-step elapsed label every second so the timer advances
- * smoothly between the 1.5s polls. Cheap because it only updates one
- * text node per running row, not the entire list.
- */
-function _ensureBuildLogTicker() {
-    if (_syncBuildLogTickerStarted) return;
-    _syncBuildLogTickerStarted = true;
-    setInterval(function () {
-        document.querySelectorAll('#syncBuildLogList [data-step-elapsed]').forEach(function (el) {
-            const startISO = el.getAttribute('data-step-elapsed');
-            const txt = formatDuration(startISO, null);
-            if (txt) el.textContent = txt;
-        });
-    }, 1000);
-}
-
-/**
- * Build a plain-text dump of the last rendered task and trigger a
- * browser download. The format is intentionally human-readable so users
- * can paste it into a support ticket without any tooling.
- */
 function exportBuildLog() {
-    const task = _syncBuildLogLastTask;
-    if (!task) {
-        showNotification('No build log to export yet', 'warning');
-        return;
-    }
-
-    const text = _formatBuildLogAsText(task);
-    const stamp = (task.started_at || task.created_at || new Date().toISOString())
-        .replace(/[:.]/g, '-')
-        .replace('T', '_')
-        .slice(0, 19);
-    const fname = 'digital-twin-build_' + stamp + '.log';
-
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fname;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
-}
-
-/**
- * Format a Task payload as a human-readable, copy-paste-friendly log.
- * One header block (task metadata + final result), one section per
- * step with status, timestamps, duration and the running message.
- */
-function _formatBuildLogAsText(task) {
-    const lines = [];
-    const sep = '─'.repeat(60);
-
-    lines.push(sep);
-    lines.push('OntoBricks — Digital Twin Build Log');
-    lines.push(sep);
-    lines.push('Task ID         : ' + (task.id || ''));
-    lines.push('Name            : ' + (task.name || ''));
-    lines.push('Status          : ' + (task.status || ''));
-    if (task.created_at)   lines.push('Created at      : ' + task.created_at);
-    if (task.started_at)   lines.push('Started at      : ' + task.started_at);
-    if (task.completed_at) lines.push('Completed at    : ' + task.completed_at);
-    const totalDur = computeTaskDuration(task);
-    if (totalDur) lines.push('Total duration  : ' + totalDur);
-    if (task.progress != null) lines.push('Progress        : ' + task.progress + '%');
-    if (task.message) lines.push('Last message    : ' + task.message);
-    if (task.error)   lines.push('Error           : ' + task.error);
-    lines.push('');
-
-    const steps = Array.isArray(task.steps) ? task.steps : [];
-    if (steps.length > 0) {
-        lines.push('Steps');
-        lines.push(sep);
-        steps.forEach(function (step, idx) {
-            const num = String(idx + 1).padStart(2, ' ');
-            const status = (step.status || 'pending').toUpperCase().padEnd(9, ' ');
-            const desc = step.description || step.name || ('Step ' + (idx + 1));
-            lines.push('[' + num + '] ' + status + ' ' + desc);
-            if (step.started_at)   lines.push('     started   : ' + step.started_at);
-            if (step.completed_at) lines.push('     completed : ' + step.completed_at);
-            if (step.started_at) {
-                const dur = formatDuration(step.started_at, step.completed_at || null);
-                if (dur) {
-                    const label = step.completed_at ? '     duration  : ' : '     elapsed   : ';
-                    lines.push(label + dur);
-                }
-            }
-            if (step.status === 'running' && task.message) {
-                lines.push('     detail    : ' + task.message);
-            }
-            lines.push('');
-        });
-    }
-
-    if (task.result && typeof task.result === 'object') {
-        lines.push('Result');
-        lines.push(sep);
-        const r = task.result;
-        if (r.triple_count != null)     lines.push('Triples         : ' + r.triple_count);
-        if (r.diff && typeof r.diff === 'object') {
-            lines.push('Diff            : +' + (r.diff.added || 0) + ' / -' + (r.diff.removed || 0));
-        }
-        if (r.view_table)               lines.push('View table      : ' + r.view_table);
-        if (r.graph_name)               lines.push('Graph name      : ' + r.graph_name);
-        if (r.duration_seconds != null) lines.push('Duration (s)    : ' + r.duration_seconds);
-        lines.push('');
-    }
-
-    lines.push(sep);
-    lines.push('Exported at     : ' + new Date().toISOString());
-    lines.push(sep);
-    return lines.join('\n');
+    _syncTimedBuildLog.export();
 }
 
 /**
@@ -1156,11 +1398,13 @@ async function loadTripleStore(options = {}) {
     const loadingHtml = '<span class="spinner-border spinner-border-sm me-1"></span>Loading...';
     if (syncBtn) { syncBtn.disabled = true; syncBtn.innerHTML = loadingHtml; }
 
+    const includeInferred = document.getElementById('sgShowInferred')?.checked !== false;
+
     try {
         const response = await fetch('/dtwin/sync/load', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({}),
+            body: JSON.stringify({ include_inferred: includeInferred }),
             credentials: 'same-origin'
         });
 
@@ -1177,31 +1421,6 @@ async function loadTripleStore(options = {}) {
         tripleStoreHasData = count > 0;
         updateDataMenus();
 
-        // Populate global query state (same as after a query execution)
-        if (typeof queryResults !== 'undefined') {
-            queryResults = data.results;
-        }
-        if (typeof generatedSql !== 'undefined') {
-            generatedSql = data.generated_sql || `SELECT * FROM ${triplestoreTable}`;
-        }
-
-        // Update badges
-        const badge = document.getElementById('resultCountBadge');
-        if (badge) badge.textContent = count;
-        const resultCount = document.getElementById('resultCount');
-        if (resultCount) resultCount.textContent = count + ' results';
-
-        // Display results in the Results section
-        if (typeof displayResults === 'function') {
-            displayResults({
-                success: true,
-                results: data.results,
-                columns: data.columns || ['subject', 'predicate', 'object'],
-                count: count,
-                generated_sql: data.generated_sql || ''
-            });
-        }
-
         // Flag for visualization to rebuild graph
         if (typeof graphJustBuilt !== 'undefined') {
             graphJustBuilt = true;
@@ -1209,7 +1428,7 @@ async function loadTripleStore(options = {}) {
 
         if (!silent) showNotification(`Loaded ${count} triples from triple store`, 'success');
 
-        // Navigate to Knowledge Graph only when explicitly requested
+        // Navigate to Graph Viewer only when explicitly requested
         if (navigate && typeof SidebarNav !== 'undefined' && SidebarNav.switchTo) {
             SidebarNav.switchTo('sigmagraph');
         }
@@ -1440,16 +1659,58 @@ function _escHtml(str) {
 
 /**
  * Fetch artefact existence flags and render check / cross icons
- * next to each Digital Twin line.
+ * next to each Knowledge Graph line.
  */
+/**
+ * Let the force-refreshed existence probe correct the readiness badge.
+ *
+ * `/dtwin/sync/info` serves `triplestore_status` from a five-minute session
+ * cache, whereas `/dtwin/sync/dt-existence` is fetched with force_refresh and so
+ * carries the current truth. Without this the two never met: the Build page
+ * showed the graph as present from this payload while every KG sub-page kept
+ * rendering "Graph not built" from the cached status.
+ *
+ * Only an affirmative live result promotes the badge — a probe that came back
+ * unknown leaves the existing state alone.
+ */
+function _reconcileReadinessWithLiveProbe(data) {
+    if (!data || data.pending === true) return;
+    if (data.graph_has_data !== true) return;
+    if (tripleStoreHasData && !tripleStoreStatusUnknown) return;
+
+    console.warn(
+        '[Sync] Live dt_existence probe found graph data but the cached ' +
+        'triplestore_status did not. Promoting readiness to built.'
+    );
+    tripleStoreHasData = true;
+    tripleStoreStatusUnknown = false;
+    updateDataMenus();
+    updateInsightsTab();
+}
+
 async function _loadDtExistence() {
+    _setArchRetrievalLoading(true);
     try {
         var resp = await fetch('/dtwin/sync/dt-existence', { credentials: 'same-origin' });
         var data = await resp.json();
         _applyBuildGraphEngineUi(data);
         _applyDtExistence(data);
+        _reconcileReadinessWithLiveProbe(data);
     } catch (e) {
         console.warn('[Sync] Could not load DT existence flags', e);
+        // Clear spinners so the cards never stay stuck in Loading.
+        _applyBuildGraphEngineUi({
+            pending: false,
+            lakebase_table_exists: null,
+            lakebase_synced_uc_exists: null,
+            lakebase_check_error: String(e && e.message ? e.message : e),
+            graph_engine: (window.__TRIPLESTORE_CONFIG || {}).graph_engine || 'lakebase',
+        });
+        _applyDtExistence({
+            pending: false,
+            view_exists: null,
+            view_check_error: 'Could not refresh artefact status',
+        });
     }
 }
 
@@ -1472,6 +1733,7 @@ document.addEventListener('DOMContentLoaded', async function() {
             var act = btn.getAttribute('data-sync-action');
             if (act === 'refresh-triple-store') checkTripleStoreStatus(true);
             else if (act === 'start-triple-store-sync') startTripleStoreSync();
+            else if (act === 'refresh-adjacency-only') startSyncAdjacencyRefresh();
         });
     }
 
@@ -1490,7 +1752,13 @@ document.addEventListener('DOMContentLoaded', async function() {
     if (syncSection) {
         const observer = new MutationObserver(() => {
             if (syncSection.classList.contains('active')) {
-                initSyncSection();
+                if (_syncTripleStoreBackend() === 'databricks') {
+                    if (typeof loadDatabricksBuildInfo === 'function') {
+                        loadDatabricksBuildInfo();
+                    }
+                } else {
+                    initSyncSection();
+                }
             } else {
                 _syncSectionLoaded = false;
             }
@@ -1498,7 +1766,13 @@ document.addEventListener('DOMContentLoaded', async function() {
         observer.observe(syncSection, { attributes: true, attributeFilter: ['class'] });
 
         if (syncSection.classList.contains('active')) {
-            initSyncSection();
+            if (_syncTripleStoreBackend() === 'databricks') {
+                if (typeof loadDatabricksBuildInfo === 'function') {
+                    loadDatabricksBuildInfo();
+                }
+            } else {
+                initSyncSection();
+            }
         }
     }
 });

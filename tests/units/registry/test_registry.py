@@ -7,13 +7,14 @@ only), domain/version CRUD wiring, and the scheduler's bootstrap-time
 """
 
 import json
-import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, call, patch
 
+import pytest
+
+from back.core.errors import ConflictError, InfrastructureError
+from back.objects.registry.RegistryCfg import RegistryCfg, _DEFAULT_VOLUME
 from back.objects.registry.RegistryService import (
-    RegistryCfg,
     RegistryService,
-    _DEFAULT_VOLUME,
     _DOMAINS_FOLDER,
     _LEGACY_DOMAINS_FOLDER,
 )
@@ -123,7 +124,49 @@ class TestRegistryCfgFromDomain:
         domain = _make_domain(
             registry={"catalog": "s_cat", "schema": "s_sch", "volume": "s_vol"}
         )
-        settings = _make_settings()
+        settings = _make_settings(
+            registry_catalog="", registry_schema="", registry_volume=""
+        )
+        c = RegistryCfg.from_domain(domain, settings)
+        assert c.catalog == "s_cat"
+        assert c.schema == "s_sch"
+        assert c.volume == "s_vol"
+
+    def test_settings_override_legacy_session_registry(self, monkeypatch):
+        """Configured env must beat the seeded session ``OntoBricksRegistry``."""
+        self._patch_no_lakebase_row(monkeypatch)
+        domain = _make_domain(
+            registry={
+                "catalog": "",
+                "schema": "",
+                "volume": "OntoBricksRegistry",
+            }
+        )
+        settings = _make_settings(
+            registry_catalog="wl_internal",
+            registry_schema="ontobricks_registry",
+            registry_volume="ontology",
+        )
+        c = RegistryCfg.from_domain(
+            domain, settings, prefer_volume_binding=True
+        )
+        assert c.catalog == "wl_internal"
+        assert c.schema == "ontobricks_registry"
+        assert c.volume == "ontology"
+
+    def test_custom_session_volume_survives_default_settings_volume(
+        self, monkeypatch
+    ):
+        """Pydantic default ``OntoBricksRegistry`` must not hide a UI volume."""
+        self._patch_no_lakebase_row(monkeypatch)
+        domain = _make_domain(
+            registry={"catalog": "s_cat", "schema": "s_sch", "volume": "s_vol"}
+        )
+        settings = _make_settings(
+            registry_catalog="",
+            registry_schema="",
+            registry_volume=_DEFAULT_VOLUME,
+        )
         c = RegistryCfg.from_domain(domain, settings)
         assert c.catalog == "s_cat"
         assert c.schema == "s_sch"
@@ -322,26 +365,6 @@ class TestPathBuilders:
 
     def test_version_path(self):
         assert self._svc().version_path("p", "3") == "/Volumes/cat/sch/vol/domains/p/V3"
-
-    def test_version_file_path(self):
-        assert (
-            self._svc().version_file_path("p", "3")
-            == "/Volumes/cat/sch/vol/domains/p/V3/V3.json"
-        )
-
-    def test_marker_path(self):
-        assert self._svc().marker_path() == "/Volumes/cat/sch/vol/.registry"
-
-    def test_config_file_path(self):
-        assert (
-            self._svc().config_file_path() == "/Volumes/cat/sch/vol/.global_config.json"
-        )
-
-    def test_history_file_path(self):
-        assert (
-            self._svc().history_file_path("p")
-            == "/Volumes/cat/sch/vol/domains/p/.schedule_history.json"
-        )
 
 
 class TestResolveDomainsFolderFallback:
@@ -629,10 +652,66 @@ class TestVersionDelegation:
     def test_delete_version_delegates(self):
         store = MagicMock()
         store.delete_version.return_value = (True, "ok")
+        store.list_documents.return_value = []
         svc = _make_svc(store=store)
         ok, _ = svc.delete_version("proj", "3")
         assert ok is True
         store.delete_version.assert_called_once_with("proj", "3")
+        store.list_documents.assert_called_once_with("proj", "3", strict=True)
+        store.delete_documents.assert_not_called()
+
+    def test_guard_conflict_does_not_purge_knowledge_store(self):
+        store = MagicMock()
+        store.delete_version.side_effect = ConflictError(
+            "Version 3 is no longer Draft"
+        )
+        svc = _make_svc(store=store)
+
+        with pytest.raises(ConflictError):
+            svc.delete_version("proj", "3")
+
+        store.list_documents.assert_not_called()
+        store.delete_documents.assert_not_called()
+
+    def test_returned_knowledge_store_cleanup_errors_fail_deletion(self):
+        store = MagicMock()
+        store.delete_version.return_value = (True, "")
+        store.list_documents.return_value = [{"filename": "guide.pdf"}]
+        store.delete_documents.return_value = ["guide.pdf: delete failed"]
+        svc = _make_svc(store=store)
+        svc.recursive_delete = MagicMock()
+
+        with pytest.raises(
+            InfrastructureError,
+            match="Knowledge Store cleanup failed",
+        ) as exc_info:
+            svc.delete_version("proj", "3")
+
+        assert "guide.pdf: delete failed" in (exc_info.value.detail or "")
+        store.delete_version.assert_called_once_with("proj", "3")
+        store.list_documents.assert_called_once_with("proj", "3", strict=True)
+        store.delete_documents.assert_called_once_with(
+            "proj", "3", ["guide.pdf"]
+        )
+        svc.recursive_delete.assert_not_called()
+
+    def test_raised_knowledge_store_cleanup_error_fails_deletion(self):
+        store = MagicMock()
+        store.delete_version.return_value = (True, "")
+        store.list_documents.side_effect = RuntimeError("lakebase unavailable")
+        svc = _make_svc(store=store)
+        svc.recursive_delete = MagicMock()
+
+        with pytest.raises(
+            InfrastructureError,
+            match="Knowledge Store cleanup failed",
+        ) as exc_info:
+            svc.delete_version("proj", "3")
+
+        assert exc_info.value.detail == "lakebase unavailable"
+        store.list_documents.assert_called_once_with("proj", "3", strict=True)
+        store.delete_documents.assert_not_called()
+        svc.recursive_delete.assert_not_called()
 
 
 # ==================================================================
@@ -708,7 +787,9 @@ class TestFromContext:
         )
         mock_creds.return_value = ("https://host", "tok")
         domain = _make_domain(registry={"catalog": "c", "schema": "s", "volume": "v"})
-        settings = _make_settings()
+        settings = _make_settings(
+            registry_catalog="", registry_schema="", registry_volume=""
+        )
 
         with patch.object(
             RegistryService, "_build_store", return_value=MagicMock()
@@ -724,6 +805,10 @@ class TestFromContext:
 # ==================================================================
 
 
+@pytest.mark.skipif(
+    not __import__("importlib.util", fromlist=["find_spec"]).find_spec("apscheduler"),
+    reason="apscheduler not installed",
+)
 class TestSchedulerResolveCredsLakebase:
     """At startup the scheduler restores jobs *before* the global
     config has been read, so the ``RegistryCfg`` it builds from
@@ -732,7 +817,7 @@ class TestSchedulerResolveCredsLakebase:
     """
 
     def test_defaults_from_settings(self):
-        from back.objects.registry.scheduler import BuildScheduler
+        from back.objects.registry.schedule.BuildScheduler import BuildScheduler
 
         settings = _make_settings()
         host, token, cfg = BuildScheduler._resolve_creds(settings)
@@ -742,7 +827,7 @@ class TestSchedulerResolveCredsLakebase:
         assert cfg["lakebase_database"] == ""
 
     def test_lakebase_with_database_override(self):
-        from back.objects.registry.scheduler import BuildScheduler
+        from back.objects.registry.schedule.BuildScheduler import BuildScheduler
 
         settings = _make_settings(
             lakebase_schema="ontobricks_registry",
@@ -752,20 +837,18 @@ class TestSchedulerResolveCredsLakebase:
         assert cfg["lakebase_schema"] == "ontobricks_registry"
         assert cfg["lakebase_database"] == "ontobricks_other"
 
-    def test_registry_volume_path_overrides_static_env_triplet(self):
-        """Scheduler boot must not use ``REGISTRY_VOLUME`` alone when the
-        Apps runtime injects ``REGISTRY_VOLUME_PATH``."""
-        from back.objects.registry.scheduler import BuildScheduler
+    def test_registry_volume_is_sentinel_default(self):
+        """The registry UC Volume was removed in v0.9.0 — the scheduler
+        always emits the sentinel volume name (documents live in Lakebase)."""
+        from back.objects.registry.schedule.BuildScheduler import BuildScheduler
 
         settings = _make_settings(
             registry_catalog="env_c",
             registry_schema="env_s",
-            registry_volume="OntoBricksRegistry",
-            registry_volume_path="/Volumes/acme/prod/custom_registry_vol",
         )
         _h, _t, cfg = BuildScheduler._resolve_creds(settings)
-        assert cfg["catalog"] == "acme"
-        assert cfg["schema"] == "prod"
-        assert cfg["volume"] == "custom_registry_vol"
+        assert cfg["catalog"] == "env_c"
+        assert cfg["schema"] == "env_s"
+        assert cfg["volume"] == "OntoBricksRegistry"
 
 

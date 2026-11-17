@@ -109,10 +109,37 @@ class TestEnsure:
         out = mgr.ensure(
             "cat.sch.tab",
             source_table_full_name="cat.sch.view",
-            primary_key_columns=["subject", "predicate", "object"],
+            primary_key_columns=["subject", "predicate", "object_hash"],
         )
         assert out is not None
         client.database.create_synced_database_table.assert_not_called()
+
+    def test_ensure_uses_fallback_when_failed_registration_cannot_be_deleted(self):
+        client = MagicMock()
+        failed = _synced(state="OFFLINE_FAILED", pipeline_id="missing-pipeline")
+        fallback = _synced()
+        fallback.name = "cat.sch.tab_b"
+        client.database.get_synced_database_table.side_effect = [
+            failed,
+            None,
+            fallback,
+        ]
+        client.database.delete_synced_database_table.side_effect = RuntimeError(
+            "control-plane delete failed"
+        )
+        mgr = _make_manager(client)
+
+        out = mgr.ensure(
+            "cat.sch.tab",
+            source_table_full_name="cat.sch.view",
+            primary_key_columns=["subject", "predicate", "object_hash"],
+        )
+
+        assert out.name == "cat.sch.tab_b"
+        created = client.database.create_synced_database_table.call_args.kwargs[
+            "synced_table"
+        ]
+        assert created["name"] == "cat.sch.tab_b"
 
     def test_ensure_creates_when_missing(self):
         client = MagicMock()
@@ -134,7 +161,7 @@ class TestEnsure:
             mgr.ensure(
                 "cat.sch.tab",
                 source_table_full_name="cat.sch.view",
-                primary_key_columns=["subject", "predicate", "object"],
+                primary_key_columns=["subject", "predicate", "object_hash"],
                 sync_mode="snapshot",
             )
         client.database.create_synced_database_table.assert_called_once()
@@ -143,7 +170,7 @@ class TestEnsure:
         assert captured["payload"]["primary_key_columns"] == [
             "subject",
             "predicate",
-            "object",
+            "object_hash",
         ]
         assert captured["payload"]["sync_mode"] == "snapshot"
         # project/branch are instance attrs consumed by the builder internals.
@@ -171,7 +198,7 @@ class TestEnsure:
             out = mgr.ensure(
                 "cat.sch.tab",
                 source_table_full_name="cat.sch.view",
-                primary_key_columns=["subject", "predicate", "object"],
+                primary_key_columns=["subject", "predicate", "object_hash"],
             )
         assert out is not None  # ownership-probe returned the winner
 
@@ -278,6 +305,29 @@ class TestRefreshAndWait:
         assert out == "ONLINE_NO_PENDING_UPDATE"
         client.pipelines.get_update.assert_called()
         client.pipelines.wait_get_pipeline_idle.assert_not_called()
+
+    def test_wait_for_completion_detects_synced_table_failure_during_update(self):
+        client = MagicMock()
+        failed = _synced(state="OFFLINE_FAILED", pipeline_id="pid-1")
+        failed.data_synchronization_status.message = "Pipeline pid-1 does not exist"
+        client.database.get_synced_database_table.side_effect = [
+            _synced(state="ONLINE_TRIGGERED_UPDATE"),
+            failed,
+        ]
+        client.pipelines.get_update.return_value = SimpleNamespace(
+            update=SimpleNamespace(state=SimpleNamespace(name="RUNNING"))
+        )
+        mgr = _make_manager(client)
+
+        with pytest.raises(
+            InfrastructureError,
+            match="OFFLINE_FAILED.*Pipeline pid-1 does not exist",
+        ):
+            mgr.wait_for_completion(
+                "cat.sch.tab",
+                timeout_s=60,
+                pipeline_update_id="upd-1",
+            )
 
     def test_wait_for_completion_raises_on_terminal_failure(self):
         client = MagicMock()

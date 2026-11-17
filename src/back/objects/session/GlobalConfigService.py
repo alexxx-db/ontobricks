@@ -19,6 +19,17 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from back.core.logging import get_logger
+from back.core.helpers import (
+    DEFAULT_APP_TITLE,
+    DEFAULT_PRIMARY_COLOR,
+    normalize_ui_branding,
+)
+from back.core.query_limits import (
+    get_graph_chat_result_cap as _effective_result_cap,
+    get_graph_query_timeout_s as _effective_timeout_s,
+    set_graph_chat_result_cap_override,
+    set_graph_query_timeout_override,
+)
 from back.objects.registry.registry_cache import set_registry_cache_ttl
 
 logger = get_logger(__name__)
@@ -91,6 +102,17 @@ class GlobalConfigService:
                 self._cache_ts = now
                 if "registry_cache_ttl" in data:
                     set_registry_cache_ttl(int(data["registry_cache_ttl"]))
+                # Apply the persisted graph-read bounds so admin overrides
+                # survive a cold restart (0 / unset clears the override, so
+                # the env var / built-in default applies).
+                if "graph_query_timeout_s" in data:
+                    set_graph_query_timeout_override(
+                        int(data["graph_query_timeout_s"] or 0) or None
+                    )
+                if "graph_chat_result_cap" in data:
+                    set_graph_chat_result_cap_override(
+                        int(data["graph_chat_result_cap"] or 0) or None
+                    )
                 logger.info(
                     "Loaded global config (backend=%s)", store.backend
                 )
@@ -131,8 +153,38 @@ class GlobalConfigService:
     def get_warehouse_id(
         self, host: str, token: str, registry_cfg: Dict[str, str]
     ) -> str:
-        """Return the globally configured SQL Warehouse ID (or empty string)."""
+        """Return the globally configured build SQL Warehouse ID."""
         return self.get(host, token, registry_cfg, "warehouse_id")
+
+    def get_build_warehouse_use_sea(
+        self, host: str, token: str, registry_cfg: Dict[str, str]
+    ) -> bool:
+        """Return False because build SQL always uses the Thrift transport."""
+        return False
+
+    def get_delta_warehouse_id(
+        self, host: str, token: str, registry_cfg: Dict[str, str]
+    ) -> str:
+        """Return the Lakehouse SQL warehouse id from ``graph_engine_config.lakehouse``."""
+        from back.core.graphdb.engine_config import resolve_lakehouse_warehouse_id
+
+        return resolve_lakehouse_warehouse_id(
+            self.get_graph_engine_config(host, token, registry_cfg)
+        )
+
+    def get_delta_warehouse_use_sea(
+        self, host: str, token: str, registry_cfg: Dict[str, str]
+    ) -> bool:
+        """Return ``graph_engine_config.lakehouse.use_sea`` (default ``False``).
+
+        The key name is retained for compatibility. ``True`` means the SQL
+        client uses the native Kernel backend required by Lakehouse/RT.
+        """
+        from back.core.graphdb.engine_config import resolve_lakehouse_use_sea
+
+        return resolve_lakehouse_use_sea(
+            self.get_graph_engine_config(host, token, registry_cfg)
+        )
 
     def get_default_base_uri(
         self, host: str, token: str, registry_cfg: Dict[str, str]
@@ -146,15 +198,22 @@ class GlobalConfigService:
         """Return the globally configured default class icon."""
         return self.get(host, token, registry_cfg, "default_emoji")
 
-    def get_navbar_logo(
+    def get_ui_branding(
         self, host: str, token: str, registry_cfg: Dict[str, str]
-    ) -> str:
-        """Return the globally configured navbar logo as a ``data:`` URL.
+    ) -> Dict[str, Any]:
+        """Return normalized UI branding with legacy ``navbar_logo`` fallback."""
+        data = self.load(host, token, registry_cfg)
+        raw = data.get("ui_branding")
+        candidate = dict(raw) if isinstance(raw, dict) else {}
 
-        Empty string means "no custom logo" — the UI falls back to the
-        bundled default (``static/global/img/favicon.svg``).
-        """
-        return self.get(host, token, registry_cfg, "navbar_logo")
+        normalized = normalize_ui_branding(candidate)
+        if not normalized.logo_data_url:
+            legacy = str(data.get("navbar_logo", "") or "").strip()
+            if legacy:
+                candidate["logo_data_url"] = legacy
+                normalized = normalize_ui_branding(candidate)
+
+        return normalized.to_dict()
 
     def get_use_cloud_fetch(
         self, host: str, token: str, registry_cfg: Dict[str, str]
@@ -191,7 +250,7 @@ class GlobalConfigService:
                 "Registry not configured — set catalog and schema in Settings first",
             )
 
-        data = self.load(host, token, registry_cfg, force=True)
+        data = dict(self.load(host, token, registry_cfg, force=True))
         data["version"] = data.get("version", 1)
         data.update(updates)
 
@@ -220,8 +279,28 @@ class GlobalConfigService:
         registry_cfg: Dict[str, str],
         warehouse_id: str,
     ) -> Tuple[bool, str]:
-        """Persist a new SQL Warehouse ID in the global config file."""
+        """Persist a new build SQL Warehouse ID in the global config file."""
         return self._save(host, token, registry_cfg, {"warehouse_id": warehouse_id})
+
+    def set_build_warehouse(
+        self,
+        host: str,
+        token: str,
+        registry_cfg: Dict[str, str],
+        warehouse_id: str,
+        *,
+        use_sea: bool,
+    ) -> Tuple[bool, str]:
+        """Persist the build warehouse and clear any legacy Kernel transport flag."""
+        return self._save(
+            host,
+            token,
+            registry_cfg,
+            {
+                "warehouse_id": (warehouse_id or "").strip(),
+                "warehouse_use_sea": False,
+            },
+        )
 
     def set_default_base_uri(
         self,
@@ -261,46 +340,72 @@ class GlobalConfigService:
         data_url: str,
     ) -> Tuple[bool, str]:
         """Persist the navbar logo as a ``data:`` URL (empty string clears it)."""
-        return self._save(host, token, registry_cfg, {"navbar_logo": data_url or ""})
+        return self.set_ui_branding(
+            host,
+            token,
+            registry_cfg,
+            {"logo_data_url": data_url or ""},
+        )
 
-    ALLOWED_GRAPH_ENGINES = ("lakebase",)
-
-    def get_graph_engine(
-        self, host: str, token: str, registry_cfg: Dict[str, str]
-    ) -> str:
-        """Return the globally configured graph DB engine name.
-
-        Currently always resolves to ``"lakebase"``.  Extra engines plug
-        in by adding their key to :data:`ALLOWED_GRAPH_ENGINES` and
-        registering a backend class under
-        :class:`back.core.graphdb.GraphDBFactory`.
-        """
-        val = self.get(host, token, registry_cfg, "graph_engine", "lakebase")
-        return val if val in self.ALLOWED_GRAPH_ENGINES else "lakebase"
-
-    def set_graph_engine(
+    def set_ui_branding(
         self,
         host: str,
         token: str,
         registry_cfg: Dict[str, str],
-        engine: str,
+        branding: Dict[str, Any],
     ) -> Tuple[bool, str]:
-        """Persist a new graph DB engine selection in the global config file."""
-        engine = (engine or "").strip().lower()
-        if engine not in self.ALLOWED_GRAPH_ENGINES:
-            return (
-                False,
-                f"Unknown graph engine '{engine}'. Allowed: {', '.join(self.ALLOWED_GRAPH_ENGINES)}",
-            )
-        return self._save(host, token, registry_cfg, {"graph_engine": engine})
+        """Persist a normalized UI branding payload under ``ui_branding``."""
+        prev_cache = self._cache
+        prev_cache_ts = self._cache_ts
+        source = (
+            self._cache
+            if isinstance(self._cache, dict)
+            else self.load(host, token, registry_cfg, force=True)
+        )
+        data = dict(source)
+        current = data.get("ui_branding")
+        merged = dict(current) if isinstance(current, dict) else {}
+        merged.update(dict(branding or {}))
+
+        normalized = normalize_ui_branding(merged)
+        merged["version"] = int(merged.get("version") or normalized.version or 1)
+        merged["app_title"] = normalized.app_title
+        merged["primary_color"] = normalized.primary_color
+        merged["aurora_color"] = normalized.aurora_color
+        merged["logo_data_url"] = normalized.logo_data_url
+
+        updates = {
+            "ui_branding": merged,
+            # Keep legacy key synchronized to prevent stale resurrection when
+            # unified branding is reset to default logo.
+            "navbar_logo": merged["logo_data_url"],
+        }
+        ok, msg = self._save(host, token, registry_cfg, updates)
+        if not ok:
+            self._cache = prev_cache
+            self._cache_ts = prev_cache_ts
+        # On success, _save() already refreshed and updated the cache from the
+        # force-loaded union. Avoid overwriting it with the pre-save snapshot.
+        return ok, msg
+
+    # NOTE: The graph *backend selection* (formerly the global ``graph_engine`` /
+    # ``triple_store_backend`` keys) moved to a mandatory per-domain choice —
+    # see ``DomainSession.info['graph_backend']`` and ``GraphDBFactory``. Only
+    # the engine *connection* config below remains workspace-global.
 
     def get_graph_engine_config(
         self, host: str, token: str, registry_cfg: Dict[str, str]
     ) -> Dict[str, Any]:
-        """Return the engine-specific configuration dict (free-form JSON)."""
+        """Return per-backend config ``{lakebase, neo4j, lakehouse}``.
+
+        Flat legacy blobs are normalised on read so callers always see the
+        nested shape.
+        """
+        from back.core.graphdb.engine_config import normalize_graph_engine_config
+
         data = self.load(host, token, registry_cfg)
         cfg = data.get("graph_engine_config")
-        return cfg if isinstance(cfg, dict) else {}
+        return normalize_graph_engine_config(cfg if isinstance(cfg, dict) else {})
 
     def set_graph_engine_config(
         self,
@@ -309,15 +414,55 @@ class GlobalConfigService:
         registry_cfg: Dict[str, str],
         config: Dict[str, Any],
     ) -> Tuple[bool, str]:
-        """Persist the engine-specific configuration dict."""
+        """Persist per-backend engine config (nested ``lakebase`` / ``neo4j`` / ``lakehouse``).
+
+        Accepts either the nested shape or a legacy flat blob; always stores
+        the nested form.
+        """
         if not isinstance(config, dict):
             return False, "graph_engine_config must be a JSON object"
+        from back.core.graphdb.engine_config import normalize_graph_engine_config
         from back.core.graphdb.lakebase.LakebaseBase import validate_engine_config_keys
 
-        ok_keys, msg_keys = validate_engine_config_keys(config)
+        nested = normalize_graph_engine_config(config)
+        ok_keys, msg_keys = validate_engine_config_keys(nested.get("lakebase") or {})
         if not ok_keys:
             return False, msg_keys
-        return self._save(host, token, registry_cfg, {"graph_engine_config": config})
+        return self._save(host, token, registry_cfg, {"graph_engine_config": nested})
+
+    def set_delta_warehouse_id(
+        self,
+        host: str,
+        token: str,
+        registry_cfg: Dict[str, str],
+        warehouse_id: str,
+        use_sea: Optional[bool] = None,
+    ) -> Tuple[bool, str]:
+        """Persist the Lakehouse SQL warehouse under ``graph_engine_config.lakehouse``.
+
+        When *use_sea* is provided it is stored alongside ``warehouse_id``;
+        when ``None`` any previously saved ``use_sea`` value is preserved.
+        """
+        from back.core.graphdb.engine_config import normalize_graph_engine_config
+
+        wid = (warehouse_id or "").strip()
+        data = self.load(host, token, registry_cfg)
+        nested = normalize_graph_engine_config(
+            data.get("graph_engine_config")
+            if isinstance(data.get("graph_engine_config"), dict)
+            else {}
+        )
+        lh = dict(nested.get("lakehouse") or {})
+        lh["warehouse_id"] = wid
+        if use_sea is not None:
+            lh["use_sea"] = bool(use_sea)
+        nested["lakehouse"] = lh
+        return self._save(
+            host,
+            token,
+            registry_cfg,
+            {"graph_engine_config": nested},
+        )
 
     def get_registry_cache_ttl(
         self, host: str, token: str, registry_cfg: Dict[str, str]
@@ -342,6 +487,191 @@ class GlobalConfigService:
         set_registry_cache_ttl(ttl)
         return self._save(host, token, registry_cfg, {"registry_cache_ttl": ttl})
 
+    def get_graph_query_timeout_s(
+        self, host: str, token: str, registry_cfg: Dict[str, str]
+    ) -> int:
+        """Return the effective graph-read statement timeout (seconds).
+
+        The persisted admin value is re-applied through the central clamp in
+        :mod:`back.core.query_limits` so the Settings UI shows the same
+        (bounded) value the database actually enforces — never a stale
+        out-of-range number.
+        """
+        val = self.get(host, token, registry_cfg, "graph_query_timeout_s", "")
+        s = str(val).strip() if val is not None else ""
+        if s.isdigit():
+            set_graph_query_timeout_override(int(s) or None)
+        return _effective_timeout_s()
+
+    def set_graph_query_timeout_s(
+        self,
+        host: str,
+        token: str,
+        registry_cfg: Dict[str, str],
+        seconds: int,
+    ) -> Tuple[bool, str]:
+        """Persist and apply the graph-read statement timeout (``0`` = unset)."""
+        seconds = max(0, int(seconds))
+        set_graph_query_timeout_override(seconds or None)
+        # Persist the clamped effective value (not the raw input) so config and
+        # the Settings UI can never show a timeout the database won't honour.
+        to_save = 0 if seconds <= 0 else _effective_timeout_s()
+        return self._save(
+            host, token, registry_cfg, {"graph_query_timeout_s": to_save}
+        )
+
+    def get_graph_chat_result_cap(
+        self, host: str, token: str, registry_cfg: Dict[str, str]
+    ) -> int:
+        """Return the effective Graph Chat triple result cap.
+
+        Re-applies the persisted admin value through the central clamp so the
+        Settings UI shows the same bounded cap that is actually enforced.
+        """
+        val = self.get(host, token, registry_cfg, "graph_chat_result_cap", "")
+        s = str(val).strip() if val is not None else ""
+        if s.isdigit():
+            set_graph_chat_result_cap_override(int(s) or None)
+        return _effective_result_cap()
+
+    def set_graph_chat_result_cap(
+        self,
+        host: str,
+        token: str,
+        registry_cfg: Dict[str, str],
+        count: int,
+    ) -> Tuple[bool, str]:
+        """Persist and apply the Graph Chat triple result cap (``0`` = unset)."""
+        count = max(0, int(count))
+        set_graph_chat_result_cap_override(count or None)
+        # Persist the clamped effective value so config/UI stay consistent with
+        # the enforced cap.
+        to_save = 0 if count <= 0 else _effective_result_cap()
+        return self._save(
+            host, token, registry_cfg, {"graph_chat_result_cap": to_save}
+        )
+
+    def get_data_assets_import_limit(
+        self, host: str, token: str, registry_cfg: Dict[str, str]
+    ) -> int:
+        """Return the max number of data assets a domain may import (default 40)."""
+        from back.core.databricks.uc.MetadataService import MetadataService
+
+        val = self.get(host, token, registry_cfg, "data_assets_import_limit", "")
+        if val is None or str(val).strip() == "":
+            return MetadataService.DEFAULT_DATA_ASSETS_IMPORT_LIMIT
+        return MetadataService.clamp_import_limit(val)
+
+    def set_data_assets_import_limit(
+        self,
+        host: str,
+        token: str,
+        registry_cfg: Dict[str, str],
+        limit: int,
+    ) -> Tuple[bool, str]:
+        """Persist the data-assets import cap (clamped 1–500)."""
+        from back.core.databricks.uc.MetadataService import MetadataService
+
+        to_save = MetadataService.clamp_import_limit(limit)
+        return self._save(
+            host, token, registry_cfg, {"data_assets_import_limit": to_save}
+        )
+
+    def get_edit_lock_ttl_s(
+        self, host: str, token: str, registry_cfg: Dict[str, str]
+    ) -> Optional[int]:
+        """Return the admin-set edit-lock lease TTL (seconds), or ``None``.
+
+        ``None`` means "not set in the global config" — the caller
+        (:meth:`EditLockService._ttl_seconds`) then falls back to the
+        ``ONTOBRICKS_EDIT_LOCK_TTL_S`` env var / built-in default. Deliberately
+        absent from :meth:`_empty` so an unconfigured / failed load yields the
+        empty sentinel rather than masking the env fallback. ``0`` is a valid
+        stored value (disables the lease).
+        """
+        val = self.get(host, token, registry_cfg, "edit_lock_ttl_s", "")
+        s = str(val).strip()
+        if s.lstrip("-").isdigit():
+            return max(0, int(s))
+        return None
+
+    def set_edit_lock_ttl_s(
+        self,
+        host: str,
+        token: str,
+        registry_cfg: Dict[str, str],
+        ttl_s: int,
+    ) -> Tuple[bool, str]:
+        """Persist the edit-lock lease TTL (seconds; ``0`` disables the lease)."""
+        return self._save(
+            host, token, registry_cfg, {"edit_lock_ttl_s": max(0, int(ttl_s))}
+        )
+
+    def get_analytics_job_enabled(
+        self, host: str, token: str, registry_cfg: Dict[str, str]
+    ) -> Optional[bool]:
+        """Return the admin's graph-analytics job setting, or ``None`` if unset.
+
+        Three-state on purpose, following :meth:`get_edit_lock_ttl_s`: ``None``
+        means "no admin has expressed an opinion", so the caller falls back to
+        the ``ONTOBRICKS_ANALYTICS_JOB_ENABLED`` deployment default. A plain
+        ``bool`` return would make "admin turned it off" indistinguishable from
+        "never configured", and the off case has to be able to override an env
+        var that enables it. Deliberately absent from :meth:`_empty` so a failed
+        or unconfigured load yields ``None`` rather than masking that fallback.
+        """
+        raw = self.load(host, token, registry_cfg).get("analytics_job_enabled", None)
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        if isinstance(raw, str):
+            token_ = raw.strip().lower()
+            if token_ in {"1", "true", "yes", "on"}:
+                return True
+            if token_ in {"0", "false", "no", "off"}:
+                return False
+        return None
+
+    def set_analytics_job_enabled(
+        self,
+        host: str,
+        token: str,
+        registry_cfg: Dict[str, str],
+        enabled: bool,
+    ) -> Tuple[bool, str]:
+        """Persist the admin's graph-analytics job on/off toggle."""
+        return self._save(
+            host, token, registry_cfg, {"analytics_job_enabled": bool(enabled)}
+        )
+
+    def get_github_config(
+        self, host: str, token: str, registry_cfg: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """Return the instance GitHub mirror settings (normalised)."""
+        from back.objects.registry.gitsync import GitHubConfig
+
+        raw = self.load(host, token, registry_cfg).get("github_config")
+        return GitHubConfig.from_dict(raw).to_dict()
+
+    def set_github_config(
+        self,
+        host: str,
+        token: str,
+        registry_cfg: Dict[str, str],
+        config: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """Persist the instance GitHub mirror settings (one repository per instance)."""
+        from back.objects.registry.gitsync import GitHubConfig, github_mirror
+
+        normalized = GitHubConfig.from_dict(config).to_dict()
+        ok, msg = self._save(host, token, registry_cfg, {"github_config": normalized})
+        if ok:
+            github_mirror.invalidate_config()
+        return ok, msg
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -351,13 +681,24 @@ class GlobalConfigService:
         return {
             "version": 1,
             "warehouse_id": "",
+            "warehouse_use_sea": False,
             "default_base_uri": "",
             "default_emoji": "",
             "navbar_logo": "",
+            "ui_branding": {
+                "version": 1,
+                "app_title": DEFAULT_APP_TITLE,
+                "primary_color": DEFAULT_PRIMARY_COLOR,
+                "logo_data_url": "",
+            },
             "use_cloud_fetch": True,
             "registry_cache_ttl": 300,
-            "graph_engine": "lakebase",
+            # 0 = unset → env var / built-in default from back.core.query_limits.
+            "graph_query_timeout_s": 0,
+            "graph_chat_result_cap": 0,
+            "data_assets_import_limit": 40,
             "graph_engine_config": {},
+            "github_config": {},
         }
 
 

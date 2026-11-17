@@ -13,6 +13,86 @@ let mappingMapSvg = null;
 let mappingMapSimulation = null;
 let mappingMapZoom = null;
 let mappingMapNodes = [];
+let isMappingResizing = false;
+
+const MAPPING_PANEL_DEFAULT_HEIGHT = 320;
+const MAPPING_PANEL_MIN_HEIGHT = 200;
+const MAPPING_PANEL_HEIGHT_STORAGE_KEY = 'mappingDesignerPanelHeight';
+const MAPPING_MAP_GRID_STORAGE_KEY = 'mappingMapGridVisible';
+
+function isMappingMapGridVisible() {
+    return sessionStorage.getItem(MAPPING_MAP_GRID_STORAGE_KEY) !== 'false';
+}
+
+function applyMappingMapGridVisibility() {
+    const container = document.getElementById('mapping-map-container');
+    const btn = document.getElementById('mappingMapToggleGrid');
+    const visible = isMappingMapGridVisible();
+    if (container) {
+        container.classList.toggle('mapping-grid-visible', visible);
+    }
+    if (btn) {
+        btn.classList.toggle('active', visible);
+        btn.setAttribute('aria-pressed', visible ? 'true' : 'false');
+        btn.title = visible ? 'Hide dot grid' : 'Show dot grid';
+    }
+}
+
+function initMappingMapGridToggle() {
+    const btn = document.getElementById('mappingMapToggleGrid');
+    applyMappingMapGridVisibility();
+    if (!btn || btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.onclick = () => {
+        sessionStorage.setItem(
+            MAPPING_MAP_GRID_STORAGE_KEY,
+            String(!isMappingMapGridVisible())
+        );
+        applyMappingMapGridVisibility();
+    };
+}
+
+/**
+ * Bound columns that no longer exist in their source table, keyed by entity
+ * class URI / relationship property URI. Populated from /mapping/schema-drift
+ * so the designer can flag upstream schema changes without the user having to
+ * run full diagnostics.
+ */
+const MappingDriftState = {
+    entities: {},
+    relationships: {}
+};
+
+// Drift is fetched once per designer render cycle. The fetch triggers a
+// re-render to paint the markers, and that re-render must not fetch again —
+// otherwise the designer loops, re-querying the warehouse forever.
+let mappingDriftLoaded = false;
+
+/**
+ * Refresh MappingDriftState. Advisory only — a failure (no warehouse, no
+ * permissions) leaves the designer working with no drift markers.
+ */
+async function loadSchemaDrift() {
+    try {
+        const response = await fetch('/mapping/schema-drift', { credentials: 'same-origin' });
+        const data = await response.json();
+        MappingDriftState.entities = (data.success && data.entities) || {};
+        MappingDriftState.relationships = (data.success && data.relationships) || {};
+    } catch (error) {
+        console.log('[MappingDrift] Schema drift check unavailable:', error);
+        MappingDriftState.entities = {};
+        MappingDriftState.relationships = {};
+    }
+    mappingDriftLoaded = true;
+}
+
+/**
+ * Columns of the currently open entity that have drifted, as a Set for
+ * cheap per-column lookup while rendering the results grid.
+ */
+function driftedColumnsForEntity(classUri) {
+    return new Set(MappingDriftState.entities[classUri]?.columns || []);
+}
 
 /**
  * Show/hide loading overlay for mapping designer
@@ -43,8 +123,15 @@ async function loadMapLayout() {
 /**
  * Initialize the mapping designer (D3.js Designer)
  */
-async function initMappingDesigner() {
-    showMappingDesignerLoading(true);
+async function initMappingDesigner(opts) {
+    const showLoading = !(opts && opts.showLoading === false);
+    if (showLoading) {
+        showMappingDesignerLoading(true);
+    }
+    initMappingMapGridToggle();
+    setupMappingDesignerResizeHandle();
+    restoreMappingDesignerPanelHeight();
+    ensureMappingDesignerPlaceholder();
     
     // Wait for MappingState initialization (ontology + mappings fetched)
     if (!MappingState.initialized) {
@@ -128,8 +215,16 @@ async function initMappingDesigner() {
             return;
         }
         
-        // Load saved layout from Ontology Designer
+        // Load saved layout from Ontology Designer synchronously (fast, session-local).
+        // Schema-drift is advisory (warehouse query, can take tens of seconds) — fire it
+        // in the background so it never blocks the spinner.  Once it resolves, re-render
+        // to pick up any drift indicators on nodes and panels.
         const savedLayout = await loadMapLayout();
+        if (!mappingDriftLoaded) {
+            loadSchemaDrift().then(() => {
+                if (mappingMapInitialized) initMappingDesigner({ showLoading: false });
+            }).catch(() => {});
+        }
         
         // Get mapping status (only count entries that have a SQL query as truly assigned)
         const mappedClassUris = new Set(
@@ -162,9 +257,15 @@ async function initMappingDesigner() {
                 if (dataProps.length > 0) {
                     const em = mappingByClassUri[cls.uri] || {};
                     const attrMap = em.attribute_mappings || {};
-                    const hasAllAttrs = dataProps.every(dp => {
+                    const excludedAttrs = new Set(em.excluded_attributes || []);
+                    // Only count included attributes — excluded ones don't create a gap.
+                    const includedProps = dataProps.filter(dp => {
                         const name = dp.name || dp.localName || '';
-                        return name && attrMap[name];
+                        return name && !excludedAttrs.has(name);
+                    });
+                    const hasAllAttrs = includedProps.every(dp => {
+                        const name = dp.name || dp.localName || '';
+                        return !!attrMap[name];
                     });
                     if (!hasAllAttrs) {
                         mappingStatus = 'partial';
@@ -182,6 +283,7 @@ async function initMappingDesigner() {
                 mapped: isMapped,
                 excluded: isExcluded,
                 mappingStatus: mappingStatus,
+                driftedColumns: MappingDriftState.entities[cls.uri]?.columns || [],
                 x: x,
                 y: y,
                 // Fix positions - no animation
@@ -240,6 +342,33 @@ async function initMappingDesigner() {
                     excluded: isExcluded
                 });
             }
+        });
+
+        (classes || []).forEach(cls => {
+            const className = cls.name || cls.localName;
+            if (!className || typeof outgoingRelationsForClass !== 'function') return;
+            outgoingRelationsForClass(classes, properties, className).forEach(rel => {
+                if (!rel.inherited) return;
+                const srcId = resolveNodeId(className);
+                const tgtId = resolveNodeId(rel.range);
+                if (!srcId || !tgtId) return;
+                const isExcluded = !!rel.excluded
+                    || excludedEntityNames.has(rel.inheritedFrom)
+                    || excludedEntityNames.has(srcId)
+                    || excludedEntityNames.has(tgtId);
+                links.push({
+                    source: srcId,
+                    target: tgtId,
+                    name: rel.name || rel.localName,
+                    uri: rel.uri,
+                    type: 'relationship',
+                    direction: rel.direction || 'forward',
+                    mapped: mappedPropertyUris.has(rel.uri),
+                    excluded: isExcluded,
+                    inherited: true,
+                    inheritedFrom: rel.inheritedFrom || '',
+                });
+            });
         });
         
         // Add inheritance links (only if parent exists as a node)
@@ -371,6 +500,26 @@ async function initMappingDesigner() {
             .attr('d', 'M0,-5L10,0L0,5')
             .attr('fill', '#ced4da');
 
+        // Arrows for reverse-direction relationships — drawn at the path start
+        // and rotated, so the head points back toward the source node.
+        [
+            ['mapping-arrow-start-mapped', '#198754'],
+            ['mapping-arrow-start-unmapped', '#dc3545'],
+            ['mapping-arrow-start-excluded', '#ced4da']
+        ].forEach(([id, fill]) => {
+            defs.append('marker')
+                .attr('id', id)
+                .attr('viewBox', '0 -5 10 10')
+                .attr('refX', 28)
+                .attr('refY', 0)
+                .attr('markerWidth', 6)
+                .attr('markerHeight', 6)
+                .attr('orient', 'auto-start-reverse')
+                .append('path')
+                .attr('d', 'M0,-5L10,0L0,5')
+                .attr('fill', fill);
+        });
+
         // Arrow for inheritance (hollow)
         defs.append('marker')
             .attr('id', 'mapping-arrow-inheritance')
@@ -444,7 +593,7 @@ async function initMappingDesigner() {
             .data(regularLinks.filter(l => l.type === 'relationship'))
             .enter()
             .append('path')
-            .attr('class', d => `mapping-map-link ${d.excluded ? 'excluded' : (d.mapped ? 'mapped' : 'unmapped')}`);
+            .attr('class', d => `mapping-map-link ${d.excluded ? 'excluded' : (d.mapped ? 'mapped' : 'unmapped')}${d.direction === 'reverse' ? ' reverse' : ''}${d.inherited ? ' inherited' : ''}`);
         
         // Draw inheritance links
         const inheritanceLinkElements = g.append('g')
@@ -461,8 +610,9 @@ async function initMappingDesigner() {
             .enter()
             .append('path')
             .attr('class', d => {
-                if (d.excluded) return 'mapping-map-link self-loop excluded';
-                return `mapping-map-link self-loop ${d.mapped ? 'mapped' : 'unmapped'}`;
+                const inherited = d.inherited ? ' inherited' : '';
+                if (d.excluded) return `mapping-map-link self-loop excluded${inherited}`;
+                return `mapping-map-link self-loop ${d.mapped ? 'mapped' : 'unmapped'}${inherited}`;
             })
             .attr('marker-end', d => {
                 if (d.excluded) return 'url(#mapping-arrow-excluded)';
@@ -554,10 +704,24 @@ async function initMappingDesigner() {
             .attr('dy', 35)
             .text(d => d.name);
         
+        // Passive schema-drift marker — the mapping is intact, the source
+        // table lost a column it is bound to.
+        nodeElements.filter(d => d.driftedColumns.length > 0)
+            .append('text')
+            .attr('class', 'mapping-map-node-drift')
+            .attr('dx', 16)
+            .attr('dy', -14)
+            .text('⚠');
+        
         // Tooltip
         const statusLabels = { mapped: 'Mapped', unmapped: 'Not Mapped', partial: 'Attributes Missing', excluded: 'Excluded' };
         nodeElements.append('title')
-            .text(d => `${d.name} (${statusLabels[d.mappingStatus] || 'Not Mapped'})`);
+            .text(d => {
+                const status = `${d.name} (${statusLabels[d.mappingStatus] || 'Not Mapped'})`;
+                return d.driftedColumns.length
+                    ? `${status}\nSchema drift — missing in source: ${d.driftedColumns.join(', ')}`
+                    : status;
+            });
         
         // Click to open mapping panel
         nodeElements.on('click', function(event, d) {
@@ -599,7 +763,7 @@ async function initMappingDesigner() {
             hideMappingMapContextMenu();
             d3.selectAll('.mapping-map-node').classed('selected', false);
             d3.selectAll('.mapping-map-link-hitarea').classed('selected', false);
-            closeMappingPanel();
+            guardedCloseMappingPanel();
         });
         
         svg.on('contextmenu', function(event) {
@@ -626,8 +790,11 @@ async function initMappingDesigner() {
                     const offset = (d.linkIndex - (d.linkCount - 1) / 2) * 40;
                     const mx = (sx + tx) / 2;
                     const my = (sy + ty) / 2;
-                    const dx = tx - sx;
-                    const dy = ty - sy;
+                    const rawDx = tx - sx;
+                    const rawDy = ty - sy;
+                    const canonFwd = d.source.id <= d.target.id;
+                    const dx = canonFwd ? rawDx : -rawDx;
+                    const dy = canonFwd ? rawDy : -rawDy;
                     const len = Math.sqrt(dx * dx + dy * dy) || 1;
                     const px = -dy / len;
                     const py = dx / len;
@@ -694,12 +861,15 @@ async function initMappingDesigner() {
                 
                 if (d.linkCount > 1) {
                     const mx = (sx + tx) / 2;
-                    const dx = tx - sx;
-                    const dy = (typeof d.target === 'object' ? d.target.y : nodes.find(n => n.id === d.target)?.y || 0) - 
+                    const rawDx = tx - sx;
+                    const rawDy = (typeof d.target === 'object' ? d.target.y : nodes.find(n => n.id === d.target)?.y || 0) - 
                                (typeof d.source === 'object' ? d.source.y : nodes.find(n => n.id === d.source)?.y || 0);
+                    const canonFwd = d.source.id <= d.target.id;
+                    const dx = canonFwd ? rawDx : -rawDx;
+                    const dy = canonFwd ? rawDy : -rawDy;
                     const len = Math.sqrt(dx * dx + dy * dy) || 1;
                     const offset = (d.linkIndex - (d.linkCount - 1) / 2) * 40;
-                    return mx + (-dy / len) * offset;
+                    return mx + (-dy / len) * offset * 0.5;
                 }
                 
                 return (sx + tx) / 2;
@@ -719,12 +889,15 @@ async function initMappingDesigner() {
                 
                 if (d.linkCount > 1) {
                     const my = (sy + ty) / 2;
-                    const dx = (typeof d.target === 'object' ? d.target.x : nodes.find(n => n.id === d.target)?.x || 0) - 
+                    const rawDx = (typeof d.target === 'object' ? d.target.x : nodes.find(n => n.id === d.target)?.x || 0) - 
                                (typeof d.source === 'object' ? d.source.x : nodes.find(n => n.id === d.source)?.x || 0);
-                    const dy = ty - sy;
+                    const rawDy = ty - sy;
+                    const canonFwd = d.source.id <= d.target.id;
+                    const dx = canonFwd ? rawDx : -rawDx;
+                    const dy = canonFwd ? rawDy : -rawDy;
                     const len = Math.sqrt(dx * dx + dy * dy) || 1;
                     const offset = (d.linkIndex - (d.linkCount - 1) / 2) * 40;
-                    return my + (dx / len) * offset;
+                    return my + (dx / len) * offset * 0.5;
                 }
                 
                 return (sy + ty) / 2;
@@ -752,12 +925,16 @@ async function initMappingDesigner() {
                 } else if (d.linkCount > 1) {
                     mx = (sx + tx) / 2;
                     my = (sy + ty) / 2;
-                    const dx = tx - sx;
-                    const dy = ty - sy;
+                    const rawDx = tx - sx;
+                    const rawDy = ty - sy;
+                    const canonFwd = d.source.id <= d.target.id;
+                    const dx = canonFwd ? rawDx : -rawDx;
+                    const dy = canonFwd ? rawDy : -rawDy;
                     const len = Math.sqrt(dx * dx + dy * dy) || 1;
                     const offset = (d.linkIndex - (d.linkCount - 1) / 2) * 40;
-                    mx += (-dy / len) * offset;
-                    my += (dx / len) * offset;
+                    // Use offset*0.5: label at Bezier midpoint (t=0.5), not at control point.
+                    mx += (-dy / len) * offset * 0.5;
+                    my += (dx / len) * offset * 0.5;
                 } else {
                     mx = (sx + tx) / 2;
                     my = (sy + ty) / 2 - 8;
@@ -792,6 +969,10 @@ async function initMappingDesigner() {
             <div class="mapping-map-legend-item">
                 <div class="mapping-map-legend-line inheritance"></div>
                 <span>Inheritance</span>
+            </div>
+            <div class="mapping-map-legend-item">
+                <div class="mapping-map-legend-line inherited"></div>
+                <span>Inherited relation</span>
             </div>
             <div class="mapping-map-legend-item">
                 <div class="mapping-map-legend-line excluded"></div>
@@ -837,7 +1018,7 @@ async function initMappingDesigner() {
                 mappingMapSimulation.alpha(0.01).restart();
                 
                 if (typeof showNotification === 'function') {
-                    showNotification('Layout restored from Ontology Designer', 'info', 2000);
+                    showNotification('Layout restored from Ontology Studio', 'info', 2000);
                 }
             } else {
                 if (typeof showNotification === 'function') {
@@ -849,9 +1030,11 @@ async function initMappingDesigner() {
     } catch (error) {
         console.error('Error initializing mapping map:', error);
     } finally {
-        setTimeout(() => {
-            showMappingDesignerLoading(false);
-        }, 500);
+        if (showLoading) {
+            setTimeout(() => {
+                showMappingDesignerLoading(false);
+            }, 500);
+        }
     }
 }
 
@@ -859,6 +1042,9 @@ async function initMappingDesigner() {
  * Refresh the mapping design view (update mapping status)
  */
 function refreshMappingDesign() {
+    // An explicit refresh follows a mapping change, so the drift picture may
+    // have changed too — allow exactly one new drift fetch.
+    mappingDriftLoaded = false;
     initMappingDesigner();
 }
 
@@ -873,6 +1059,12 @@ function loadOntologyIntoMappingDesigner() {
 
 let currentPanelType = null; // 'entity' or 'relationship'
 let currentPanelUri = null;
+let currentPanelDirty = false;
+// Body element id of the host holding the panel: 'panelBody' (Designer right panel)
+// or 'manualPanelBody' (Manual Mapping bottom panel). The panel markup uses
+// page-global ep*/rp* ids, so a leftover copy in the other host would shadow the
+// live one on every getElementById lookup.
+let currentPanelHostId = null;
 
 /**
  * Open the right panel for entity mapping
@@ -888,7 +1080,7 @@ function openEntityMappingFromDesign(entity) {
     );
     
     if (!ontologyClass) {
-        showNotification(`Class "${entity.name}" not found in ontology`, 'warning');
+        showNotification(`Entity "${entity.name}" not found in ontology`, 'warning');
         return;
     }
     
@@ -934,40 +1126,108 @@ function openRelationshipMappingFromDesign(rel) {
  * Open the mapping panel
  */
 function openMappingPanel() {
-    const container = document.getElementById('mappingDesignerContainer');
-    container.classList.add('panel-open');
+    setTimeout(resizeMapSvg, 0);
+}
+
+/**
+ * Register the host that now holds the entity/relationship panel markup.
+ * Any other host is closed first so only one copy of those ids exists.
+ * Callers that render panel content must call this before initialising it —
+ * runEntityPanelQuery() / runRelPanelQuery() drop their results when the
+ * panel type does not match the host they were started from.
+ *
+ * @param {HTMLElement} panelBody - The body element receiving the markup
+ * @param {string} type - 'entity' or 'relationship'
+ * @param {string} uri - URI of the ontology item being mapped
+ */
+function claimMappingPanel(panelBody, type, uri) {
+    const hostId = panelBody?.id || 'panelBody';
+    if (currentPanelHostId && currentPanelHostId !== hostId) {
+        closeActiveMappingPanel();
+    }
+    currentPanelHostId = hostId;
+    currentPanelType = type;
+    currentPanelUri = uri;
+    currentPanelDirty = false;
+}
+
+function markMappingPanelDirty() {
+    currentPanelDirty = true;
+    if (currentPanelHostId === 'manualPanelBody') {
+        const saveBtn = document.getElementById('manualSavePanelBtn');
+        if (saveBtn && window.isActiveVersion !== false) saveBtn.disabled = false;
+    }
+}
+
+/**
+ * Drop panel ownership and invalidate in-flight panel queries.
+ * Called by every host when it tears its panel down.
+ */
+function releaseMappingPanel() {
+    currentPanelHostId = null;
+    currentPanelType = null;
+    currentPanelUri = null;
+    currentPanelDirty = false;
     
-    // Resize SVG after transition completes
-    setTimeout(resizeMapSvg, 250);
+    if (EntityPanelState._autoLoadTimer) {
+        clearTimeout(EntityPanelState._autoLoadTimer);
+        EntityPanelState._autoLoadTimer = null;
+    }
+    EntityPanelState._generation++;
+}
+
+/**
+ * Close whichever host currently holds the panel.
+ */
+function closeActiveMappingPanel() {
+    if (currentPanelHostId === 'manualPanelBody' && window.ManualModule) {
+        ManualModule.closePanel();
+    } else {
+        closeMappingPanel();
+    }
 }
 
 /**
  * Close the mapping panel
  */
 function closeMappingPanel() {
-    const container = document.getElementById('mappingDesignerContainer');
-    if (container) container.classList.remove('panel-open');
-    currentPanelType = null;
-    currentPanelUri = null;
-    
-    // Invalidate any in-flight entity panel queries
-    if (EntityPanelState._autoLoadTimer) {
-        clearTimeout(EntityPanelState._autoLoadTimer);
-        EntityPanelState._autoLoadTimer = null;
-    }
-    EntityPanelState._generation++;
+    releaseMappingPanel();
     
     const panelBody = document.getElementById('panelBody');
-    if (panelBody) panelBody.innerHTML = '';
-    const saveBtn = document.getElementById('savePanelBtn');
-    if (saveBtn) saveBtn.disabled = true;
+    if (panelBody) {
+        panelBody.innerHTML = renderMappingPanelPlaceholder();
+    }
+    const panelTitle = document.getElementById('panelTitle');
+    if (panelTitle) {
+        panelTitle.innerHTML = '<span id="panelItemName">Select Item</span>';
+    }
     
     // Clear selections on map
     d3.selectAll('.mapping-map-node').classed('selected', false);
     d3.selectAll('.mapping-map-link-hitarea').classed('selected', false);
     
-    // Resize SVG after transition completes
-    setTimeout(resizeMapSvg, 250);
+    setTimeout(resizeMapSvg, 0);
+}
+
+/**
+ * Close the panel with auto-save (used for explicit user dismissal via X or background click).
+ * Skips save when viewing a non-active (read-only) version.
+ * savePanelMapping() calls closeMappingPanel() internally, so no double-close.
+ */
+function guardedCloseMappingPanel() {
+    if (!currentPanelType) {
+        closeMappingPanel();
+        return;
+    }
+    if (window.isActiveVersion === false) {
+        closeMappingPanel();
+        return;
+    }
+    if (!currentPanelDirty) {
+        closeMappingPanel();
+        return;
+    }
+    savePanelMapping();
 }
 
 /**
@@ -993,6 +1253,91 @@ function resizeMapSvg() {
     }
 }
 
+function renderMappingPanelPlaceholder() {
+    return `
+        <div class="panel-placeholder">
+            <i class="bi bi-cursor"></i>
+            <p class="mb-0">Click on an entity or relationship to configure its mapping.</p>
+        </div>
+    `;
+}
+
+function ensureMappingDesignerPlaceholder() {
+    const panelBody = document.getElementById('panelBody');
+    if (!panelBody) return;
+    if (panelBody.children.length > 0) return;
+    panelBody.innerHTML = renderMappingPanelPlaceholder();
+}
+
+function restoreMappingDesignerPanelHeight() {
+    const panel = document.getElementById('mappingRightPanel');
+    const container = document.getElementById('mappingDesignerContainer');
+    if (!panel || !container) return;
+
+    const maxHeight = Math.max(MAPPING_PANEL_MIN_HEIGHT, Math.floor(container.clientHeight * 0.5));
+    const persistedHeight = Number.parseInt(
+        window.sessionStorage.getItem(MAPPING_PANEL_HEIGHT_STORAGE_KEY) || '',
+        10
+    );
+    const safeHeight = Number.isFinite(persistedHeight)
+        ? Math.max(MAPPING_PANEL_MIN_HEIGHT, Math.min(maxHeight, persistedHeight))
+        : Math.max(MAPPING_PANEL_MIN_HEIGHT, Math.min(maxHeight, MAPPING_PANEL_DEFAULT_HEIGHT));
+    panel.style.height = `${safeHeight}px`;
+}
+
+function setupMappingDesignerResizeHandle() {
+    const container = document.getElementById('mappingDesignerContainer');
+    const panel = document.getElementById('mappingRightPanel');
+    const handle = container?.querySelector('.detail-panel-resize-handle');
+    if (!container || !panel || !handle) return;
+    if (handle.dataset.mappingResizeBound === 'true') return;
+
+    handle.style.cursor = 'row-resize';
+
+    const onMouseMove = (event) => {
+        if (!isMappingResizing) return;
+        if ((event.buttons & 1) !== 1) {
+            onMouseUp();
+            return;
+        }
+        const containerRect = container.getBoundingClientRect();
+        const maxHeight = Math.max(
+            MAPPING_PANEL_MIN_HEIGHT,
+            Math.floor(containerRect.height * 0.5)
+        );
+        const nextHeight = Math.round(containerRect.bottom - event.clientY);
+        const clampedHeight = Math.max(
+            MAPPING_PANEL_MIN_HEIGHT,
+            Math.min(maxHeight, nextHeight)
+        );
+        panel.style.height = `${clampedHeight}px`;
+        window.sessionStorage.setItem(MAPPING_PANEL_HEIGHT_STORAGE_KEY, String(clampedHeight));
+    };
+
+    const onMouseUp = () => {
+        if (!isMappingResizing) return;
+        isMappingResizing = false;
+        handle.classList.remove('active');
+        document.body.classList.remove('resizing-panel');
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('mouseup', onMouseUp);
+        resizeMapSvg();
+    };
+
+    handle.addEventListener('mousedown', (event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        event.stopPropagation();
+        isMappingResizing = true;
+        handle.classList.add('active');
+        document.body.classList.add('resizing-panel');
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+    });
+
+    handle.dataset.mappingResizeBound = 'true';
+}
+
 /**
  * Load entity panel content
  * @param {string} classUri - The class URI
@@ -1001,12 +1346,19 @@ function resizeMapSvg() {
  */
 function loadEntityPanelContent(classUri, className, targetPanelBody = null) {
     const panelBody = targetPanelBody || document.getElementById('panelBody');
+    claimMappingPanel(panelBody, 'entity', classUri);
     const existingMapping = MappingState.config.entities.find(m => m.ontology_class === classUri);
     const classInfo = MappingState.loadedOntology?.classes?.find(c => c.uri === classUri);
     
-    const attributes = classInfo?.dataProperties || [];
-    
     const epAttrMap = existingMapping?.attribute_mappings || {};
+    // Primary source: ontology dataProperties. Fallback: synthesize from already-saved
+    // attribute_mappings so mapped attributes always appear even if the ontology config
+    // hasn't had sync_class_data_properties applied.
+    const ontologyAttrs = classInfo?.dataProperties || [];
+    const mappedOnlyAttrs = Object.keys(epAttrMap)
+        .filter(k => !ontologyAttrs.some(a => (a.name || a.localName) === k))
+        .map(k => ({ name: k }));
+    const attributes = [...ontologyAttrs, ...mappedOnlyAttrs];
     const epHasSql = !!(existingMapping?.sql_query);
     const epHasId = !!(existingMapping?.id_column);
     const epHasLabel = !!(existingMapping?.label_column);
@@ -1017,16 +1369,38 @@ function loadEntityPanelContent(classUri, className, targetPanelBody = null) {
     const epStatusIcon = (ok) => ok
         ? '<i class="bi bi-check-circle-fill text-success"></i>'
         : '<i class="bi bi-x-circle-fill text-danger"></i>';
-    const epOntologyRows = attributes.map((a, i) => {
+    const epExcludedAttrs = existingMapping?.excluded_attributes || [];
+    const epOntologyRows = attributes.map((a) => {
         const name = a.name || a.localName || '';
-        const assigned = !!(name && epAttrMap[name]);
-        return `<tr><td class="text-muted" style="width:28px;">${i + 1}</td><td>${name}</td><td class="text-center">${epStatusIcon(assigned)}</td></tr>`;
+        const isExcluded = epExcludedAttrs.includes(name);
+        const assigned = !!(name && epAttrMap[name]) && !isExcluded;
+        const nameCell = isExcluded ? `<span class="text-muted text-decoration-line-through">${name}</span>` : name;
+        const mappedCell = isExcluded
+            ? '<i class="bi bi-dash text-muted" title="Excluded from mapping"></i>'
+            : epStatusIcon(assigned);
+        return `<tr>
+            <td style="width:32px;padding-left:8px;"><input type="checkbox" class="ep-attr-include-cb form-check-input form-check-input-sm" data-attr="${name}" ${isExcluded ? '' : 'checked'} title="${isExcluded ? 'Click to include this attribute' : 'Click to exclude this attribute'}"></td>
+            <td>${nameCell}</td>
+            <td class="text-center">${mappedCell}</td>
+        </tr>`;
     }).join('');
+
+    const epDrift = MappingDriftState.entities[classUri]?.columns || [];
 
     panelBody.innerHTML = `
         <input type="hidden" id="panelEntityClass" value="${classUri}" />
         
-        <ul class="nav nav-tabs ob-tabs" id="entityPanelTabs" role="tablist">
+        ${epDrift.length ? `
+            <div class="alert alert-warning py-2 px-3 mb-2" style="font-size:0.78rem;">
+                <i class="bi bi-database-exclamation me-1"></i>
+                <strong>Source schema changed.</strong>
+                ${epDrift.length} mapped column(s) no longer exist upstream:
+                ${epDrift.map(c => `<code>${c}</code>`).join(', ')}.
+                Remap them or restore the column in the source table.
+            </div>
+        ` : ''}
+        
+        <ul class="nav nav-tabs ob-tabs ob-tabs--compact" id="entityPanelTabs" role="tablist">
             <li class="nav-item" role="presentation">
                 <button class="nav-link active" id="ep-status-tab" data-bs-toggle="tab" data-bs-target="#ep-status-pane" type="button">
                     <i class="bi bi-clipboard-check"></i> Status
@@ -1038,7 +1412,7 @@ function loadEntityPanelContent(classUri, className, targetPanelBody = null) {
                 </button>
             </li>
             <li class="nav-item" role="presentation">
-                <button class="nav-link" id="ep-mapping-tab" data-bs-toggle="tab" data-bs-target="#ep-mapping-pane" type="button" ${!existingMapping ? 'disabled' : ''}>
+                <button class="nav-link" id="ep-mapping-tab" data-bs-toggle="tab" data-bs-target="#ep-mapping-pane" type="button" ${!existingMapping?.sql_query ? 'disabled' : ''}>
                     <i class="bi bi-diagram-3"></i> Mapping
                 </button>
             </li>
@@ -1049,6 +1423,7 @@ function loadEntityPanelContent(classUri, className, targetPanelBody = null) {
                 <div class="small mb-2">
                     <span class="fw-semibold">${className}</span>
                     ${classInfo?.parent ? '<span class="text-muted ms-1">inherits <span class="fst-italic">' + classInfo.parent + '</span></span>' : ''}
+                    <div id="epInheritedRelations" class="mt-2"></div>
                     <a href="/ontology/?section=entities&select=${encodeURIComponent(className)}" class="ms-2 small" title="View ${className} in Ontology Editor"><i class="bi bi-box-arrow-up-right"></i> Ontology</a>
                     ${classInfo?.comment ? '<p class="text-muted mt-1 mb-0" style="font-size:0.78rem;">' + classInfo.comment + '</p>' : ''}
                 </div>
@@ -1062,8 +1437,8 @@ function loadEntityPanelContent(classUri, className, targetPanelBody = null) {
                             <table class="table table-sm mb-0" style="font-size:0.8rem;">
                                 <tbody>
                                     <tr><td>${epStatusIcon(epHasSql)}</td><td>SQL Query</td><td class="text-muted small">${epHasSql ? 'Defined' : 'Not defined'}</td></tr>
-                                    <tr><td>${epStatusIcon(epHasId)}</td><td>ID column</td><td class="text-muted small">${epHasId ? existingMapping.id_column : 'Not assigned'}</td></tr>
-                                    <tr><td>${epStatusIcon(epHasLabel)}</td><td>Label column</td><td class="text-muted small">${epHasLabel ? existingMapping.label_column : 'Not assigned'}</td></tr>
+                                    <tr><td id="epStatusIdIcon">${epStatusIcon(epHasId)}</td><td>ID column</td><td id="epStatusIdDetail" class="text-muted small">${epHasId ? existingMapping.id_column : 'Not assigned'}</td></tr>
+                                    <tr><td id="epStatusLabelIcon">${epStatusIcon(epHasLabel)}</td><td>Label column</td><td id="epStatusLabelDetail" class="text-muted small">${epHasLabel ? existingMapping.label_column : 'Not assigned'}</td></tr>
                                     ${attributes.length > 0 ? '<tr><td>' + epStatusIcon(epMappedAttrCount === attributes.length) + '</td><td>Attributes</td><td class="text-muted small">' + epMappedAttrCount + ' / ' + attributes.length + ' assigned</td></tr>' : ''}
                                 </tbody>
                             </table>
@@ -1075,7 +1450,31 @@ function loadEntityPanelContent(classUri, className, targetPanelBody = null) {
                         </div>
                     </div>
                     ${attributes.length > 0
-                        ? '<div class="col-6"><div class="border rounded" style="max-height: 200px; overflow-y: auto;"><table class="table table-sm table-striped mb-0" style="font-size:0.78rem;"><thead class="table-light sticky-top"><tr><th style="width:28px;">#</th><th>Attribute</th><th class="text-center" style="width:70px;">Mapped</th></tr></thead><tbody>' + epOntologyRows + '</tbody></table></div></div>'
+                        ? `<div class="col-6">
+                            <div class="d-flex justify-content-between align-items-center mb-1">
+                                <span class="text-muted small fw-semibold">Attributes</span>
+                                <div class="d-flex align-items-center gap-2">
+                                    <button id="epAttrToggleAllBtn" type="button" class="btn btn-link btn-sm py-0 px-0 text-muted"
+                                            style="font-size:0.72rem;" onclick="toggleAllEntityAttrs()"
+                                            title="Include or exclude all attributes">
+                                        <i class="bi bi-x-square me-1"></i>Exclude all
+                                    </button>
+                                    <button type="button" class="btn btn-link btn-sm py-0 px-0 text-muted"
+                                            style="font-size:0.72rem;" onclick="autoExcludeUnmappedEntityAttrs()"
+                                            title="Automatically exclude all attributes not yet assigned to a column">
+                                        <i class="bi bi-slash-circle me-1"></i>Exclude unmapped
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="border rounded" style="max-height:185px;overflow-y:auto;">
+                                <table class="table table-sm table-striped mb-0" style="font-size:0.78rem;">
+                                    <thead class="table-light sticky-top">
+                                        <tr><th style="width:32px;" title="Include in mapping"><i class="bi bi-check2-square text-muted"></i></th><th>Attribute</th><th class="text-center" style="width:70px;">Mapped</th></tr>
+                                    </thead>
+                                    <tbody>${epOntologyRows}</tbody>
+                                </table>
+                            </div>
+                          </div>`
                         : ''}
                 </div>
             </div>
@@ -1141,6 +1540,30 @@ function loadEntityPanelContent(classUri, className, targetPanelBody = null) {
         </div>
     `;
     
+    const inhBox = document.getElementById('epInheritedRelations');
+    if (inhBox && typeof outgoingRelationsForClass === 'function') {
+        const ontoClasses = MappingState.loadedOntology?.classes || [];
+        const ontoProperties = MappingState.loadedOntology?.properties || [];
+        const inherited = outgoingRelationsForClass(ontoClasses, ontoProperties, className)
+            .filter(r => r.inherited);
+        const mappedUris = new Set((MappingState.config.relationships || []).map(m => m.property));
+        inhBox.innerHTML = inherited.length
+            ? `<div class="text-muted small fw-semibold mb-1">Inherited relations</div>` +
+              inherited.map(r => {
+                  const mapped = mappedUris.has(r.uri);
+                  const icon = mapped
+                      ? '<i class="bi bi-check-circle-fill text-success"></i>'
+                      : '<i class="bi bi-x-circle-fill text-danger"></i>';
+                  return `<button type="button" class="btn btn-link btn-sm py-0 px-0 d-block text-start"
+                      onclick="openRelationshipMappingFromDesign({ uri: ${JSON.stringify(r.uri)} })">
+                      ${icon}
+                      <span class="ms-1">${r.label || r.name}</span>
+                      <span class="text-muted"> via ${r.inheritedFrom}</span>
+                  </button>`;
+              }).join('')
+            : '';
+    }
+
     initEntityPanel(classUri, className, existingMapping, classInfo);
 }
 
@@ -1151,6 +1574,7 @@ function loadEntityPanelContent(classUri, className, targetPanelBody = null) {
  */
 function loadRelationshipPanelContent(ontologyProperty, targetPanelBody = null) {
     const panelBody = targetPanelBody || document.getElementById('panelBody');
+    claimMappingPanel(panelBody, 'relationship', ontologyProperty.uri);
     const existingMapping = MappingState.config.relationships.find(m => m.property === ontologyProperty.uri);
     
     const domainUri = ontologyProperty.domain;
@@ -1169,7 +1593,12 @@ function loadRelationshipPanelContent(ontologyProperty, targetPanelBody = null) 
     const hasSrcId = !!(existingMapping?.source_id_column);
     const hasTgtId = !!(existingMapping?.target_id_column);
     const relAttrMap = existingMapping?.attribute_mappings || {};
-    const relAttributes = ontologyProperty?.properties || [];
+    // Primary source: ontology properties. Fallback: synthesize from saved attribute_mappings.
+    const ontologyRelAttrs = ontologyProperty?.properties || [];
+    const relMappedOnlyAttrs = Object.keys(relAttrMap)
+        .filter(k => !ontologyRelAttrs.some(a => (a.name || a.localName) === k))
+        .map(k => ({ name: k }));
+    const relAttributes = [...ontologyRelAttrs, ...relMappedOnlyAttrs];
     const mappedAttrCount = relAttributes.filter(a => {
         const n = a.name || a.localName || '';
         return n && relAttrMap[n];
@@ -1190,19 +1619,40 @@ function loadRelationshipPanelContent(ontologyProperty, targetPanelBody = null) 
 
     const rpStatusRows = `
         <tr><td>${statusIcon(hasSql)}</td><td>SQL Query</td><td class="text-muted small">${hasSql ? 'Defined' : 'Not defined'}</td></tr>
-        <tr><td>${statusIcon(hasSrcId)}</td><td>Source ID column</td><td class="text-muted small">${hasSrcId ? existingMapping.source_id_column : 'Not assigned'}</td></tr>
-        <tr><td>${statusIcon(hasTgtId)}</td><td>Target ID column</td><td class="text-muted small">${hasTgtId ? existingMapping.target_id_column : 'Not assigned'}</td></tr>
+        <tr><td id="rpStatusSourceIcon">${statusIcon(hasSrcId)}</td><td>Source ID column</td><td id="rpStatusSourceDetail" class="text-muted small">${hasSrcId ? existingMapping.source_id_column : 'Not assigned'}</td></tr>
+        <tr><td id="rpStatusTargetIcon">${statusIcon(hasTgtId)}</td><td>Target ID column</td><td id="rpStatusTargetDetail" class="text-muted small">${hasTgtId ? existingMapping.target_id_column : 'Not assigned'}</td></tr>
         ${relAttributes.length > 0 ? `<tr><td>${statusIcon(mappedAttrCount === relAttributes.length)}</td><td>Attributes</td><td class="text-muted small">${mappedAttrCount} / ${relAttributes.length} assigned</td></tr>` : ''}
     `;
 
-    const rpOntologyRows = relAttributes.map((a, i) => {
+    const rpExcludedAttrs = existingMapping?.excluded_attributes || [];
+    const rpOntologyRows = relAttributes.map((a) => {
         const name = a.name || a.localName || '';
-        const assigned = !!(name && relAttrMap[name]);
-        return `<tr><td class="text-muted" style="width:28px;">${i + 1}</td><td>${name}</td><td class="text-center">${statusIcon(assigned)}</td></tr>`;
+        const isExcluded = rpExcludedAttrs.includes(name);
+        const assigned = !!(name && relAttrMap[name]) && !isExcluded;
+        const nameCell = isExcluded ? `<span class="text-muted text-decoration-line-through">${name}</span>` : name;
+        const mappedCell = isExcluded
+            ? '<i class="bi bi-dash text-muted" title="Excluded from mapping"></i>'
+            : statusIcon(assigned);
+        return `<tr>
+            <td style="width:32px;padding-left:8px;"><input type="checkbox" class="rp-attr-include-cb form-check-input form-check-input-sm" data-attr="${name}" ${isExcluded ? '' : 'checked'} title="${isExcluded ? 'Click to include this attribute' : 'Click to exclude this attribute'}"></td>
+            <td>${nameCell}</td>
+            <td class="text-center">${mappedCell}</td>
+        </tr>`;
     }).join('');
+
+    const rpDrift = MappingDriftState.relationships[ontologyProperty.uri]?.columns || [];
 
     panelBody.innerHTML = `
         <input type="hidden" id="panelPropertyUri" value="${ontologyProperty.uri}" />
+        
+        ${rpDrift.length ? `
+            <div class="alert alert-warning py-2 px-3 mb-2" style="font-size:0.78rem;">
+                <i class="bi bi-database-exclamation me-1"></i>
+                <strong>Source schema changed.</strong>
+                ${rpDrift.length} mapped column(s) no longer exist upstream:
+                ${rpDrift.map(c => `<code>${c}</code>`).join(', ')}.
+            </div>
+        ` : ''}
         
         <div class="d-flex align-items-center justify-content-center gap-2 py-2 mb-2 bg-light rounded">
             <span class="badge bg-primary small">${sourceName}</span>
@@ -1210,7 +1660,7 @@ function loadRelationshipPanelContent(ontologyProperty, targetPanelBody = null) 
             <span class="badge bg-success small">${targetName}</span>
         </div>
         
-        <ul class="nav nav-tabs ob-tabs" id="relPanelTabs" role="tablist">
+        <ul class="nav nav-tabs ob-tabs ob-tabs--compact" id="relPanelTabs" role="tablist">
             <li class="nav-item" role="presentation">
                 <button class="nav-link active" id="rp-status-tab" data-bs-toggle="tab" data-bs-target="#rp-status-pane" type="button">
                     <i class="bi bi-clipboard-check"></i> Status
@@ -1222,7 +1672,7 @@ function loadRelationshipPanelContent(ontologyProperty, targetPanelBody = null) 
                 </button>
             </li>
             <li class="nav-item" role="presentation">
-                <button class="nav-link" id="rp-mapping-tab" data-bs-toggle="tab" data-bs-target="#rp-mapping-pane" type="button" ${!existingMapping ? 'disabled' : ''}>
+                <button class="nav-link" id="rp-mapping-tab" data-bs-toggle="tab" data-bs-target="#rp-mapping-pane" type="button" ${!existingMapping?.sql_query ? 'disabled' : ''}>
                     <i class="bi bi-diagram-3"></i> Mapping
                 </button>
             </li>
@@ -1254,7 +1704,31 @@ function loadRelationshipPanelContent(ontologyProperty, targetPanelBody = null) 
                         </div>
                     </div>
                     ${relAttributes.length > 0
-                        ? '<div class="col-6"><div class="border rounded" style="max-height: 200px; overflow-y: auto;"><table class="table table-sm table-striped mb-0" style="font-size:0.78rem;"><thead class="table-light sticky-top"><tr><th style="width:28px;">#</th><th>Attribute</th><th class="text-center" style="width:70px;">Mapped</th></tr></thead><tbody>' + rpOntologyRows + '</tbody></table></div></div>'
+                        ? `<div class="col-6">
+                            <div class="d-flex justify-content-between align-items-center mb-1">
+                                <span class="text-muted small fw-semibold">Attributes</span>
+                                <div class="d-flex align-items-center gap-2">
+                                    <button id="rpAttrToggleAllBtn" type="button" class="btn btn-link btn-sm py-0 px-0 text-muted"
+                                            style="font-size:0.72rem;" onclick="toggleAllRelAttrs()"
+                                            title="Include or exclude all attributes">
+                                        <i class="bi bi-x-square me-1"></i>Exclude all
+                                    </button>
+                                    <button type="button" class="btn btn-link btn-sm py-0 px-0 text-muted"
+                                            style="font-size:0.72rem;" onclick="autoExcludeUnmappedRelAttrs()"
+                                            title="Automatically exclude all attributes not yet assigned to a column">
+                                        <i class="bi bi-slash-circle me-1"></i>Exclude unmapped
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="border rounded" style="max-height:185px;overflow-y:auto;">
+                                <table class="table table-sm table-striped mb-0" style="font-size:0.78rem;">
+                                    <thead class="table-light sticky-top">
+                                        <tr><th style="width:32px;" title="Include in mapping"><i class="bi bi-check2-square text-muted"></i></th><th>Attribute</th><th class="text-center" style="width:70px;">Mapped</th></tr>
+                                    </thead>
+                                    <tbody>${rpOntologyRows}</tbody>
+                                </table>
+                            </div>
+                          </div>`
                         : ''}
                 </div>
             </div>
@@ -1334,9 +1808,70 @@ const EntityPanelState = {
     labelColumn: null,
     attributeMappings: {},
     attributes: [],
+    excludedAttributes: [],
+    driftedColumns: new Set(),
     _generation: 0,
     _autoLoadTimer: null
 };
+
+const EntityPreviewCache = new Map();
+
+function entityPreviewCacheKey(classUri, sql, previewLimit) {
+    return JSON.stringify([classUri, sql, previewLimit]);
+}
+
+function applyEntityPanelPreview(result, options = {}) {
+    EntityPanelState.columns = result.columns;
+    EntityPanelState.rows = result.rows || [];
+
+    if (!EntityPanelState.idColumn || !result.columns.includes(EntityPanelState.idColumn)) {
+        EntityPanelState.idColumn = null;
+    }
+    if (EntityPanelState.labelColumn && !result.columns.includes(EntityPanelState.labelColumn)) {
+        EntityPanelState.labelColumn = null;
+    }
+
+    autoMapEntityColumns(result.columns);
+    renderEntityPanelGrid();
+    const epSummary = document.getElementById('epMappingSummary');
+    if (epSummary) epSummary.style.display = 'none';
+    const epLoading = document.getElementById('epMappingLoading');
+    if (epLoading) epLoading.style.display = 'none';
+    const epGrid = document.getElementById('epMappingGrid');
+    if (epGrid) epGrid.style.display = 'flex';
+
+    const epTab = document.getElementById('ep-mapping-tab');
+    if (epTab) {
+        epTab.disabled = false;
+        if (!options.autoLoad) bootstrap.Tab.getOrCreateInstance(epTab).show();
+    }
+
+    const statusEl = document.getElementById('epQueryStatus');
+    if (statusEl) {
+        statusEl.innerHTML = '<span class="text-success"><i class="bi bi-check-circle"></i> ' + result.row_count + ' rows</span>';
+    }
+}
+
+function cacheEntityPreview(classUri, sql, previewLimit, result) {
+    EntityPreviewCache.set(
+        entityPreviewCacheKey(classUri, sql, previewLimit),
+        {
+            ...result,
+            columns: [...result.columns],
+            rows: (result.rows || []).map(row => Array.isArray(row) ? [...row] : {...row})
+        }
+    );
+}
+
+function restoreCachedEntityPreview(classUri, sql, previewLimit) {
+    const cached = EntityPreviewCache.get(
+        entityPreviewCacheKey(classUri, sql, previewLimit)
+    );
+    if (!cached) return false;
+
+    applyEntityPanelPreview(cached, { autoLoad: true });
+    return true;
+}
 
 function initEntityPanel(classUri, className, existingMapping, classInfo) {
     // Cancel any pending autoLoad from a previous entity to prevent race conditions
@@ -1352,26 +1887,64 @@ function initEntityPanel(classUri, className, existingMapping, classInfo) {
     EntityPanelState.idColumn = existingMapping?.id_column || null;
     EntityPanelState.labelColumn = existingMapping?.label_column || null;
     EntityPanelState.attributeMappings = existingMapping?.attribute_mappings ? {...existingMapping.attribute_mappings} : {};
-    EntityPanelState.attributes = classInfo?.dataProperties || [];
+    const _epOntAttrs = classInfo?.dataProperties || [];
+    const _epMappedOnly = Object.keys(EntityPanelState.attributeMappings)
+        .filter(k => !_epOntAttrs.some(a => (a.name || a.localName) === k))
+        .map(k => ({ name: k }));
+    EntityPanelState.attributes = [..._epOntAttrs, ..._epMappedOnly];
+    EntityPanelState.excludedAttributes = existingMapping?.excluded_attributes ? [...existingMapping.excluded_attributes] : [];
+    EntityPanelState.driftedColumns = driftedColumnsForEntity(classUri);
     
     updateEntityPanelSaveBtn();
     
     document.getElementById('epRunQueryBtn')?.addEventListener('click', runEntityPanelQuery);
+    document.getElementById('epSqlQuery')?.addEventListener('input', markMappingPanelDirty);
     
     // Exclude checkbox
     const epExcludeCb = document.getElementById('epExcludeCheck');
     if (epExcludeCb) {
         epExcludeCb.addEventListener('change', function() {
+            markMappingPanelDirty();
             toggleEntityExclusion(classUri, !this.checked, 'entity');
         });
     }
-    
+
+    // Per-attribute include/exclude checkboxes
+    document.querySelectorAll('.ep-attr-include-cb').forEach(cb => {
+        cb.addEventListener('change', function() {
+            markMappingPanelDirty();
+            const attrName = this.dataset.attr;
+            const row = this.closest('tr');
+            const nameCell = row.querySelector('td:nth-child(2)');
+            const mappedCell = row.querySelector('td:nth-child(3)');
+            if (this.checked) {
+                EntityPanelState.excludedAttributes = EntityPanelState.excludedAttributes.filter(a => a !== attrName);
+                const isMapped = !!EntityPanelState.attributeMappings[attrName];
+                nameCell.innerHTML = attrName;
+                mappedCell.innerHTML = isMapped
+                    ? '<i class="bi bi-check-circle-fill text-success"></i>'
+                    : '<i class="bi bi-x-circle-fill text-danger"></i>';
+            } else {
+                if (!EntityPanelState.excludedAttributes.includes(attrName)) {
+                    EntityPanelState.excludedAttributes.push(attrName);
+                }
+                nameCell.innerHTML = `<span class="text-muted text-decoration-line-through">${attrName}</span>`;
+                mappedCell.innerHTML = '<i class="bi bi-dash text-muted" title="Excluded from mapping"></i>';
+            }
+            _updateEntityAttrToggleBtn();
+        });
+    });
+    _updateEntityAttrToggleBtn();
+
     // Auto-load query data in background when there is an existing mapping with SQL
     if (existingMapping?.sql_query) {
-        EntityPanelState._autoLoadTimer = setTimeout(() => {
-            EntityPanelState._autoLoadTimer = null;
-            runEntityPanelQuery({ autoLoad: true });
-        }, 100);
+        const previewLimit = parseInt(document.getElementById('epPreviewLimit')?.value) || 10;
+        if (!restoreCachedEntityPreview(classUri, existingMapping.sql_query, previewLimit)) {
+            EntityPanelState._autoLoadTimer = setTimeout(() => {
+                EntityPanelState._autoLoadTimer = null;
+                runEntityPanelQuery({ autoLoad: true });
+            }, 100);
+        }
     }
 }
 
@@ -1386,6 +1959,7 @@ async function runEntityPanelQuery(options = {}) {
     
     // Capture the generation at call time so we can detect stale responses
     const capturedGeneration = EntityPanelState._generation;
+    const capturedPanelUri = currentPanelUri;
     
     const previewLimit = parseInt(document.getElementById('epPreviewLimit')?.value) || 10;
     const btn = document.getElementById('epRunQueryBtn');
@@ -1406,32 +1980,8 @@ async function runEntityPanelQuery(options = {}) {
         if (currentPanelType !== 'entity' || capturedGeneration !== EntityPanelState._generation) return;
         
         if (result.success) {
-            EntityPanelState.columns = result.columns;
-            EntityPanelState.rows = result.rows || [];
-            
-            if (!EntityPanelState.idColumn || !result.columns.includes(EntityPanelState.idColumn)) {
-                EntityPanelState.idColumn = null;
-            }
-            if (EntityPanelState.labelColumn && !result.columns.includes(EntityPanelState.labelColumn)) {
-                EntityPanelState.labelColumn = null;
-            }
-            
-            autoMapEntityColumns(result.columns);
-            renderEntityPanelGrid();
-            const epSummary = document.getElementById('epMappingSummary');
-            if (epSummary) epSummary.style.display = 'none';
-            const epLoading = document.getElementById('epMappingLoading');
-            if (epLoading) epLoading.style.display = 'none';
-            const epGrid = document.getElementById('epMappingGrid');
-            if (epGrid) epGrid.style.display = 'flex';
-            
-            const epTab = document.getElementById('ep-mapping-tab');
-            if (epTab) {
-                epTab.disabled = false;
-                if (!options.autoLoad) bootstrap.Tab.getOrCreateInstance(epTab).show();
-            }
-            
-            if (statusEl) statusEl.innerHTML = '<span class="text-success"><i class="bi bi-check-circle"></i> ' + result.row_count + ' rows</span>';
+            cacheEntityPreview(capturedPanelUri, sql, previewLimit, result);
+            applyEntityPanelPreview(result, options);
         } else {
             const epLoading = document.getElementById('epMappingLoading');
             if (epLoading) epLoading.style.display = 'none';
@@ -1469,6 +2019,11 @@ function renderEntityPanelGrid() {
             if (attr) badge = `<span class="badge bg-secondary">${attr[0]}</span>`;
             else badge = '<span class="badge bg-light text-muted border">Map</span>';
         }
+        if (EntityPanelState.driftedColumns.has(col)) {
+            badge += ' <span class="badge bg-warning text-dark" ' +
+                'title="This column no longer exists in the source table">' +
+                '<i class="bi bi-database-exclamation"></i></span>';
+        }
         return `<th data-col="${col}" style="cursor:pointer;">${col}<br>${badge}</th>`;
     }).join('');
     
@@ -1480,7 +2035,25 @@ function renderEntityPanelGrid() {
         th.addEventListener('click', () => showEntityColumnMenu(th, th.dataset.col));
     });
     
+    refreshEntityPanelStatus();
     updateEntityPanelSaveBtn();
+}
+
+function refreshEntityPanelStatus() {
+    const assignments = [
+        ['epStatusIdIcon', 'epStatusIdDetail', EntityPanelState.idColumn],
+        ['epStatusLabelIcon', 'epStatusLabelDetail', EntityPanelState.labelColumn]
+    ];
+    assignments.forEach(([iconId, detailId, column]) => {
+        const icon = document.getElementById(iconId);
+        const detail = document.getElementById(detailId);
+        if (icon) {
+            icon.innerHTML = column
+                ? '<i class="bi bi-check-circle-fill text-success"></i>'
+                : '<i class="bi bi-x-circle-fill text-danger"></i>';
+        }
+        if (detail) detail.textContent = column || 'Not assigned';
+    });
 }
 
 function showEntityColumnMenu(th, column) {
@@ -1512,6 +2085,7 @@ function showEntityColumnMenu(th, column) {
     
     menu.querySelectorAll('.dropdown-item').forEach(item => {
         item.addEventListener('click', () => {
+            markMappingPanelDirty();
             const action = item.dataset.action;
             if (EntityPanelState.idColumn === column) EntityPanelState.idColumn = null;
             if (EntityPanelState.labelColumn === column) EntityPanelState.labelColumn = null;
@@ -1522,7 +2096,7 @@ function showEntityColumnMenu(th, column) {
             if (action === 'id') EntityPanelState.idColumn = column;
             else if (action === 'label') EntityPanelState.labelColumn = column;
             else if (action === 'attr') EntityPanelState.attributeMappings[item.dataset.attr] = column;
-            
+
             menu.remove();
             renderEntityPanelGrid();
         });
@@ -1588,18 +2162,29 @@ function autoMapEntityColumns(columns) {
 function updateEntityPanelSaveBtn() {
     const saveBtn = document.getElementById('savePanelBtn');
     const statusEl = document.getElementById('epMappingStatus');
-    
+
     if (window.isActiveVersion === false) {
         if (saveBtn) saveBtn.disabled = true;
         return;
     }
 
-    if (EntityPanelState.idColumn) {
-        saveBtn.disabled = false;
-        if (statusEl) statusEl.innerHTML = '<span class="text-success"><i class="bi bi-check-circle"></i> ID: ' + EntityPanelState.idColumn + '</span>';
-    } else {
-        saveBtn.disabled = true;
-        if (statusEl) statusEl.innerHTML = '<span class="text-danger"><i class="bi bi-x-circle"></i> ID required</span>';
+    // Save button is always enabled — validation happens on click.
+    if (saveBtn) saveBtn.disabled = false;
+
+    if (statusEl) {
+        if (EntityPanelState.idColumn) {
+            statusEl.innerHTML = '<span class="text-success"><i class="bi bi-check-circle"></i> ID: ' + EntityPanelState.idColumn + '</span>';
+        } else {
+            const classUri = document.getElementById('panelEntityClass')?.value;
+            const configEntry = classUri
+                ? MappingState.config.entities.find(m => m.ontology_class === classUri)
+                : null;
+            if (configEntry?.id_column) {
+                statusEl.innerHTML = '<span class="text-warning"><i class="bi bi-exclamation-triangle"></i> ID: ' + configEntry.id_column + ' (verify in Mapping tab)</span>';
+            } else {
+                statusEl.innerHTML = '<span class="text-muted"><i class="bi bi-info-circle"></i> Set SQL + ID column to create mapping</span>';
+            }
+        }
     }
 }
 
@@ -1613,29 +2198,65 @@ const RelPanelState = {
     sourceIdColumn: null,
     targetIdColumn: null,
     attributeMappings: {},
-    attributes: []
+    attributes: [],
+    excludedAttributes: []
 };
 
 function initRelationshipPanel(ontologyProperty, existingMapping) {
     RelPanelState.columns = [];
     RelPanelState.rows = [];
+    RelPanelState.propertyUri = ontologyProperty?.uri || null;
     RelPanelState.sourceIdColumn = existingMapping?.source_id_column || null;
     RelPanelState.targetIdColumn = existingMapping?.target_id_column || null;
     RelPanelState.attributeMappings = existingMapping?.attribute_mappings ? {...existingMapping.attribute_mappings} : {};
-    RelPanelState.attributes = ontologyProperty?.properties || [];
+    const _rpOntAttrs = ontologyProperty?.properties || [];
+    const _rpMappedOnly = Object.keys(RelPanelState.attributeMappings)
+        .filter(k => !_rpOntAttrs.some(a => (a.name || a.localName) === k))
+        .map(k => ({ name: k }));
+    RelPanelState.attributes = [..._rpOntAttrs, ..._rpMappedOnly];
+    RelPanelState.excludedAttributes = existingMapping?.excluded_attributes ? [...existingMapping.excluded_attributes] : [];
     
     updateRelPanelSaveBtn();
     
     document.getElementById('rpRunQueryBtn')?.addEventListener('click', runRelPanelQuery);
+    document.getElementById('rpSqlQuery')?.addEventListener('input', markMappingPanelDirty);
     
     // Exclude checkbox
     const rpExcludeCb = document.getElementById('rpExcludeCheck');
     if (rpExcludeCb) {
         rpExcludeCb.addEventListener('change', function() {
+            markMappingPanelDirty();
             toggleEntityExclusion(ontologyProperty.uri, !this.checked, 'relationship');
         });
     }
-    
+
+    // Per-attribute include/exclude checkboxes
+    document.querySelectorAll('.rp-attr-include-cb').forEach(cb => {
+        cb.addEventListener('change', function() {
+            markMappingPanelDirty();
+            const attrName = this.dataset.attr;
+            const row = this.closest('tr');
+            const nameCell = row.querySelector('td:nth-child(2)');
+            const mappedCell = row.querySelector('td:nth-child(3)');
+            if (this.checked) {
+                RelPanelState.excludedAttributes = RelPanelState.excludedAttributes.filter(a => a !== attrName);
+                const isMapped = !!RelPanelState.attributeMappings[attrName];
+                nameCell.innerHTML = attrName;
+                mappedCell.innerHTML = isMapped
+                    ? '<i class="bi bi-check-circle-fill text-success"></i>'
+                    : '<i class="bi bi-x-circle-fill text-danger"></i>';
+            } else {
+                if (!RelPanelState.excludedAttributes.includes(attrName)) {
+                    RelPanelState.excludedAttributes.push(attrName);
+                }
+                nameCell.innerHTML = `<span class="text-muted text-decoration-line-through">${attrName}</span>`;
+                mappedCell.innerHTML = '<i class="bi bi-dash text-muted" title="Excluded from mapping"></i>';
+            }
+            _updateRelAttrToggleBtn();
+        });
+    });
+    _updateRelAttrToggleBtn();
+
     // Auto-load query data in background when there is an existing mapping with SQL
     if (existingMapping?.sql_query) {
         setTimeout(() => {
@@ -1734,7 +2355,25 @@ function renderRelPanelGrid() {
         th.addEventListener('click', () => showRelColumnMenu(th, th.dataset.col));
     });
     
+    refreshRelationshipPanelStatus();
     updateRelPanelSaveBtn();
+}
+
+function refreshRelationshipPanelStatus() {
+    const assignments = [
+        ['rpStatusSourceIcon', 'rpStatusSourceDetail', RelPanelState.sourceIdColumn],
+        ['rpStatusTargetIcon', 'rpStatusTargetDetail', RelPanelState.targetIdColumn]
+    ];
+    assignments.forEach(([iconId, detailId, column]) => {
+        const icon = document.getElementById(iconId);
+        const detail = document.getElementById(detailId);
+        if (icon) {
+            icon.innerHTML = column
+                ? '<i class="bi bi-check-circle-fill text-success"></i>'
+                : '<i class="bi bi-x-circle-fill text-danger"></i>';
+        }
+        if (detail) detail.textContent = column || 'Not assigned';
+    });
 }
 
 function showRelColumnMenu(th, column) {
@@ -1766,6 +2405,7 @@ function showRelColumnMenu(th, column) {
     
     menu.querySelectorAll('.dropdown-item').forEach(item => {
         item.addEventListener('click', () => {
+            markMappingPanelDirty();
             const action = item.dataset.action;
             if (RelPanelState.sourceIdColumn === column) RelPanelState.sourceIdColumn = null;
             if (RelPanelState.targetIdColumn === column) RelPanelState.targetIdColumn = null;
@@ -1776,7 +2416,7 @@ function showRelColumnMenu(th, column) {
             if (action === 'source') RelPanelState.sourceIdColumn = column;
             else if (action === 'target') RelPanelState.targetIdColumn = column;
             else if (action === 'attr') RelPanelState.attributeMappings[item.dataset.attr] = column;
-            
+
             menu.remove();
             renderRelPanelGrid();
         });
@@ -1842,18 +2482,29 @@ function autoMapRelColumns(columns) {
 function updateRelPanelSaveBtn() {
     const saveBtn = document.getElementById('savePanelBtn');
     const statusEl = document.getElementById('rpMappingStatus');
-    
+
     if (window.isActiveVersion === false) {
         if (saveBtn) saveBtn.disabled = true;
         return;
     }
 
-    if (RelPanelState.sourceIdColumn && RelPanelState.targetIdColumn) {
-        saveBtn.disabled = false;
-        if (statusEl) statusEl.innerHTML = '<span class="text-success"><i class="bi bi-check-circle"></i> Source: ' + RelPanelState.sourceIdColumn + ' | Target: ' + RelPanelState.targetIdColumn + '</span>';
-    } else {
-        saveBtn.disabled = true;
-        if (statusEl) statusEl.innerHTML = '<span class="text-danger"><i class="bi bi-x-circle"></i> Source & Target required</span>';
+    // Save button is always enabled — validation happens on click.
+    if (saveBtn) saveBtn.disabled = false;
+
+    if (statusEl) {
+        if (RelPanelState.sourceIdColumn && RelPanelState.targetIdColumn) {
+            statusEl.innerHTML = '<span class="text-success"><i class="bi bi-check-circle"></i> Source: ' + RelPanelState.sourceIdColumn + ' | Target: ' + RelPanelState.targetIdColumn + '</span>';
+        } else {
+            const propUri = RelPanelState.propertyUri;
+            const configEntry = propUri
+                ? MappingState.config.relationships.find(m => m.property === propUri)
+                : null;
+            if (configEntry?.source_id_column && configEntry?.target_id_column) {
+                statusEl.innerHTML = '<span class="text-warning"><i class="bi bi-exclamation-triangle"></i> Source/Target IDs from saved mapping (verify in Mapping tab)</span>';
+            } else {
+                statusEl.innerHTML = '<span class="text-muted"><i class="bi bi-info-circle"></i> Set SQL + Source & Target ID columns to create mapping</span>';
+            }
+        }
     }
 }
 
@@ -1874,26 +2525,57 @@ function saveEntityPanelMapping() {
     const classUri = document.getElementById('panelEntityClass')?.value;
     const sqlQueryRaw = document.getElementById('epSqlQuery')?.value?.trim();
     const sqlQuery = stripLimitClause(sqlQueryRaw);
-    
-    if (!sqlQuery || !EntityPanelState.idColumn) {
-        showNotification('Please complete the mapping', 'warning');
-        return;
-    }
-    
+
     const classInfo = MappingState.loadedOntology?.classes?.find(c => c.uri === classUri);
     const classLabel = classInfo ? (classInfo.label || classInfo.name) : 'Unknown';
-    
     const existingIndex = MappingState.config.entities.findIndex(m => m.ontology_class === classUri);
-    
+    const existingInConfig = existingIndex >= 0 ? MappingState.config.entities[existingIndex] : null;
+
+    // Fall back to previously saved values when the Mapping tab hasn't been opened yet
+    const effectiveSql = sqlQuery || existingInConfig?.sql_query || '';
+    const effectiveIdCol = EntityPanelState.idColumn || existingInConfig?.id_column || '';
+
+    if (!effectiveSql || !effectiveIdCol) {
+        // No full mapping yet — save only the attribute exclusion state (no warning).
+        const excl = EntityPanelState.excludedAttributes;
+        if (existingInConfig) {
+            if (excl.length > 0) {
+                existingInConfig.excluded_attributes = [...excl];
+            } else {
+                delete existingInConfig.excluded_attributes;
+            }
+        } else {
+            // Lightweight stub — backend skips it for R2RML / gap computation (no sql_query).
+            MappingState.config.entities.push({
+                ontology_class: classUri,
+                ontology_class_label: classLabel,
+                sql_query: '',
+                ...(excl.length > 0 && { excluded_attributes: [...excl] })
+            });
+        }
+        autoSaveMappings();
+        showNotification('Attribute selections applied', 'success', 2000);
+        closeMappingPanel();
+        refreshMappingDesign();
+        return;
+    }
+
+    const filteredAttrMappings = Object.fromEntries(
+        Object.entries(EntityPanelState.attributeMappings).filter(([k]) => !EntityPanelState.excludedAttributes.includes(k))
+    );
     const newMapping = {
         ontology_class: classUri,
         ontology_class_label: classLabel,
-        sql_query: sqlQuery,
-        id_column: EntityPanelState.idColumn,
+        sql_query: effectiveSql,
+        id_column: effectiveIdCol,
         label_column: EntityPanelState.labelColumn,
-        attribute_mappings: {...EntityPanelState.attributeMappings}
+        attribute_mappings: filteredAttrMappings
     };
-    
+    if (existingInConfig?.excluded) newMapping.excluded = existingInConfig.excluded;
+    if (EntityPanelState.excludedAttributes.length > 0) {
+        newMapping.excluded_attributes = [...EntityPanelState.excludedAttributes];
+    }
+
     if (existingIndex >= 0) {
         MappingState.config.entities[existingIndex] = newMapping;
         showNotification(`Mapping for "${classLabel}" updated`, 'success', 2000);
@@ -1901,7 +2583,7 @@ function saveEntityPanelMapping() {
         MappingState.config.entities.push(newMapping);
         showNotification(`Mapping created for "${classLabel}"`, 'success', 2000);
     }
-    
+
     autoSaveMappings();
     closeMappingPanel();
     refreshMappingDesign();
@@ -1911,46 +2593,77 @@ function saveRelPanelMapping() {
     const propertyUri = document.getElementById('panelPropertyUri')?.value;
     const sqlQueryRaw = document.getElementById('rpSqlQuery')?.value?.trim();
     const sqlQuery = stripLimitClause(sqlQueryRaw);
-    
-    if (!sqlQuery || !RelPanelState.sourceIdColumn || !RelPanelState.targetIdColumn) {
-        showNotification('Please complete the mapping', 'warning');
+
+    const existingIndex = MappingState.config.relationships.findIndex(m => m.property === propertyUri);
+    const existingInConfig = existingIndex >= 0 ? MappingState.config.relationships[existingIndex] : null;
+
+    // Fall back to previously saved values when the Mapping tab hasn't been opened yet
+    const effectiveSql = sqlQuery || existingInConfig?.sql_query || '';
+    const effectiveSrc = RelPanelState.sourceIdColumn || existingInConfig?.source_id_column || '';
+    const effectiveTgt = RelPanelState.targetIdColumn || existingInConfig?.target_id_column || '';
+
+    if (!effectiveSql || !effectiveSrc || !effectiveTgt) {
+        // No full mapping yet — save only the attribute exclusion state (no warning).
+        const excl = RelPanelState.excludedAttributes;
+        if (existingInConfig) {
+            if (excl.length > 0) {
+                existingInConfig.excluded_attributes = [...excl];
+            } else {
+                delete existingInConfig.excluded_attributes;
+            }
+        } else {
+            MappingState.config.relationships.push({
+                property: propertyUri,
+                sql_query: '',
+                ...(excl.length > 0 && { excluded_attributes: [...excl] })
+            });
+        }
+        autoSaveMappings();
+        showNotification('Attribute selections applied', 'success', 2000);
+        closeMappingPanel();
+        refreshMappingDesign();
         return;
     }
-    
+
     const propertyInfo = MappingState.loadedOntology?.properties?.find(p => p.uri === propertyUri);
     const propertyLabel = propertyInfo ? (propertyInfo.label || propertyInfo.name) : 'Unknown';
-    
+
     const sourceEntityId = propertyInfo?.sourceEntityId || propertyInfo?.domain || propertyInfo?.source || '';
     const targetEntityId = propertyInfo?.targetEntityId || propertyInfo?.range || propertyInfo?.target || '';
-    
-    const sourceClass = MappingState.loadedOntology?.classes?.find(c => 
+
+    const sourceClass = MappingState.loadedOntology?.classes?.find(c =>
         c.id === sourceEntityId || c.uri === sourceEntityId || c.name === sourceEntityId || c.localName === sourceEntityId
     );
-    const targetClass = MappingState.loadedOntology?.classes?.find(c => 
+    const targetClass = MappingState.loadedOntology?.classes?.find(c =>
         c.id === targetEntityId || c.uri === targetEntityId || c.name === targetEntityId || c.localName === targetEntityId
     );
-    
+
     const sourceClassLabel = sourceClass ? (sourceClass.label || sourceClass.name || sourceClass.localName || '') : '';
     const targetClassLabel = targetClass ? (targetClass.label || targetClass.name || targetClass.localName || '') : '';
     const sourceClassUri = sourceClass?.uri || '';
     const targetClassUri = targetClass?.uri || '';
-    
-    const existingIndex = MappingState.config.relationships.findIndex(m => m.property === propertyUri);
-    
+
+    const filteredRelAttrMappings = Object.fromEntries(
+        Object.entries(RelPanelState.attributeMappings).filter(([k]) => !RelPanelState.excludedAttributes.includes(k))
+    );
     const newMapping = {
         property: propertyUri,
         property_label: propertyLabel,
-        sql_query: sqlQuery,
-        source_id_column: RelPanelState.sourceIdColumn,
-        target_id_column: RelPanelState.targetIdColumn,
+        sql_query: effectiveSql,
+        source_id_column: effectiveSrc,
+        target_id_column: effectiveTgt,
         source_class: sourceClassUri,
         source_class_label: sourceClassLabel,
         target_class: targetClassUri,
         target_class_label: targetClassLabel,
-        attribute_mappings: {...RelPanelState.attributeMappings},
+        attribute_mappings: filteredRelAttrMappings,
         direction: propertyInfo?.direction || 'forward'
     };
-    
+    if (existingInConfig?.excluded) newMapping.excluded = existingInConfig.excluded;
+    if (RelPanelState.excludedAttributes.length > 0) {
+        newMapping.excluded_attributes = [...RelPanelState.excludedAttributes];
+    }
+
     if (existingIndex >= 0) {
         MappingState.config.relationships[existingIndex] = newMapping;
         showNotification(`Mapping for "${propertyLabel}" updated`, 'success', 2000);
@@ -1958,10 +2671,268 @@ function saveRelPanelMapping() {
         MappingState.config.relationships.push(newMapping);
         showNotification(`Mapping created for "${propertyLabel}"`, 'success', 2000);
     }
-    
+
     autoSaveMappings();
     closeMappingPanel();
     refreshMappingDesign();
+}
+
+// ==========================================================================
+// ATTRIBUTE EXCLUSION PERSISTENCE HELPERS
+// ==========================================================================
+
+/**
+ * Persist EntityPanelState.excludedAttributes into MappingState.config and auto-save.
+ * Works whether or not the entity has a full mapping (stub entry is created if needed).
+ */
+function _syncEntityAttrExclusions(classUri) {
+    if (!classUri) return;
+    const existing = MappingState.config.entities.find(m => m.ontology_class === classUri);
+    if (!existing) return;  // no mapping yet — exclusions live in EntityPanelState until Save
+    const excl = [...EntityPanelState.excludedAttributes];
+    if (excl.length > 0) {
+        existing.excluded_attributes = excl;
+    } else {
+        delete existing.excluded_attributes;
+    }
+    autoSaveMappings();
+}
+
+/**
+ * Persist RelPanelState.excludedAttributes into MappingState.config and auto-save.
+ */
+function _syncRelAttrExclusions(propertyUri) {
+    if (!propertyUri) return;
+    const existing = MappingState.config.relationships.find(m => m.property === propertyUri);
+    if (!existing) return;  // no mapping yet — exclusions live in RelPanelState until Save
+    const excl = [...RelPanelState.excludedAttributes];
+    if (excl.length > 0) {
+        existing.excluded_attributes = excl;
+    } else {
+        delete existing.excluded_attributes;
+    }
+    autoSaveMappings();
+}
+
+/**
+ * Persist column assignment state (id/label/attribute→column) from EntityPanelState
+ * into the matching MappingState.config entry and auto-save.
+ * Only operates when an existing mapping is present (won't create stubs).
+ */
+function _syncEntityColAssignments() {
+    const classUri = document.getElementById('panelEntityClass')?.value;
+    if (!classUri) return;
+    const existing = MappingState.config.entities.find(m => m.ontology_class === classUri);
+    if (!existing) return;
+    if (EntityPanelState.idColumn) existing.id_column = EntityPanelState.idColumn;
+    if (EntityPanelState.labelColumn !== undefined) existing.label_column = EntityPanelState.labelColumn || '';
+    const excl = EntityPanelState.excludedAttributes || [];
+    existing.attribute_mappings = Object.fromEntries(
+        Object.entries(EntityPanelState.attributeMappings).filter(([k]) => !excl.includes(k))
+    );
+    autoSaveMappings();
+}
+
+/**
+ * Persist column assignment state from RelPanelState into the matching config entry and auto-save.
+ */
+function _syncRelColAssignments() {
+    const propertyUri = RelPanelState.propertyUri;
+    if (!propertyUri) return;
+    const existing = MappingState.config.relationships.find(m => m.property === propertyUri);
+    if (!existing) return;
+    if (RelPanelState.sourceIdColumn) existing.source_id_column = RelPanelState.sourceIdColumn;
+    if (RelPanelState.targetIdColumn) existing.target_id_column = RelPanelState.targetIdColumn;
+    const excl = RelPanelState.excludedAttributes || [];
+    existing.attribute_mappings = Object.fromEntries(
+        Object.entries(RelPanelState.attributeMappings).filter(([k]) => !excl.includes(k))
+    );
+    autoSaveMappings();
+}
+
+// ==========================================================================
+// SELECT / UNSELECT ALL ATTRIBUTES
+// ==========================================================================
+
+/**
+ * Update the entity-panel toggle-all button label to reflect current state.
+ * - All included  → button offers "Exclude all"
+ * - Any excluded  → button offers "Include all"
+ */
+function _updateEntityAttrToggleBtn() {
+    const btn = document.getElementById('epAttrToggleAllBtn');
+    if (!btn) return;
+    const anyExcluded = EntityPanelState.excludedAttributes.length > 0;
+    if (anyExcluded) {
+        btn.innerHTML = '<i class="bi bi-check2-all me-1"></i>Include all';
+        btn.title = 'Include all attributes in the mapping';
+    } else {
+        btn.innerHTML = '<i class="bi bi-x-square me-1"></i>Exclude all';
+        btn.title = 'Exclude all attributes from the mapping';
+    }
+}
+
+/**
+ * Toggle all entity attributes: include all if any are excluded, otherwise exclude all.
+ */
+function toggleAllEntityAttrs() {
+    const cbs = document.querySelectorAll('.ep-attr-include-cb');
+    if (!cbs.length) return;
+    markMappingPanelDirty();
+    const includeAll = EntityPanelState.excludedAttributes.length > 0;
+    cbs.forEach(cb => {
+        const attrName = cb.dataset.attr;
+        const row = cb.closest('tr');
+        const nameCell = row?.querySelector('td:nth-child(2)');
+        const mappedCell = row?.querySelector('td:nth-child(3)');
+        if (includeAll) {
+            cb.checked = true;
+            EntityPanelState.excludedAttributes = EntityPanelState.excludedAttributes.filter(a => a !== attrName);
+            const isMapped = !!EntityPanelState.attributeMappings[attrName];
+            if (nameCell) nameCell.innerHTML = attrName;
+            if (mappedCell) mappedCell.innerHTML = isMapped
+                ? '<i class="bi bi-check-circle-fill text-success"></i>'
+                : '<i class="bi bi-x-circle-fill text-danger"></i>';
+        } else {
+            cb.checked = false;
+            if (!EntityPanelState.excludedAttributes.includes(attrName)) {
+                EntityPanelState.excludedAttributes.push(attrName);
+            }
+            if (nameCell) nameCell.innerHTML = `<span class="text-muted text-decoration-line-through">${attrName}</span>`;
+            if (mappedCell) mappedCell.innerHTML = '<i class="bi bi-dash text-muted" title="Excluded from mapping"></i>';
+        }
+    });
+    _updateEntityAttrToggleBtn();
+    const classUri = document.getElementById('panelEntityClass')?.value;
+    _syncEntityAttrExclusions(classUri);
+    const msg = includeAll ? 'All attributes included' : `${cbs.length} attribute(s) excluded`;
+    showNotification(msg, 'info', 2000);
+}
+
+/**
+ * Update the relationship-panel toggle-all button label to reflect current state.
+ */
+function _updateRelAttrToggleBtn() {
+    const btn = document.getElementById('rpAttrToggleAllBtn');
+    if (!btn) return;
+    const anyExcluded = RelPanelState.excludedAttributes.length > 0;
+    if (anyExcluded) {
+        btn.innerHTML = '<i class="bi bi-check2-all me-1"></i>Include all';
+        btn.title = 'Include all attributes in the mapping';
+    } else {
+        btn.innerHTML = '<i class="bi bi-x-square me-1"></i>Exclude all';
+        btn.title = 'Exclude all attributes from the mapping';
+    }
+}
+
+/**
+ * Toggle all relationship attributes: include all if any are excluded, otherwise exclude all.
+ */
+function toggleAllRelAttrs() {
+    const cbs = document.querySelectorAll('.rp-attr-include-cb');
+    if (!cbs.length) return;
+    markMappingPanelDirty();
+    const includeAll = RelPanelState.excludedAttributes.length > 0;
+    cbs.forEach(cb => {
+        const attrName = cb.dataset.attr;
+        const row = cb.closest('tr');
+        const nameCell = row?.querySelector('td:nth-child(2)');
+        const mappedCell = row?.querySelector('td:nth-child(3)');
+        if (includeAll) {
+            cb.checked = true;
+            RelPanelState.excludedAttributes = RelPanelState.excludedAttributes.filter(a => a !== attrName);
+            const isMapped = !!RelPanelState.attributeMappings[attrName];
+            if (nameCell) nameCell.innerHTML = attrName;
+            if (mappedCell) mappedCell.innerHTML = isMapped
+                ? '<i class="bi bi-check-circle-fill text-success"></i>'
+                : '<i class="bi bi-x-circle-fill text-danger"></i>';
+        } else {
+            cb.checked = false;
+            if (!RelPanelState.excludedAttributes.includes(attrName)) {
+                RelPanelState.excludedAttributes.push(attrName);
+            }
+            if (nameCell) nameCell.innerHTML = `<span class="text-muted text-decoration-line-through">${attrName}</span>`;
+            if (mappedCell) mappedCell.innerHTML = '<i class="bi bi-dash text-muted" title="Excluded from mapping"></i>';
+        }
+    });
+    _updateRelAttrToggleBtn();
+    const propertyUri = RelPanelState.propertyUri;
+    _syncRelAttrExclusions(propertyUri);
+    const msg = includeAll ? 'All attributes included' : `${cbs.length} attribute(s) excluded`;
+    showNotification(msg, 'info', 2000);
+}
+
+// ==========================================================================
+// AUTO-EXCLUDE UNMAPPED ATTRIBUTES
+// ==========================================================================
+
+/**
+ * Exclude all entity attributes that have no column assigned in the current session.
+ * Mapped attributes (green checkmark) are left untouched.
+ */
+function autoExcludeUnmappedEntityAttrs() {
+    const attrs = EntityPanelState.attributes || [];
+    let changed = 0;
+    attrs.forEach(a => {
+        const name = a.name || a.localName || '';
+        if (!name) return;
+        const isMapped = !!EntityPanelState.attributeMappings[name];
+        const isAlreadyExcluded = EntityPanelState.excludedAttributes.includes(name);
+        if (!isMapped && !isAlreadyExcluded) {
+            EntityPanelState.excludedAttributes.push(name);
+            const cb = document.querySelector(`.ep-attr-include-cb[data-attr="${CSS.escape(name)}"]`);
+            if (cb) {
+                cb.checked = false;
+                const row = cb.closest('tr');
+                const nameCell = row?.querySelector('td:nth-child(2)');
+                const mappedCell = row?.querySelector('td:nth-child(3)');
+                if (nameCell) nameCell.innerHTML = `<span class="text-muted text-decoration-line-through">${name}</span>`;
+                if (mappedCell) mappedCell.innerHTML = '<i class="bi bi-dash text-muted" title="Excluded from mapping"></i>';
+            }
+            changed++;
+        }
+    });
+    _updateEntityAttrToggleBtn();
+    if (changed > 0) {
+        markMappingPanelDirty();
+        showNotification(`${changed} unmapped attribute(s) excluded`, 'info', 2500);
+    } else {
+        showNotification('No unmapped attributes to exclude', 'info', 2000);
+    }
+}
+
+/**
+ * Exclude all relationship attributes that have no column assigned in the current session.
+ */
+function autoExcludeUnmappedRelAttrs() {
+    const attrs = RelPanelState.attributes || [];
+    let changed = 0;
+    attrs.forEach(a => {
+        const name = a.name || a.localName || '';
+        if (!name) return;
+        const isMapped = !!RelPanelState.attributeMappings[name];
+        const isAlreadyExcluded = RelPanelState.excludedAttributes.includes(name);
+        if (!isMapped && !isAlreadyExcluded) {
+            RelPanelState.excludedAttributes.push(name);
+            const cb = document.querySelector(`.rp-attr-include-cb[data-attr="${CSS.escape(name)}"]`);
+            if (cb) {
+                cb.checked = false;
+                const row = cb.closest('tr');
+                const nameCell = row?.querySelector('td:nth-child(2)');
+                const mappedCell = row?.querySelector('td:nth-child(3)');
+                if (nameCell) nameCell.innerHTML = `<span class="text-muted text-decoration-line-through">${name}</span>`;
+                if (mappedCell) mappedCell.innerHTML = '<i class="bi bi-dash text-muted" title="Excluded from mapping"></i>';
+            }
+            changed++;
+        }
+    });
+    _updateRelAttrToggleBtn();
+    if (changed > 0) {
+        markMappingPanelDirty();
+        showNotification(`${changed} unmapped attribute(s) excluded`, 'info', 2500);
+    } else {
+        showNotification('No unmapped attributes to exclude', 'info', 2000);
+    }
 }
 
 // ==========================================================================
@@ -2139,7 +3110,11 @@ function _buildAgentEntityItem(uri) {
     const lookupUri = uri || currentPanelUri;
     const classInfo = MappingState.loadedOntology?.classes?.find(c => c.uri === lookupUri);
     if (!classInfo) return null;
-    const attributes = (classInfo.dataProperties || []).map(a => a.name || a.localName || a);
+    const existingMapping = MappingState.config.entities.find(m => m.ontology_class === lookupUri);
+    const excluded = new Set(existingMapping?.excluded_attributes || []);
+    const attributes = (classInfo.dataProperties || [])
+        .map(a => a.name || a.localName || a)
+        .filter(a => !excluded.has(a));
     return {
         uri: classInfo.uri,
         name: classInfo.label || classInfo.name || classInfo.localName,
@@ -2209,6 +3184,11 @@ async function _pollSingleTask(taskId) {
 function _saveEntityAgentResult(targetUri, itemName, m) {
     const classInfo = MappingState.loadedOntology?.classes?.find(c => c.uri === targetUri);
     const classLabel = classInfo ? (classInfo.label || classInfo.name) : itemName;
+    const existingEntry = MappingState.config.entities.find(x => x.ontology_class === targetUri);
+    // Preserve excluded_attributes: agent result takes precedence, then existing config.
+    const excl = (m.excluded_attributes && m.excluded_attributes.length > 0)
+        ? m.excluded_attributes
+        : (existingEntry?.excluded_attributes || []);
     const mapping = {
         ontology_class: m.ontology_class || targetUri,
         ontology_class_label: m.class_name || classLabel,
@@ -2217,6 +3197,7 @@ function _saveEntityAgentResult(targetUri, itemName, m) {
         label_column: m.label_column,
         attribute_mappings: m.attribute_mappings || {}
     };
+    if (excl.length > 0) mapping.excluded_attributes = excl;
     const idx = MappingState.config.entities.findIndex(x => x.ontology_class === targetUri);
     if (idx >= 0) MappingState.config.entities[idx] = mapping;
     else MappingState.config.entities.push(mapping);
@@ -2228,6 +3209,10 @@ function _saveEntityAgentResult(targetUri, itemName, m) {
 function _saveRelAgentResult(targetUri, itemName, m) {
     const propInfo = MappingState.loadedOntology?.properties?.find(p => p.uri === targetUri);
     const propLabel = propInfo ? (propInfo.label || propInfo.name) : itemName;
+    const existingEntry = MappingState.config.relationships.find(x => x.property === targetUri);
+    const excl = (m.excluded_attributes && m.excluded_attributes.length > 0)
+        ? m.excluded_attributes
+        : (existingEntry?.excluded_attributes || []);
     const mapping = {
         property: m.property || targetUri,
         property_label: m.property_label || m.property_name || propLabel,
@@ -2241,6 +3226,7 @@ function _saveRelAgentResult(targetUri, itemName, m) {
         attribute_mappings: m.attribute_mappings || {},
         direction: m.direction || propInfo?.direction || 'forward'
     };
+    if (excl.length > 0) mapping.excluded_attributes = excl;
     const idx = MappingState.config.relationships.findIndex(x => x.property === targetUri);
     if (idx >= 0) MappingState.config.relationships[idx] = mapping;
     else MappingState.config.relationships.push(mapping);
@@ -2271,7 +3257,7 @@ async function _pollAndSaveResult(taskId, itemType, targetUri, itemName) {
         );
 
         if (currentPanelUri === targetUri) {
-            closeMappingPanel();
+            closeActiveMappingPanel();
         }
     } catch (error) {
         console.error('[Auto-Map] Poll/save error for ' + itemName + ':', error);
@@ -2346,7 +3332,7 @@ function showMappingMapContextMenu(event, itemData, type, container) {
         </div>
         <div class="mapping-map-context-divider"></div>
         ${!isExcluded ? `
-        <div class="mapping-map-context-item" data-action="auto-assign">
+        <div class="mapping-map-context-item" data-action="auto-assign" data-requires-llm>
             <i class="bi bi-lightning-charge text-primary"></i>
             <span>Auto-Map</span>
         </div>
@@ -2566,10 +3552,21 @@ async function contextMenuAutoAssignEntity(entityData) {
 function contextMenuUnassignEntity(entityData) {
     const uri = entityData.uri;
     const displayName = entityData.label || entityData.name;
-    
+
     const existingIndex = MappingState.config.entities.findIndex(m => m.ontology_class === uri);
     if (existingIndex >= 0) {
-        MappingState.config.entities.splice(existingIndex, 1);
+        const excl = MappingState.config.entities[existingIndex].excluded_attributes;
+        if (excl && excl.length > 0) {
+            // Keep a stub so attribute exclusions survive the unmap.
+            MappingState.config.entities[existingIndex] = {
+                ontology_class: uri,
+                ontology_class_label: MappingState.config.entities[existingIndex].ontology_class_label || '',
+                sql_query: '',
+                excluded_attributes: [...excl]
+            };
+        } else {
+            MappingState.config.entities.splice(existingIndex, 1);
+        }
         showNotification(`Mapping for "${displayName}" removed`, 'success', 2000);
         autoSaveMappings();
         refreshMappingDesign();
@@ -2604,10 +3601,20 @@ async function contextMenuAutoAssignRelationship(relData) {
 function contextMenuUnassignRelationship(relData) {
     const uri = relData.uri;
     const displayName = relData.label || relData.name;
-    
+
     const existingIndex = MappingState.config.relationships.findIndex(m => m.property === uri);
     if (existingIndex >= 0) {
-        MappingState.config.relationships.splice(existingIndex, 1);
+        const excl = MappingState.config.relationships[existingIndex].excluded_attributes;
+        if (excl && excl.length > 0) {
+            MappingState.config.relationships[existingIndex] = {
+                property: uri,
+                property_label: MappingState.config.relationships[existingIndex].property_label || '',
+                sql_query: '',
+                excluded_attributes: [...excl]
+            };
+        } else {
+            MappingState.config.relationships.splice(existingIndex, 1);
+        }
         showNotification(`Mapping for "${displayName}" removed`, 'success', 2000);
         autoSaveMappings();
         refreshMappingDesign();
@@ -2671,11 +3678,195 @@ async function toggleEntityExclusion(uri, excluded, itemType) {
 // Expose globally so the status tab can call it
 window.toggleEntityExclusion = toggleEntityExclusion;
 
+/**
+ * Returns only ObjectProperty entries from an allProperties array,
+ * using the same heuristic as buildMappingGraph().
+ */
+function _filterObjectProperties(allProperties) {
+    return allProperties.filter(prop => {
+        if (prop.type) {
+            return prop.type === 'ObjectProperty' || prop.type === 'owl:ObjectProperty';
+        }
+        if (prop.range) {
+            const range = prop.range.toLowerCase();
+            if (range.startsWith('xsd:') || range.includes('string') || range.includes('integer') ||
+                range.includes('decimal') || range.includes('date') || range.includes('boolean') ||
+                range.includes('float') || range.includes('double') || range.includes('time')) {
+                return false;
+            }
+        }
+        return true;
+    });
+}
+
+/**
+ * Auto-exclude entities and relationships that are noise:
+ *  • Unmapped entities (no sql_query)
+ *  • Orphans / pure-parent entities: not the domain or range of any ObjectProperty
+ *    (they only participate in inheritance — abstract base classes, isolated nodes)
+ * Unmapped ObjectProperties are excluded too.
+ * Already-excluded items are skipped.
+ */
+async function autoExcludeAll() {
+    const classes = MappingState.loadedOntology?.classes || [];
+    const allProperties = MappingState.loadedOntology?.properties || [];
+    const objectProperties = _filterObjectProperties(allProperties);
+
+    // Resolve domain/range references (local-name or full URI) to canonical node names.
+    const validNodeIds = new Set(classes.map(c => c.name || c.localName));
+    const nodeIdByLower = new Map(classes.map(c => [(c.name || c.localName).toLowerCase(), c.name || c.localName]));
+    const resolveNodeId = id => {
+        if (!id) return null;
+        if (validNodeIds.has(id)) return id;
+        const lower = id.toLowerCase();
+        if (nodeIdByLower.has(lower)) return nodeIdByLower.get(lower);
+        const local = id.includes('#') ? id.split('#').pop() : id.includes('/') ? id.split('/').pop() : null;
+        if (local) {
+            if (validNodeIds.has(local)) return local;
+            if (nodeIdByLower.has(local.toLowerCase())) return nodeIdByLower.get(local.toLowerCase());
+        }
+        return null;
+    };
+
+    // Entities that appear in at least one ObjectProperty (as domain OR range).
+    // Entities connected ONLY by inheritance (rdfs:subClassOf) are not counted.
+    const nodesWithRelationships = new Set();
+    objectProperties.forEach(prop => {
+        if (prop.domain && prop.range) {
+            const srcId = resolveNodeId(prop.domain);
+            const tgtId = resolveNodeId(prop.range);
+            if (srcId) nodesWithRelationships.add(srcId);
+            if (tgtId) nodesWithRelationships.add(tgtId);
+        }
+    });
+
+    // Entities to exclude: not already excluded AND not connected via any ObjectProperty.
+    // This covers both pure orphans and inheritance-only entities.
+    const candidateEntityUris = classes
+        .filter(c => !c.excluded && !nodesWithRelationships.has(c.name || c.localName))
+        .map(c => c.uri);
+
+    // Relationships are never auto-excluded.
+    const candidateRelUris = [];
+
+    if (candidateEntityUris.length === 0 && candidateRelUris.length === 0) {
+        showNotification('Nothing to auto-exclude', 'info', 2000);
+        return;
+    }
+
+    try {
+        const requests = [];
+        if (candidateEntityUris.length > 0) {
+            requests.push(fetch('/mapping/exclude', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ uris: candidateEntityUris, excluded: true, item_type: 'entity' }),
+                credentials: 'same-origin'
+            }));
+        }
+        if (candidateRelUris.length > 0) {
+            requests.push(fetch('/mapping/exclude', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ uris: candidateRelUris, excluded: true, item_type: 'relationship' }),
+                credentials: 'same-origin'
+            }));
+        }
+
+        await Promise.all(requests);
+
+        // Stamp local state so the graph refresh reads the right flags immediately.
+        candidateEntityUris.forEach(uri => {
+            let entry = (MappingState.config.entities || []).find(m => m.ontology_class === uri);
+            if (entry) { entry.excluded = true; } else { MappingState.config.entities.push({ ontology_class: uri, excluded: true }); }
+            const cls = classes.find(c => c.uri === uri);
+            if (cls) cls.excluded = true;
+        });
+        candidateRelUris.forEach(uri => {
+            let entry = (MappingState.config.relationships || []).find(m => m.property === uri);
+            if (entry) { entry.excluded = true; } else { MappingState.config.relationships.push({ property: uri, excluded: true }); }
+            const prop = objectProperties.find(p => p.uri === uri);
+            if (prop) prop.excluded = true;
+        });
+
+        const total = candidateEntityUris.length + candidateRelUris.length;
+        showNotification(`Auto-excluded ${total} item(s)`, 'success', 2500);
+        refreshMappingDesign();
+        if (typeof updateMappingCompletionStatus === 'function') updateMappingCompletionStatus();
+    } catch (error) {
+        showNotification('Auto-exclude failed: ' + error.message, 'error');
+    }
+}
+
+/**
+ * Include (un-exclude) all currently excluded entities and relationships in bulk.
+ */
+async function includeAllExcluded() {
+    const classes = MappingState.loadedOntology?.classes || [];
+    const properties = MappingState.loadedOntology?.properties || [];
+
+    const excludedEntityUris = classes.filter(c => c.excluded).map(c => c.uri);
+    const excludedRelUris = properties.filter(p => p.excluded).map(p => p.uri);
+
+    if (excludedEntityUris.length === 0 && excludedRelUris.length === 0) {
+        showNotification('No excluded items to include', 'info', 2000);
+        return;
+    }
+
+    try {
+        const requests = [];
+        if (excludedEntityUris.length > 0) {
+            requests.push(
+                fetch('/mapping/exclude', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ uris: excludedEntityUris, excluded: false, item_type: 'entity' }),
+                    credentials: 'same-origin'
+                })
+            );
+        }
+        if (excludedRelUris.length > 0) {
+            requests.push(
+                fetch('/mapping/exclude', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ uris: excludedRelUris, excluded: false, item_type: 'relationship' }),
+                    credentials: 'same-origin'
+                })
+            );
+        }
+
+        await Promise.all(requests);
+
+        // Update local state
+        excludedEntityUris.forEach(uri => {
+            const entry = (MappingState.config.entities || []).find(m => m.ontology_class === uri);
+            if (entry) delete entry.excluded;
+            const cls = classes.find(c => c.uri === uri);
+            if (cls) delete cls.excluded;
+        });
+        excludedRelUris.forEach(uri => {
+            const entry = (MappingState.config.relationships || []).find(m => m.property === uri);
+            if (entry) delete entry.excluded;
+            const prop = properties.find(p => p.uri === uri);
+            if (prop) delete prop.excluded;
+        });
+
+        const total = excludedEntityUris.length + excludedRelUris.length;
+        showNotification(`${total} excluded item(s) included`, 'success', 2500);
+        refreshMappingDesign();
+        if (typeof updateMappingCompletionStatus === 'function') updateMappingCompletionStatus();
+    } catch (error) {
+        showNotification('Error including excluded items: ' + error.message, 'error');
+    }
+}
+
+window.autoExcludeAll = autoExcludeAll;
+window.includeAllExcluded = includeAllExcluded;
+
 // Initialize panel close/save buttons
 document.addEventListener('DOMContentLoaded', function() {
-    document.getElementById('closePanelBtn')?.addEventListener('click', closeMappingPanel);
-    document.getElementById('cancelPanelBtn')?.addEventListener('click', closeMappingPanel);
-    document.getElementById('savePanelBtn')?.addEventListener('click', savePanelMapping);
+    document.getElementById('closePanelBtn')?.addEventListener('click', guardedCloseMappingPanel);
     document.getElementById('autoMapPanelBtn')?.addEventListener('click', autoMapPanel);
     document.getElementById('resetPanelBtn')?.addEventListener('click', resetPanel);
     

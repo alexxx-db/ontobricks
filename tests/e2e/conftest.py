@@ -1,28 +1,230 @@
 """
 End-to-end test fixtures.
 
-Starts a Uvicorn server on localhost:18765, waits for it to be healthy,
-then provides a Playwright browser and page to each test.
+Starts a Uvicorn server on localhost:18765 backed by **real Databricks
+integration-workspace credentials**, waits for it to be healthy, then
+provides a Playwright browser and page to each test.
 
-NOTE: E2E tests should be run separately from unit tests:
-    .venv/bin/python -m pytest tests/e2e/ -v
+Default behaviour: the conftest mints a workspace OAuth token from the
+Databricks CLI profile named by ``ONTOBRICKS_E2E_PROFILE`` (default
+``fevm-ontobricks-int``) and exports it as ``DATABRICKS_TOKEN``/``HOST``
+into the subprocess. This makes Databricks-dependent pages
+(``/dtwin/``, ``/domain``, ``/resolve``) load instead of hanging.
+
+Escape hatches (env vars):
+
+* ``ONTOBRICKS_E2E_PROFILE`` — which CLI profile to mint a token from.
+* ``ONTOBRICKS_E2E_WAREHOUSE_ID`` — override the int warehouse.
+* ``ONTOBRICKS_E2E_FAKE_CREDS=1`` — disable the auto-mint and fall
+  back to the original fake env (``test.databricks.com`` etc.). Useful
+  for tests that should NOT touch a real workspace; in this mode the
+  6 Databricks-dependent tests will time out.
+* ``DATABRICKS_HOST`` / ``DATABRICKS_TOKEN`` already set in the
+  environment — respected (no auto-mint).
+
+If the CLI cannot mint a token AND ``ONTOBRICKS_E2E_FAKE_CREDS`` is not
+set, the whole suite is skipped with a clear message — better than
+running with fake creds and producing 6 confusing timeouts.
+
+Usage (local mode — in-process uvicorn on localhost:18765):
+    uv run pytest tests/e2e/ -v
+
+Live mode (run the SAME browser flows against a DEPLOYED Databricks App):
+
+    export ONTOBRICKS_LIVE_BASE=https://ontobricks-030-<workspace-id>.aws.databricksapps.com
+    export DATABRICKS_CONFIG_PROFILE=fevm-ontobricks-int
+    uv run pytest tests/e2e/ -v --no-cov
+
+When ``ONTOBRICKS_LIVE_BASE`` is set, no local server starts; the
+Playwright browser context carries an ``Authorization: Bearer <token>``
+header (minted from the CLI profile) so the Databricks Apps gateway
+authenticates every request, and a route handler rewrites bare no-slash
+section routes to their trailing-slash form (the deployed app emits
+trailing-slash redirects to the wrong host). Environment-specific tests
+(assume local admin / no-auth) and durable-mutating tests are auto-skipped;
+opt in to the mutating ones with ``ONTOBRICKS_LIVE_ALLOW_MUTATING=1``
+(CAUTION: the int workspace is shared).
 """
 
 import atexit
 import os
-import signal
-import sys
-import time
+import pathlib
 import socket
 import subprocess
+import sys
+import time
+from typing import Optional
 
 import pytest
+
+from tests.fixtures.databricks_auth import DatabricksAuth
 
 
 E2E_PORT = 18765
 E2E_BASE = f"http://localhost:{E2E_PORT}"
 
+_E2E_DIR = pathlib.Path(__file__).parent.resolve()
+_SCENARIOS_DIR = _E2E_DIR / "scenarios"
+
+
+def _live_base() -> Optional[str]:
+    """Deployed-app base URL for live mode, or None for local mode."""
+    return os.environ.get("ONTOBRICKS_LIVE_BASE") or None
+
+
+def _e2e_explicitly_selected(config) -> bool:
+    """True when the caller clearly asked for the e2e browser suite.
+
+    The e2e suite drives a **session-scoped** ``sync_playwright`` browser
+    whose event loop stays alive in-process for the rest of the session; when
+    it runs alongside the unit/mcp suites it breaks ``pytest-asyncio`` for
+    every async test collected after it. It is a *nightly-only* suite, so the
+    routine command (``uv run pytest -q -m "not scenario"``) must not run it —
+    but a developer who explicitly targets it (``pytest tests/e2e``,
+    ``pytest tests/e2e/scenarios/``, ``-m e2e``, ``-m scenario``, or live
+    mode) must still get it.
+    """
+    if _live_base():
+        return True
+    markexpr = (getattr(config.option, "markexpr", "") or "").strip()
+    # ``-m "not scenario"`` must not count as an explicit e2e/scenario request.
+    if markexpr and not markexpr.startswith("not "):
+        if "e2e" in markexpr or "scenario" in markexpr:
+            return True
+    try:
+        args = list(config.invocation_params.args)
+    except Exception:  # noqa: BLE001 — invocation params are best-effort
+        args = []
+    normalized = [str(a).replace("\\", "/") for a in args]
+    return any("tests/e2e" in a or a.endswith("/e2e") for a in normalized)
+
+
+def _bearer_continue_headers(request_headers: dict, token: str) -> dict:
+    """Re-apply the Apps gateway bearer after Playwright intercepts a request.
+
+    ``page.route`` + ``route.continue_()`` drops ``extra_http_headers``, so
+    document navigations hit the Databricks sign-in page and XHR/API calls
+    come back 401. Copy intercepted headers and set ``Authorization``.
+    """
+    headers = dict(request_headers or {})
+    headers["authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _install_redirect_fix(ctx, base: str, token: str) -> None:
+    """Work around the deployed app's wrong-host ``redirect_slashes`` redirects.
+
+    Behind the Databricks Apps gateway the app does not honour the forwarded
+    host when building its trailing-slash redirects, so a navigation to e.g.
+    ``/ontology`` answers 307 → ``https://localhost:8000/ontology/`` and the
+    browser dies with ``ERR_CONNECTION_REFUSED``. The redirect runs in BOTH
+    directions (some routes are canonical with a slash, some without), so we
+    cannot blindly add or strip one.
+
+    Instead, for each top-level document navigation we resolve the canonical
+    URL server-side with httpx — following redirects but pinning every hop
+    back onto ``base`` — then point the browser straight at the resolved
+    same-origin URL (``continue_`` only allows same-origin rewrites). Every
+    intercepted request (document, XHR, sub-resource) is continued with the
+    gateway bearer, because Playwright drops ``extra_http_headers`` once a
+    route handler is installed.
+    """
+    import httpx
+
+    base = base.rstrip("/")
+
+    def _canonical(url: str) -> str:
+        with httpx.Client(
+            follow_redirects=False,
+            timeout=30.0,
+            headers={"Authorization": f"Bearer {token}"},
+        ) as client:
+            for _ in range(5):
+                resp = client.get(url)
+                # Only the slash redirects (307/308) are wrong-host. Session
+                # redirects (303, e.g. "no domain loaded → /") depend on the
+                # browser's cookies, which this cookieless client lacks.
+                if resp.status_code not in (307, 308):
+                    return url
+                loc = resp.headers.get("location", "")
+                if not loc:
+                    return url
+                # Pin the redirect target (possibly wrong-host) back onto base.
+                if "://" in loc:
+                    path = loc.split("://", 1)[1].split("/", 1)[-1]
+                else:
+                    path = loc.lstrip("/")
+                url = f"{base}/{path}"
+        return url
+
+    def _route(route):
+        req = route.request
+        if req.resource_type != "document" or not req.url.startswith(base):
+            # ``continue_()`` drops extra_http_headers; ``continue_(headers=)``
+            # breaks ``window.fetch`` (TypeError: Failed to fetch). ``fallback()``
+            # sends the request as the context built it, bearer included.
+            route.fallback()
+            return
+        headers = _bearer_continue_headers(req.headers, token)
+        try:
+            resolved = _canonical(req.url)
+        except Exception:  # noqa: BLE001 — best-effort; fall back to the browser
+            route.continue_(headers=headers)
+            return
+        if resolved != req.url:
+            route.continue_(url=resolved, headers=headers)
+        else:
+            route.continue_(headers=headers)
+
+    # Intercept only top-level HTML navigations. A ``**/*`` handler also
+    # sees fetch/XHR; even ``fallback()`` then races ``window.fetch`` on
+    # the Apps gateway (registry domain list → TypeError: Failed to fetch).
+    for pattern in (
+        f"{base}",
+        f"{base}/",
+        f"{base}/ontology",
+        f"{base}/ontology/",
+        f"{base}/ontology?*",
+        f"{base}/domain",
+        f"{base}/domain/",
+        f"{base}/domain?*",
+        f"{base}/mapping",
+        f"{base}/mapping/",
+        f"{base}/mapping?*",
+        f"{base}/dtwin",
+        f"{base}/dtwin/",
+        f"{base}/dtwin/?*",
+        f"{base}/settings",
+        f"{base}/settings/",
+        f"{base}/settings?*",
+        f"{base}/help",
+        f"{base}/help/",
+        f"{base}/registry",
+        f"{base}/registry/",
+        f"{base}/access-denied",
+        f"{base}/review/**",
+    ):
+        ctx.route(pattern, _route)
+
+
+# Default integration workspace settings. Override via the
+# ``ONTOBRICKS_E2E_*`` env vars documented at the top of this module.
+DEFAULT_E2E_PROFILE = "fevm-ontobricks-int"
+DEFAULT_E2E_HOST = "https://fevm-ontobricks-int.cloud.databricks.com"
+DEFAULT_E2E_WAREHOUSE_ID = "fcdf5a06992ad225"
+
 _server_proc = None
+
+
+def _mint_workspace_token(profile: str) -> tuple[str, str] | None:
+    """Mint a workspace OAuth token from the named Databricks CLI profile.
+
+    Returns ``(host, access_token)`` on success, ``None`` if the CLI is
+    not installed, the profile does not exist, or token minting fails.
+    Thin adapter over the shared ``DatabricksAuth`` helper; the host falls
+    back to the well-known int host so the local uvicorn always has one.
+    """
+    return DatabricksAuth.mint_host_and_token(profile, host_fallback=DEFAULT_E2E_HOST)
 
 
 def _port_free(port: int) -> bool:
@@ -53,17 +255,89 @@ def _kill_server():
 
 @pytest.fixture(scope="session", autouse=True)
 def _set_env():
-    """Ensure Databricks env vars are set for the server process."""
-    os.environ.setdefault("DATABRICKS_HOST", "https://test.databricks.com")
-    os.environ.setdefault("DATABRICKS_TOKEN", "test-token")
-    os.environ.setdefault("DATABRICKS_SQL_WAREHOUSE_ID", "test-warehouse")
+    """Resolve Databricks env vars for the server subprocess.
+
+    Default mode: mint a workspace OAuth token from the Databricks CLI
+    profile named by ``ONTOBRICKS_E2E_PROFILE`` (default
+    ``fevm-ontobricks-int``) and export it as ``DATABRICKS_TOKEN`` /
+    ``DATABRICKS_HOST`` so the local uvicorn talks to the real int
+    workspace.
+
+    Respects any pre-set ``DATABRICKS_HOST``/``DATABRICKS_TOKEN`` (so
+    CI can pass workspace creds via env). Falls back to fake values
+    only if ``ONTOBRICKS_E2E_FAKE_CREDS=1`` is set. Otherwise, if
+    neither pre-set creds nor a working CLI profile exist, skips the
+    whole suite with a clear message.
+    """
+    if _live_base():
+        # Live mode: talk to a DEPLOYED app via the Databricks Apps gateway.
+        # No local subprocess starts, so there is nothing to configure here
+        # (no DATABRICKS_TOKEN/HOST/SECRET_KEY export, no skip-on-missing
+        # creds). The bearer token is minted lazily by ``_resolve_live_bearer``.
+        return
+
+    fake_only = os.environ.get("ONTOBRICKS_E2E_FAKE_CREDS") == "1"
+
+    # Always set SECRET_KEY.
     os.environ.setdefault("SECRET_KEY", "test-secret-key-e2e")
+
+    if fake_only:
+        os.environ.setdefault("DATABRICKS_HOST", "https://test.databricks.com")
+        os.environ.setdefault("DATABRICKS_TOKEN", "test-token")
+        os.environ.setdefault("DATABRICKS_SQL_WAREHOUSE_ID", "test-warehouse")
+        return
+
+    # If the caller already exported real creds, respect them.
+    have_host = bool(os.environ.get("DATABRICKS_HOST"))
+    have_token = bool(os.environ.get("DATABRICKS_TOKEN"))
+    if have_host and have_token:
+        os.environ.setdefault(
+            "DATABRICKS_SQL_WAREHOUSE_ID",
+            os.environ.get(
+                "ONTOBRICKS_E2E_WAREHOUSE_ID", DEFAULT_E2E_WAREHOUSE_ID
+            ),
+        )
+        return
+
+    # Auto-mint from the configured profile.
+    profile = os.environ.get("ONTOBRICKS_E2E_PROFILE", DEFAULT_E2E_PROFILE)
+    minted = _mint_workspace_token(profile)
+    if minted is None:
+        pytest.skip(
+            f"E2E suite needs real Databricks creds. Either:\n"
+            f"  - run `databricks auth login --profile {profile} "
+            f"--host {DEFAULT_E2E_HOST}` and retry, or\n"
+            f"  - export DATABRICKS_HOST + DATABRICKS_TOKEN explicitly, "
+            f"or\n"
+            f"  - set ONTOBRICKS_E2E_FAKE_CREDS=1 to use fake values "
+            f"(note: 6 Databricks-dependent tests will time out)."
+        )
+
+    host, token = minted
+    os.environ["DATABRICKS_HOST"] = host
+    os.environ["DATABRICKS_TOKEN"] = token
+    os.environ.setdefault(
+        "DATABRICKS_SQL_WAREHOUSE_ID",
+        os.environ.get(
+            "ONTOBRICKS_E2E_WAREHOUSE_ID", DEFAULT_E2E_WAREHOUSE_ID
+        ),
+    )
 
 
 @pytest.fixture(scope="session")
 def live_server(_set_env):
-    """Start OntoBricks in a subprocess to isolate from test process env changes."""
+    """Base URL the browser points at.
+
+    Live mode (``ONTOBRICKS_LIVE_BASE`` set): yield the deployed app URL and
+    start no local server. Local mode: start OntoBricks in a subprocess to
+    isolate it from test-process env changes.
+    """
     global _server_proc
+
+    live = _live_base()
+    if live:
+        yield live.rstrip("/")
+        return
 
     if not _port_free(E2E_PORT):
         pytest.skip(f"Port {E2E_PORT} is already in use -- cannot start test server")
@@ -81,6 +355,12 @@ def live_server(_set_env):
     # the rejection branch.
     env.pop("CSRF_DISABLED", None)
 
+    # Capture stdout/stderr into a session log so startup failures are
+    # debuggable. Path is printed on failure.
+    log_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "_e2e_server.log"
+    )
+    log_fh = open(log_path, "w")
     _server_proc = subprocess.Popen(
         [
             sys.executable,
@@ -95,8 +375,8 @@ def live_server(_set_env):
             "warning",
         ],
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
     )
     atexit.register(_kill_server)
 
@@ -104,7 +384,12 @@ def live_server(_set_env):
         _wait_for_server(E2E_PORT)
     except RuntimeError:
         _kill_server()
-        pytest.fail("Failed to start test server")
+        log_fh.close()
+        with open(log_path) as f:
+            tail = f.read()[-4000:]
+        pytest.fail(
+            f"Failed to start test server. uvicorn log tail:\n{tail}"
+        )
 
     yield E2E_BASE
     _kill_server()
@@ -122,12 +407,200 @@ def browser_instance():
     pw.stop()
 
 
+# Apps gateway OAuth tokens die in ~1h. Remint well before that so a
+# 309-test live e2e run does not start landing on Databricks Sign-In.
+# Force-refresh: the CLI cache can keep serving a token the gateway already
+# rejects; ``--force-refresh`` asks for a new one.
+_LIVE_BEARER_TTL_S = 12 * 60
+_live_bearer_state: dict = {"token": None, "mono": 0.0}
+
+
+def _resolve_live_bearer() -> Optional[str]:
+    """Workspace bearer for live mode; ``None`` in local / loopback mode.
+
+    Profile precedence matches the live_integration suite —
+    ``DATABRICKS_CONFIG_PROFILE`` first, then ``ONTOBRICKS_E2E_PROFILE``,
+    then the int default — so a single env var configures both suites.
+    Cached for ``_LIVE_BEARER_TTL_S`` so every ``page`` fixture does not
+    shell out to the CLI, then reminted so long campaigns stay authenticated.
+    """
+    if not _live_base():
+        return None
+    from tests.e2e.scenarios._harness import needs_apps_gateway_token
+
+    if not needs_apps_gateway_token(_live_base()):
+        return None
+    now = time.monotonic()
+    cached = _live_bearer_state["token"]
+    if cached and (now - _live_bearer_state["mono"]) < _LIVE_BEARER_TTL_S:
+        return cached
+    profile = os.environ.get("DATABRICKS_CONFIG_PROFILE") or os.environ.get(
+        "ONTOBRICKS_E2E_PROFILE", DEFAULT_E2E_PROFILE
+    )
+    had_cached = bool(cached)
+    token = DatabricksAuth.mint_token(profile, force_refresh=had_cached)
+    if not token:
+        pytest.skip(
+            "Live e2e needs a Databricks token. Run "
+            f"`databricks auth login --profile {profile}` and retry."
+        )
+    _live_bearer_state["token"] = token
+    _live_bearer_state["mono"] = now
+    return token
+
+
+@pytest.fixture(scope="session")
+def _live_bearer() -> Optional[str]:
+    """Session probe token. Page fixtures remint via ``_resolve_live_bearer``."""
+    return _resolve_live_bearer()
+
+
+# Tests that assume the LOCAL admin/no-auth server (or a local host / locally
+# synced files) and would misbehave against the deployed app + gateway —
+# always skipped in live mode.
+_LIVE_SKIP_ENV_SPECIFIC = (
+    "settings/test_settings_flows.py::TestSettingsPage::test_host_display",
+    "settings/test_write_flows.py::TestSettingsSaveSessionOnly",
+    "security/test_permissions_flows.py::TestPermissionMiddlewareShape"
+    "::test_settings_page_is_reachable_for_admin",
+    # Help docs are served from the synced docs/ dir. A bare README.md
+    # sync.exclude used to drop docs/README.md (Overview 404). That is
+    # now `/README.md` (root only). Keep these skipped against a live
+    # instance until that instance has been redeployed with the fix.
+    "help/test_help_modal_flows.py::TestHelpDocsApi::test_help_doc_fetch_round_trip",
+    "help/test_help_modal_flows.py::TestHelpDocsApi::test_all_catalogued_docs_return_200",
+    # The Apps gateway rejects the path-traversal URL with 400 before the app's
+    # 404 handler runs — still rejected, just a different status code.
+    "help/test_help_modal_flows.py::TestHelpDocsApi::test_help_image_bad_name_is_rejected",
+)
+
+# Tests that perform DURABLE writes to the shared int registry — skipped in
+# live mode unless ONTOBRICKS_LIVE_ALLOW_MUTATING=1.
+_LIVE_SKIP_MUTATING = (
+    "settings/test_write_flows.py::TestSettingsSaveRouteContracts",
+    "domain/test_domain_api_flows.py::TestDomainWriteEndpoints"
+    "::test_design_view_create_contract",
+    "domain/test_domain_api_flows.py::TestDomainWriteEndpoints"
+    "::test_design_view_save_current_contract",
+)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Tag / gate the e2e browser suite.
+
+    Two responsibilities:
+
+    1. **Nightly-only isolation** — tag browser e2e tests with the ``e2e``
+       marker and, unless the suite is explicitly targeted, skip **every**
+       test under ``tests/e2e/`` (including ``tests/e2e/scenarios/``).
+       ``test_full_lifecycle.py`` uses the session-scoped Playwright loop too;
+       leaving scenarios un-gated poisons ``pytest-asyncio`` for MCP/API tests
+       collected later in a bare ``pytest -q`` run.
+    2. **Live-mode gating** — when ``ONTOBRICKS_LIVE_BASE`` is set, skip
+       environment-specific flows always and durable-mutating flows unless the
+       caller opts in with ``ONTOBRICKS_LIVE_ALLOW_MUTATING=1``.
+
+    A sub-directory ``conftest`` hook still receives the *whole* session's
+    item list, so we filter to items under this directory first.
+    """
+    targeted = _e2e_explicitly_selected(config)
+    skip_nightly = pytest.mark.skip(
+        reason="e2e browser suite is nightly-only; run it explicitly with "
+        "`uv run pytest tests/e2e` or `-m scenario` (skipped in routine runs "
+        "so the session-scoped Playwright loop can't break pytest-asyncio)."
+    )
+    for item in items:
+        item_path = pathlib.Path(
+            str(getattr(item, "path", item.fspath))
+        ).resolve()
+        under_e2e = _E2E_DIR in item_path.parents or item_path == _E2E_DIR
+        under_scenarios = _SCENARIOS_DIR in item_path.parents
+        if under_e2e:
+            if not under_scenarios:
+                item.add_marker(pytest.mark.e2e)
+            if not targeted:
+                item.add_marker(skip_nightly)
+
+    if not _live_base():
+        return
+    if os.environ.get("ONTOBRICKS_LIVE_NO_SKIP") == "1":
+        return
+    allow_mut = os.environ.get("ONTOBRICKS_LIVE_ALLOW_MUTATING") == "1"
+    skip_env = pytest.mark.skip(
+        reason="live mode: ENV-SPECIFIC (assumes local admin/no-auth host)"
+    )
+    skip_mut = pytest.mark.skip(
+        reason="live mode: MUTATES shared int env; set "
+        "ONTOBRICKS_LIVE_ALLOW_MUTATING=1 to run"
+    )
+    for item in items:
+        nid = str(item.nodeid).replace("\\", "/")
+        if any(s in nid for s in _LIVE_SKIP_ENV_SPECIFIC):
+            item.add_marker(skip_env)
+        elif not allow_mut and any(s in nid for s in _LIVE_SKIP_MUTATING):
+            item.add_marker(skip_mut)
+
+
+def _seed_loaded_workspace(pg, base: str) -> None:
+    """Give the session a named domain so workspace HTML does not 303 to Home.
+
+    ``home_redirect_if_unloaded`` sends ``/ontology``, ``/mapping``,
+    ``/domain``, and ``/dtwin`` to ``/`` when the session is still the
+    ``NewDomain`` placeholder. Live Apps contexts start empty, so sidebar
+    and title assertions would otherwise run against the home page.
+    Session-only — not saved to the registry.
+    """
+    import json
+
+    pg.goto(base)
+    pg.wait_for_load_state("domcontentloaded")
+    headers = {"Content-Type": "application/json"}
+    cookies = {c["name"]: c["value"] for c in pg.context.cookies()}
+    if csrf := cookies.get("csrf_token"):
+        headers["X-CSRF-Token"] = csrf
+    resp = pg.context.request.post(
+        f"{base}/domain/info",
+        headers=headers,
+        data=json.dumps(
+            {
+                "name": "ZzE2eLive",
+                "description": "Session-only workspace seed for live e2e",
+            }
+        ),
+    )
+    if resp.status != 200:
+        raise AssertionError(
+            f"live workspace seed failed: {resp.status} {resp.text()[:300]}"
+        )
+    pg.goto(f"{base}/ontology")
+    pg.wait_for_load_state("domcontentloaded")
+    pg.wait_for_function(
+        "() => { const el = document.getElementById('obSubnav');"
+        " return Boolean(el) && !el.classList.contains('d-none'); }"
+    )
+
+
 @pytest.fixture
-def page(browser_instance, live_server):
-    """Provide a fresh browser page pointed at the live server."""
-    ctx = browser_instance.new_context()
+def page(browser_instance, live_server, _live_bearer):
+    """Provide a fresh browser page pointed at the server.
+
+    In live mode the context carries an ``Authorization: Bearer`` header on
+    every request (page nav, sub-resources, and ``page.context.request.*``
+    API calls) and rewrites the deployed app's bad trailing-slash redirects.
+    Local mode is unchanged.
+    """
+    token = _resolve_live_bearer() if _live_bearer else None
+    if token:
+        ctx = browser_instance.new_context(
+            extra_http_headers={"Authorization": f"Bearer {token}"}
+        )
+        _install_redirect_fix(ctx, live_server, token)
+    else:
+        ctx = browser_instance.new_context()
     pg = ctx.new_page()
     pg.base_url = live_server
+    if _live_base():
+        _seed_loaded_workspace(pg, live_server)
     yield pg
     pg.close()
     ctx.close()

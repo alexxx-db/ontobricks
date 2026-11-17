@@ -158,6 +158,19 @@ async function showEntityDetails(entity) {
                 validAttributeNames.add(colName.toLowerCase());
             });
         }
+        // Include all data properties declared on the ontology class so that
+        // attributes present in the graph but not yet in attributeMappings are shown
+        if (entityMapping.dataProperties && entityMapping.dataProperties.length > 0) {
+            entityMapping.dataProperties.forEach(dp => {
+                if (dp.name) validAttributeNames.add(dp.name.toLowerCase());
+                if (dp.localName) validAttributeNames.add(dp.localName.toLowerCase());
+                if (dp.label) validAttributeNames.add(dp.label.toLowerCase());
+                if (dp.uri) {
+                    const localPart = dp.uri.split('#').pop().split('/').pop();
+                    if (localPart) validAttributeNames.add(localPart.toLowerCase());
+                }
+            });
+        }
         // Also add standard names
         validAttributeNames.add('label');
         validAttributeNames.add('name');
@@ -349,6 +362,18 @@ async function showEntityDetails(entity) {
             </div>
         `;
     }
+
+    // Virtual attributes: declared here, computed only when the user asks.
+    const virtualGroups = entityMapping?.virtualAttributes || classInfo?.virtualAttributes || [];
+    if (virtualGroups.length > 0 && typeof renderVirtualAttributeSection === 'function') {
+        const vaCount = virtualGroups.reduce((n, g) => n + ((g.attributes || []).length), 0);
+        html += `
+            <div class="entity-detail-section">
+                <h6><i class="bi bi-magic"></i> Virtual Attributes (${vaCount})</h6>
+                ${renderVirtualAttributeSection(entity.id, virtualGroups)}
+            </div>
+        `;
+    }
     
     // Dashboard section (separate, at the bottom of attributes area)
     if (dashboardUrl) {
@@ -400,6 +425,101 @@ async function showEntityDetails(entity) {
         `;
     }
 
+    // Linked external datasets (Dashboard-style box + preview)
+    const datasets = entityMapping?.datasets
+        || classInfo?.datasets
+        || ((entityMapping?.dataset || classInfo?.dataset)
+            ? [entityMapping?.dataset || classInfo?.dataset]
+            : []);
+    const linkedDatasets = (datasets || []).filter(ds => ds && (ds.fullName || ds.asset));
+    if (linkedDatasets.length) {
+        const anyKey = linkedDatasets.some(ds => ds.key_column);
+        const previewDisabled = anyKey ? '' : 'disabled';
+        const previewTitle = anyKey
+            ? 'Preview up to 10 matching rows per dataset'
+            : 'Key column is not configured — preview unavailable';
+        const previewOnClick = anyKey
+            ? `openDatasetPreviewModal('${escapeHtml(entity.id)}', '${escapeHtml(ontologyTypeName)}', '${escapeHtml(actualIdValue || '')}')`
+            : '';
+        const rowsHtml = linkedDatasets.map(dataset => {
+            const fullName = dataset.fullName
+                || [dataset.catalog, dataset.schema, dataset.asset].filter(Boolean).join('.');
+            const kind = (dataset.type || '').toUpperCase();
+            const kindLabel = kind === 'METRIC_VIEW' ? 'Metric View'
+                : (kind === 'VIEW' ? 'View' : 'Table');
+            return `
+                <div class="entity-detail-item">
+                    <span class="detail-key">${escapeHtml(kindLabel)}</span>
+                    <span class="detail-value"><code>${escapeHtml(fullName)}</code></span>
+                </div>
+                ${dataset.key_column ? `
+                <div class="entity-detail-item">
+                    <span class="detail-key">Key</span>
+                    <span class="detail-value"><code>${escapeHtml(dataset.key_column)}</code></span>
+                </div>` : ''}
+                ${dataset.description ? `
+                <div class="entity-detail-item">
+                    <span class="detail-key">Description</span>
+                    <span class="detail-value">${escapeHtml(dataset.description)}</span>
+                </div>` : ''}`;
+        }).join('');
+        html += `
+            <div class="entity-detail-section">
+                <h6><i class="bi bi-table"></i> Datasets</h6>
+                ${rowsHtml}
+                <div class="entity-detail-item">
+                    <button type="button" onclick="${previewOnClick}"
+                            class="btn btn-sm btn-outline-info w-100" ${previewDisabled}
+                            title="${escapeHtml(previewTitle)}">
+                        <i class="bi bi-table me-1"></i>Preview rows
+                    </button>
+                </div>
+            </div>
+        `;
+    }
+
+    // Unity Catalog function actions (each takes the entity ID as its only argument)
+    const actions = entityMapping?.actions || classInfo?.actions || [];
+    if (actions.length > 0) {
+        const buttons = actions.map(action => {
+            const isJob = typeof _entityActionIsJob === 'function' && _entityActionIsJob(action);
+            const fullName = action.fullName
+                || (isJob ? ('job:' + action.job_id) : [action.catalog, action.schema, action.function].filter(Boolean).join('.'));
+            if (!fullName) return '';
+            const label = action.job_name || action.function || fullName;
+            const title = action.description || `Run ${fullName}`;
+            const description = action.description || '';
+            const icon = isJob ? 'bi bi-play-circle' : 'bi bi-lightning-charge';
+            return `
+                <div class="entity-detail-item">
+                    <button type="button"
+                            onclick="openEntityActionModal('${escapeHtml(entity.id)}', '${escapeHtml(fullName)}', '${escapeHtml(label)}', '${escapeHtml(description)}')"
+                            class="btn btn-sm btn-outline-primary w-100"
+                            title="${escapeHtml(title)}">
+                        <i class="${icon} me-1"></i>${escapeHtml(label)}
+                    </button>
+                </div>
+            `;
+        }).join('');
+        html += `
+            <div class="entity-detail-section">
+                <h6><i class="bi bi-lightning-charge"></i> Actions</h6>
+                ${buttons}
+            </div>
+        `;
+    }
+
+    // SWRL business rules declared on the class — applied to this entity only
+    const businessRules = classInfo?.businessRules || [];
+    if (businessRules.length > 0 && typeof renderBusinessRuleSection === 'function') {
+        html += `
+            <div class="entity-detail-section">
+                <h6><i class="bi bi-diagram-3"></i> Inference rules</h6>
+                ${renderBusinessRuleSection(entity.id, businessRules)}
+            </div>
+        `;
+    }
+
     // Cross-domain bridges
     const bridges = entityMapping?.bridges || classInfo?.bridges || [];
     if (bridges.length > 0) {
@@ -421,7 +541,7 @@ async function showEntityDetails(entity) {
                     <a href="${escapeHtml(resolveUrl)}" onclick="${onClickSpinner}" class="btn btn-sm btn-outline-primary w-100 text-start" title="${tooltip}">
                         <i class="bi bi-signpost-2 me-1"></i>
                         <span class="fw-semibold">${escapeHtml(bridge.target_class_name || '')}</span>
-                        <small class="text-muted ms-1"><i class="bi bi-folder2-open ms-1 me-1"></i>${escapeHtml(tgtDom)}</small>
+                        <small class="text-muted ms-1"><i class="bi bi-box ms-1 me-1"></i>${escapeHtml(tgtDom)}</small>
                         <i class="bi bi-box-arrow-up-right ms-auto float-end mt-1"></i>
                     </a>
                 </div>

@@ -43,51 +43,57 @@ router = APIRouter(tags=["Help"], prefix="/api/help")
 
 _DOC_CATEGORIES: List[Dict] = [
     {
-        "id": "getting-started",
-        "label": "Getting Started",
+        "id": "start",
+        "label": "Start here",
         "docs": [
             {"slug": "readme", "file": "README.md", "title": "Overview"},
             {
-                "slug": "get-started",
-                "file": "get-started.md",
+                "slug": "getting-started",
+                "file": "getting-started.md",
                 "title": "Get Started",
             },
-            {"slug": "info", "file": "INFO.md", "title": "Project Info"},
+            {"slug": "examples", "file": "examples.md", "title": "Examples"},
         ],
     },
     {
-        "id": "guides",
-        "label": "Guides",
+        "id": "using",
+        "label": "Using OntoBricks",
         "docs": [
             {"slug": "user-guide", "file": "user-guide.md", "title": "User Guide"},
-            {"slug": "examples", "file": "examples.md", "title": "Examples"},
-            {"slug": "features", "file": "features.md", "title": "Features"},
-            {"slug": "product", "file": "product.md", "title": "Product"},
             {
-                "slug": "graphdb-integration",
-                "file": "graphdb-integration.md",
-                "title": "GraphDB Integration",
+                "slug": "advanced-features",
+                "file": "advanced_features.md",
+                "title": "Advanced features",
             },
             {"slug": "mcp", "file": "mcp.md", "title": "MCP"},
         ],
     },
     {
-        "id": "reference-ops",
-        "label": "Reference & Ops",
+        "id": "platform",
+        "label": "Platform",
         "docs": [
+            {"slug": "backend", "file": "backend.md", "title": "Graph backends"},
             {
                 "slug": "architecture",
                 "file": "architecture.md",
                 "title": "Architecture",
             },
             {"slug": "api", "file": "api.md", "title": "API Reference"},
-            {
-                "slug": "data-access",
-                "file": "data-access.md",
-                "title": "Data Access",
-            },
-            {"slug": "development", "file": "development.md", "title": "Development"},
+        ],
+    },
+    {
+        "id": "ops",
+        "label": "Deploy & develop",
+        "docs": [
             {"slug": "deployment", "file": "deployment.md", "title": "Deployment"},
+            {"slug": "development", "file": "development.md", "title": "Development"},
+        ],
+    },
+    {
+        "id": "about",
+        "label": "About",
+        "docs": [
+            {"slug": "product", "file": "product.md", "title": "Product"},
         ],
     },
 ]
@@ -122,16 +128,16 @@ def _docs_dir() -> str:
 def _audit_docs_on_disk() -> None:
     """Log a loud warning at boot if any catalogued doc is missing on disk.
 
-    Prevents the class of bug where ``.databricksignore`` (or any other
-    deploy-time filter) silently drops the ``docs/`` folder and every
-    Help Center entry starts 404'ing in production.
+    Prevents the class of bug where ``databricks.yml`` ``sync.exclude``
+    (or a bare ``README.md`` gitignore pattern) silently drops Help
+    Center files and every ``/api/help/docs/*`` entry 404s in production.
     """
     docs_dir = _docs_dir()
     if not os.path.isdir(docs_dir):
         logger.warning(
             "Help Center docs directory is missing at %s — the deployed "
-            "bundle is likely excluding docs/*.md (check .databricksignore). "
-            "All /api/help/docs/* endpoints will return 404.",
+            "bundle is likely excluding docs/*.md (check databricks.yml "
+            "sync.exclude). All /api/help/docs/* endpoints will return 404.",
             docs_dir,
         )
         return

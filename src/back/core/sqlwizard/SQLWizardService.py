@@ -11,6 +11,7 @@ from typing import Dict, List, Any, Optional, Tuple
 
 from back.core.logging import get_logger
 from back.core.errors import OntoBricksError, ValidationError, InfrastructureError
+from shared.llm_target import build_llm_request
 
 from .models import SchemaContext
 
@@ -262,7 +263,11 @@ class SQLWizardService:
         return {"system": system_instruction, "user": user_message}
 
     def call_llm_endpoint(
-        self, endpoint_name: str, prompt: Dict[str, str], timeout: int = 60
+        self,
+        endpoint_name: str,
+        prompt: Dict[str, str],
+        timeout: int = 60,
+        endpoint_kind: str = "",
     ) -> str:
         """Call the LLM endpoint and get the generated SQL.
 
@@ -283,16 +288,18 @@ class SQLWizardService:
         host = self.client.host.rstrip("/")
         headers = self.client.get_auth_headers()
 
-        url = f"{host}/serving-endpoints/{endpoint_name}/invocations"
-
-        payload = {
-            "messages": [
+        messages = [
                 {"role": "system", "content": prompt["system"]},
                 {"role": "user", "content": prompt["user"]},
-            ],
-            "max_tokens": 1024,
-            "temperature": 0.1,
-        }
+        ]
+        url, payload = build_llm_request(
+            host,
+            endpoint_name,
+            endpoint_kind,
+            messages,
+            max_tokens=1024,
+            temperature=0.1,
+        )
 
         logger.info(
             "[SQLWizard] call_llm_endpoint: POST %s (timeout=%ds)",
@@ -615,7 +622,8 @@ class SQLWizardService:
         token = col_expr.strip().split(".")[-1].strip('`"')
         return token
 
-    def _deduplicate_select_columns(self, sql: str, mapping_type: str = None) -> str:
+    @staticmethod
+    def _deduplicate_select_columns(sql: str, mapping_type: str = None) -> str:
         """Ensure every column in the SELECT list has a unique output name.
 
         - For *entity* queries: guarantees the first column is aliased AS ID
@@ -624,13 +632,16 @@ class SQLWizardService:
           AS source_id and the second AS target_id.
         - For any query: if two columns share the same effective output name,
           the later occurrence(s) get a numeric suffix (e.g. col_2).
+
+        Made static so it can be reused from agents/tools/mapping.py's Auto-Map
+        submission tools without constructing a full SQLWizardService.
         """
-        parsed = self._parse_select_columns(sql)
+        parsed = SQLWizardService._parse_select_columns(sql)
         if parsed is None or len(parsed) != 3:
             return sql
 
         prefix, select_part, rest = parsed
-        columns = self._split_columns(select_part)
+        columns = SQLWizardService._split_columns(select_part)
 
         if not columns:
             return sql
@@ -646,7 +657,7 @@ class SQLWizardService:
         for idx, alias in required.items():
             if idx < len(columns):
                 col = columns[idx]
-                eff = self._effective_name(col)
+                eff = SQLWizardService._effective_name(col)
                 if eff.upper() != alias.upper():
                     # Strip any existing alias first
                     col_stripped = re.sub(
@@ -658,10 +669,10 @@ class SQLWizardService:
         seen = {}  # lowercase name -> count
         deduped = []
         for col in columns:
-            eff = self._effective_name(col).lower()
+            eff = SQLWizardService._effective_name(col).lower()
             if eff in seen:
                 seen[eff] += 1
-                new_alias = f"{self._effective_name(col)}_{seen[eff]}"
+                new_alias = f"{SQLWizardService._effective_name(col)}_{seen[eff]}"
                 col_stripped = re.sub(
                     r"\s+AS\s+\S+\s*$", "", col, flags=re.IGNORECASE
                 ).strip()
@@ -724,6 +735,7 @@ class SQLWizardService:
         mapping_type: str = None,
         catalog: str = None,
         schema: str = None,
+        endpoint_kind: str = "",
     ) -> Dict[str, Any]:
         """Full pipeline: generate and validate SQL from natural language.
 
@@ -736,6 +748,7 @@ class SQLWizardService:
             mapping_type: Type of mapping ('entity', 'relationship', or None for general)
             catalog: (deprecated) Unity Catalog catalog - only used if fetching from UC
             schema: (deprecated) Schema name - only used if fetching from UC
+            endpoint_kind: Saved LLM target kind (serving or AI Gateway)
 
         Returns:
             Dict with generated SQL, validation results, and telemetry
@@ -798,7 +811,9 @@ class SQLWizardService:
             logger.info(
                 "[SQLWizard] generate_sql step 3: call LLM endpoint '%s'", endpoint_name
             )
-            raw_output = self.call_llm_endpoint(endpoint_name, prompt)
+            raw_output = self.call_llm_endpoint(
+                endpoint_name, prompt, endpoint_kind=endpoint_kind
+            )
             logger.debug(
                 "[SQLWizard] generate_sql: raw LLM output (%d chars): %.300s",
                 len(raw_output),

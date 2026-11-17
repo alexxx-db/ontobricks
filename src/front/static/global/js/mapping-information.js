@@ -41,12 +41,12 @@ async function updateMetadataStatus() {
         } else {
             prereqAlert.className = 'alert alert-warning';
             checkIcon.innerHTML = '<i class="bi bi-exclamation-triangle-fill me-2"></i>';
-            checkStatus.innerHTML = '<strong>No data sources loaded</strong> — Data sources are required before creating mappings. Please load data sources first.';
+            checkStatus.innerHTML = '<strong>No data assets loaded</strong> — Data assets are required before creating mappings. Please load data assets first.';
         }
     } catch (e) {
         prereqAlert.className = 'alert alert-danger';
         checkIcon.innerHTML = '<i class="bi bi-x-circle-fill me-2"></i>';
-        checkStatus.textContent = 'Error checking data sources status';
+        checkStatus.textContent = 'Error checking data assets status';
     }
 }
 
@@ -197,52 +197,67 @@ function updateMappingCompletionStatus() {
     const totalClasses = activeClasses.length;
     const totalProperties = activeProperties.length;
     
-    // Count entity mappings that match existing non-excluded ontology classes
-    let mappedClasses = 0;
+    // Build lookup maps (same pattern as Auto-Map page)
+    // Only count entities / relationships that have a real SQL query — stubs
+    // (excluded_attributes only, no sql_query) must not inflate the mapped count.
+    const entityMappings = MappingState.config.entities || [];
+    const relationshipMappings = MappingState.config.relationships || [];
+
+    const assignedEntityUris = new Set(
+        entityMappings.filter(m => m.sql_query).map(m => m.ontology_class || m.class_uri)
+    );
+    const assignedRelUris = new Set(
+        relationshipMappings.filter(m => m.sql_query).map(m => m.property)
+    );
+
+    // Build mappingByClass from ALL config entries (needed for attribute lookup)
     const mappingByClass = {};
-    if (MappingState.config.entities && activeClasses.length > 0) {
-        const classUris = new Set(activeClasses.map(c => c.uri));
-        MappingState.config.entities.forEach(m => {
-            const uri = m.ontology_class || m.class_uri;
-            if (classUris.has(uri)) {
-                mappedClasses++;
-                mappingByClass[uri] = m;
-            }
-        });
-    }
+    entityMappings.forEach(m => {
+        const uri = m.ontology_class || m.class_uri;
+        if (uri) mappingByClass[uri] = m;
+    });
+
+    // Count from the ONTOLOGY side (same direction as Auto-Map) so any URI
+    // mismatch or stub entry can't inflate the denominator.
+    const mappedClasses = activeClasses.filter(c => assignedEntityUris.has(c.uri)).length;
+    const mappedProperties = activeProperties.filter(p => assignedRelUris.has(p.uri)).length;
     
-    // Count relationship mappings that match existing non-excluded ObjectProperties
-    let mappedProperties = 0;
-    if (MappingState.config.relationships && activeProperties.length > 0) {
-        const propUris = new Set(activeProperties.map(p => p.uri));
-        mappedProperties = MappingState.config.relationships.filter(m => 
-            propUris.has(m.property)
-        ).length;
-    }
-    
-    // Count attribute mappings across all mapped non-excluded entities
+    // Count attribute mappings across all mapped non-excluded entities.
+    // Excluded attributes (excluded_attributes in the mapping) are not counted.
     let totalAttributes = 0;
     let mappedAttributes = 0;
+    let excludedAttrCount = 0;
     for (const cls of activeClasses) {
         const dataProps = cls.dataProperties || [];
         if (dataProps.length === 0) continue;
-        totalAttributes += dataProps.length;
         const em = mappingByClass[cls.uri];
-        if (em) {
-            const attrMap = em.attribute_mappings || {};
-            for (const dp of dataProps) {
-                const attrName = dp.name || dp.localName || '';
-                if (attrName && attrMap[attrName]) {
-                    mappedAttributes++;
-                }
-            }
+        const exclAttrs = new Set((em && em.excluded_attributes) || []);
+        excludedAttrCount += exclAttrs.size;
+        const attrMap = (em && em.attribute_mappings) || {};
+        for (const dp of dataProps) {
+            const attrName = dp.name || dp.localName || '';
+            if (!attrName) continue;
+            if (exclAttrs.has(attrName)) continue;   // excluded — skip
+            totalAttributes++;
+            if (attrMap[attrName]) mappedAttributes++;
         }
     }
-    
+
+    // Reusable helper: render "· N excl." badge
+    const _excl = (n) => n > 0
+        ? ` <span class="text-warning-emphasis" title="${n} excluded" style="font-size:0.72rem;">· ${n} excl.</span>`
+        : '';
+
+    // Count excluded entities / relationships for badges
+    const excludedEntityCount = allClasses.filter(c => c.excluded).length;
+    const excludedRelCount = allObjectProperties.filter(p =>
+        p.excluded || excludedClassNames.has(p.domain) || excludedClassNames.has(p.range)
+    ).length;
+
     // Update counts
-    entityCountEl.textContent = `${mappedClasses} / ${totalClasses}`;
-    relationshipCountEl.textContent = `${mappedProperties} / ${totalProperties}`;
-    if (attributeCountEl) attributeCountEl.textContent = `${mappedAttributes} / ${totalAttributes}`;
+    entityCountEl.innerHTML = `${mappedClasses} / ${totalClasses}${_excl(excludedEntityCount)}`;
+    relationshipCountEl.innerHTML = `${mappedProperties} / ${totalProperties}${_excl(excludedRelCount)}`;
+    if (attributeCountEl) attributeCountEl.innerHTML = `${mappedAttributes} / ${totalAttributes}${_excl(excludedAttrCount)}`;
 
     // Draw gauges
     const entityPct = totalClasses > 0 ? (mappedClasses / totalClasses) * 100 : null;
@@ -255,7 +270,7 @@ function updateMappingCompletionStatus() {
     // Populate entity/relationship detail lists
     renderSummaryDetailLists(mappingByClass, allObjectProperties, excludedClassNames);
     
-    // Determine status
+    // Determine status (only included attrs count towards completeness)
     const totalItems = totalClasses + totalProperties + totalAttributes;
     const mappedItems = mappedClasses + mappedProperties + mappedAttributes;
     const entitiesComplete = mappedClasses >= totalClasses;
@@ -308,23 +323,31 @@ function renderSummaryDetailLists(mappingByClass, objectProperties, excludedClas
             const isExcluded = !!cls.excluded;
             const em = mappingByClass[cls.uri];
             const dataProps = cls.dataProperties || [];
+            const exclAttrs = new Set((em && em.excluded_attributes) || []);
+            // Only count included attributes (same logic as gauges)
+            const includedProps = dataProps.filter(dp => {
+                const n = dp.name || dp.localName || '';
+                return n && !exclAttrs.has(n);
+            });
             let attrMapped = 0;
             if (em) {
                 const attrMap = em.attribute_mappings || {};
-                for (const dp of dataProps) {
+                for (const dp of includedProps) {
                     if (attrMap[dp.name || dp.localName || '']) attrMapped++;
                 }
             }
-            const isMapped = !!em;
+            const isMapped = !!(em && em.sql_query);
+            const exclCount = exclAttrs.size;
 
             const cbId = `excludeEntity_${idx}`;
             const checked = isExcluded ? '' : 'checked';
             const checkbox = `<input class="form-check-input exclude-cb" type="checkbox" id="${cbId}" ${checked} data-uri="${cls.uri}" data-type="entity" title="${isExcluded ? 'Include in mapping' : 'Exclude from mapping'}">`;
 
+            const exclBit = exclCount > 0 ? ` <span class="text-warning-emphasis" style="font-size:0.7rem;" title="${exclCount} attr(s) excluded">· ${exclCount} excl.</span>` : '';
             const badge = isExcluded
                 ? '<span class="badge bg-light text-secondary border">excluded</span>'
                 : isMapped
-                    ? `<span class="badge bg-success-subtle text-success">${attrMapped}/${dataProps.length} attr</span>`
+                    ? `<span class="badge bg-success-subtle text-success">${attrMapped}/${includedProps.length} attr${exclBit}</span>`
                     : '<span class="badge bg-secondary-subtle text-secondary">not mapped</span>';
 
             const rowClass = isExcluded ? 'summary-detail-row excluded' : 'summary-detail-row';
@@ -393,95 +416,25 @@ function _bindExcludeCheckboxes(container) {
     });
 }
 
-// Show validation result modal (kept for potential future use)
-function showValidationResult(issues, warnings) {
-    let modalHtml = `
-        <div class="modal fade" id="validationResultModal" tabindex="-1">
-            <div class="modal-dialog">
-                <div class="modal-content">
-                    <div class="modal-header">
-                        <h5 class="modal-title">
-                            <i class="bi bi-x-circle text-danger"></i> Validation Incomplete
-                        </h5>
-                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-                    </div>
-                    <div class="modal-body">
-                        <div class="alert alert-danger">
-                            <h6><i class="bi bi-exclamation-triangle"></i> Issues Found</h6>
-                            <ul class="mb-0">
-                                ${issues.map(i => `<li>${i}</li>`).join('')}
-                            </ul>
-                        </div>
-                        <p class="text-muted small mb-0">
-                            <i class="bi bi-lightbulb"></i> Complete all mappings before validating.
-                        </p>
-                    </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    `;
-    
-    const existingModal = document.getElementById('validationResultModal');
-    if (existingModal) existingModal.remove();
-    
-    document.body.insertAdjacentHTML('beforeend', modalHtml);
-    const modal = new bootstrap.Modal(document.getElementById('validationResultModal'));
-    modal.show();
-}
-
-// Show validation success modal
-function showValidationSuccessModal(stats) {
-    const modalHtml = `
-        <div class="modal fade" id="validationSuccessModal" tabindex="-1">
-            <div class="modal-dialog">
-                <div class="modal-content">
-                    <div class="modal-header bg-success text-white">
-                        <h5 class="modal-title">
-                            <i class="bi bi-patch-check-fill"></i> Mapping Validated!
-                        </h5>
-                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-                    </div>
-                    <div class="modal-body">
-                        <div class="text-center mb-3">
-                            <i class="bi bi-check-circle-fill text-success" style="font-size: 4rem;"></i>
-                        </div>
-                        <div class="alert alert-success">
-                            <h6><i class="bi bi-check-circle"></i> Success</h6>
-                            <p class="mb-0">All mappings validated. R2RML has been generated.</p>
-                        </div>
-                        <table class="table table-sm">
-                            <tr><td><strong>Entity Mappings:</strong></td><td>${stats?.entities || 0}</td></tr>
-                            <tr><td><strong>Relationship Mappings:</strong></td><td>${stats?.relationships || 0}</td></tr>
-                        </table>
-                    </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-                        <button type="button" class="btn btn-outline-secondary" onclick="SidebarNav.switchTo('r2rml'); bootstrap.Modal.getInstance(document.getElementById('validationSuccessModal')).hide();">
-                            <i class="bi bi-file-earmark-code"></i> View R2RML
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    `;
-    
-    const existingModal = document.getElementById('validationSuccessModal');
-    if (existingModal) existingModal.remove();
-    
-    document.body.insertAdjacentHTML('beforeend', modalHtml);
-    const modal = new bootstrap.Modal(document.getElementById('validationSuccessModal'));
-    modal.show();
-}
-
 // Reset all mappings
 async function confirmResetMappings() {
+    // View / viewer / lock mode: CSS already greys the button; refuse here
+    // so a synthetic click or a race before the body class lands cannot wipe
+    // mappings on a non-editable version.
+    if (window.OB && typeof window.OB.canEditOntology === 'function'
+            && !window.OB.canEditOntology()) {
+        if (typeof showNotification === 'function') {
+            showNotification(
+                'Unmap all is unavailable — this version is read-only.',
+                'warning'
+            );
+        }
+        return;
+    }
     const confirmed = await showConfirmDialog({
-        title: 'Reset All Mappings',
+        title: 'Unmap All',
         message: 'This will delete <strong>all entity and relationship mappings</strong>.<br><br>Are you sure you want to continue?',
-        confirmText: 'Reset All',
+        confirmText: 'Unmap all',
         confirmClass: 'btn-danger',
         icon: 'exclamation-triangle'
     });
@@ -491,16 +444,29 @@ async function confirmResetMappings() {
 }
 
 async function resetAllMappings() {
-    const btn = document.getElementById('resetMappingsBtn');
-    const originalHTML = btn.innerHTML;
-    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
-    btn.disabled = true;
+    // The button exists on both Mapping → General and Mapping → Studio;
+    // target whichever one is currently rendered for the spinner.
+    const btn = document.getElementById('resetMappingsBtn')
+        || document.getElementById('resetMappingsDesignBtn');
+    const originalHTML = btn ? btn.innerHTML : '';
+    if (btn) {
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+        btn.disabled = true;
+    }
     
     try {
         MappingState.config = {
             entities: [],
             relationships: []
         };
+
+        // Re-stamp excluded flags so the ontology objects reflect the now-empty
+        // mapping config.  Without this the designer still shows previously
+        // excluded classes/properties as excluded because the flags live on the
+        // MappingState.loadedOntology objects and are only cleared by this call.
+        if (typeof _stampExcludedFlags === 'function') {
+            _stampExcludedFlags();
+        }
         
         await fetch('/mapping/save', {
             method: 'POST',
@@ -529,8 +495,10 @@ async function resetAllMappings() {
         console.error('Error resetting:', error);
         showNotification('Error: ' + error.message, 'error');
     } finally {
-        btn.innerHTML = originalHTML;
-        btn.disabled = false;
+        if (btn) {
+            btn.innerHTML = originalHTML;
+            btn.disabled = false;
+        }
     }
 }
 
@@ -843,11 +811,16 @@ async function exportR2RMLToUC() {
 
 function _initMappingInformationButtons() {
     setupImportExportButtons();
-    var _resetBtn = document.getElementById('resetMappingsBtn');
-    if (_resetBtn && !_resetBtn.dataset.obResetWired) {
-        _resetBtn.addEventListener('click', function() { confirmResetMappings(); });
-        _resetBtn.dataset.obResetWired = '1';
-    }
+    // "Unmap all" appears on both Mapping → General (#resetMappingsBtn) and
+    // Mapping → Studio (#resetMappingsDesignBtn); both open the same confirm
+    // dialog before clearing mappings.
+    ['resetMappingsBtn', 'resetMappingsDesignBtn'].forEach(function(_id) {
+        var _btn = document.getElementById(_id);
+        if (_btn && !_btn.dataset.obResetWired) {
+            _btn.addEventListener('click', function() { confirmResetMappings(); });
+            _btn.dataset.obResetWired = '1';
+        }
+    });
 }
 
 if (document.readyState === 'loading') {

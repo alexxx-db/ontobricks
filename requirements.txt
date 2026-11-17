@@ -1,6 +1,10 @@
 # OntoBricks — Databricks Apps deployment
-# Install uv plus the local project so Databricks Apps resolves
-# all runtime dependencies from pyproject.toml at build time.
-# See: https://docs.databricks.com/aws/en/generative-ai/mcp/custom-mcp
-uv
--e ".[lakebase,pitfalls]"
+#
+# Intentionally installs nothing. The workspace has no PyPI egress, so any
+# package named here would fail the Apps build. Every runtime dependency is a
+# vendored wheel under vendor/ (scripts/build_artifact.sh, per hello-abacus),
+# installed offline by vendor_bootstrap.py, the app command in app.yaml.
+# Some of those wheels are split into chunks to stay under the Apps file size
+# limit, which is why pip cannot install them from this file at build time.
+#
+# Do NOT add `uv` or `-e .` back: both need a package index.

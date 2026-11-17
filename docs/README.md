@@ -1,32 +1,118 @@
 # OntoBricks Documentation
 
-OntoBricks is a **Knowledge Graph Builder** for the Databricks platform. It lets you design ontologies visually, map them to Unity Catalog tables, materialize a triple store, and explore the result as an interactive knowledge graph — all from a single Databricks App.
+OntoBricks is a **Graph Viewer Builder** for the Databricks platform. Design
+ontologies visually, map them to Unity Catalog tables, materialize a triple
+store, and explore the result as an interactive graph — all from one Databricks
+App.
 
-**New here?** Start with the [Get Started](get-started.md) guide, then browse the [Examples](examples.md) for end-to-end walkthroughs.
+Markdown in this folder is the **single source of truth**. The in-app Help
+Center and the Sphinx site include the same files, grouped the same way.
+
+**New here?** [Get Started](getting-started.md) → [Examples](examples.md) →
+[User Guide](user-guide.md).
+
+## What's new in 0.9.2
+
+Patch on 0.9.1. Full details:
+[Release notes V0.9.2](../releases/ReleaseNotes_V0.9.2.md).
+
+| Feature | Where it is documented |
+|---------|------------------------|
+| Several datasets per class, metric views included | [User Guide](user-guide.md#ontology-studio-map-full-graph), [Advanced features](advanced_features.md#ontology-specifics), [MCP](mcp.md#available-tools) |
+| MCP end-user identity forward (`X-OntoBricks-Acting-*`) | [Architecture](architecture.md#agents--mcp-server), [Deployment](deployment.md#e-permission-layers) |
+| MCP stateless domain resolution (`domain_name`) | [User Guide](user-guide.md#available-mcp-tools), [MCP](mcp.md#available-tools) |
+| SPARQL typed value `FILTER` compilation to SQL | [Architecture](architecture.md#query-engines) |
+| Apps deployment user API scopes reduced to `[sql]` | [Deployment](deployment.md#appyaml-configuration--full-reference) |
+| Local setup interpreter fallback on macOS (Python 3.9) | [Deployment](deployment.md#prerequisites) |
+
+## What's new in 0.9.1
+
+Patch on 0.9.0. Full details:
+[Release notes V0.9.1](../releases/ReleaseNotes_V0.9.1.md).
+
+| Feature | Where it is documented |
+|---------|------------------------|
+| Viewer Explorer search and Graph Chat (read-only POSTs) | [Development](development.md#enforcement-rules) |
+| SWRL `swrlb:` builtins on inference and materialization | [User Guide](user-guide.md#feature-inventory) |
+| Auto-Map Metric View SQL (`MEASURE` + `GROUP BY`) | [User Guide](user-guide.md#auto-map-sidebar), [Architecture](architecture.md) |
+| Bulk / entity Data Quality snapshot and live activity log | [User Guide](user-guide.md#data-quality-sidebar), [API](api.md) |
+| Lakebase quality SQL on the Build warehouse | [Graph backends](backend.md) |
+
+## What's new in 0.9.0
+
+Operator guides for this version. Full details:
+[Release notes V0.9.0](../releases/ReleaseNotes_V0.9.0.md).
+
+| Feature | Where it is documented |
+|---------|------------------------|
+| Lakehouse//RT query warehouse, SEA, CloudFetch | [Get Started](getting-started.md#sql-warehouses-and-explorer-timing), [User Guide](user-guide.md#lakehouse-sql-warehouses-and-cloudfetch), [Deployment](deployment.md) |
+| Three-stage Ontology Generate (detect → review → complete) | [User Guide](user-guide.md#option-c-ai-powered-wizard) |
+| Knowledge Store (parsed text in Lakebase, no Volume) | [User Guide](user-guide.md#knowledge-store), [Get Started](getting-started.md#upload-documents-to-the-knowledge-store-optional) |
+| Ontology Studio (renamed Designer), entity panel tabs | [User Guide](user-guide.md#ontology-studio-map-full-graph) |
+| Entity Data Quality Checks, SWRL on an entity, Jobs as class actions | [User Guide](user-guide.md#feature-inventory), [MCP](mcp.md) |
+| SPARQL playground | [User Guide](user-guide.md#sparql-playground) |
+| GitHub domain mirror | [User Guide](user-guide.md#github-mirror), [Advanced features](advanced_features.md#load-from-github-repository) |
+| Load opens Domain → General | [User Guide](user-guide.md#domain-saveload) |
+| No LLM, AI Gateway picker, OBO / MCP Team gate | [User Guide](user-guide.md#no-llm-mode), [Deployment](deployment.md) |
+| App `/health` vs readiness, CSRF | [API](api.md#csrf-protection), [Deployment](deployment.md) |
+
+The in-app Help Center serves these same files. [ontobricks.org](https://ontobricks.org/)
+mirrors the last published `master` snapshot and stays on the previous
+release until this documentation is published.
 
 ---
 
-## Topic Index
+## Start here
 
-| Topic | File | What you'll find |
-|-------|------|------------------|
-| **Get Started** | [get-started.md](get-started.md) | Install, first run, Databricks setup, environment variables |
-| **User Guide** | [user-guide.md](user-guide.md) | Day-to-day usage — domain cockpit & versions (MCP-active vs loaded), ontology **Designer**, data mapping, triple-store pipeline, quality checks, reasoning, import (OWL, FIBO, CDISC, IOF, FHIR), Pitfalls Detector, Registry OBX export/import |
-| **Examples** | [examples.md](examples.md) | Family-tree and customer-journey walkthroughs you can follow along |
-| **Deployment** | [deployment.md](deployment.md) | Local dev, Databricks Apps, `app.yaml` resources, Unity Catalog grants for the app SP, in-app permissions, MCP deploy |
-| **Architecture** | [architecture.md](architecture.md) | System design, semantic web standards, agents, OntoViz, triple-store backends, reasoning engine |
-| **API** | [api.md](api.md) | External (stateless) REST & GraphQL, plus internal REST reference |
-| **Data Access** | [data-access.md](data-access.md) | Engine map — which wrapper (REST / GraphQL / SPARQL / Spark SQL / Cypher) every UI / MCP / Chat feature actually uses |
-| **MCP** | [mcp.md](mcp.md) | MCP server, Databricks Playground integration, client configuration |
-| **Development** | [development.md](development.md) | Dependencies, test suite, permission / SDK notes |
-| **Code Map** | [code_organization.md](code_organization.md) | UI routes & templates, API surfaces, agents, MCP wiring |
-| **Lakebase GraphDB** | [lakebase-graphdb.md](lakebase-graphdb.md) | Lakebase setup, write modes, Postgres schema layout, permissions bootstrap, troubleshooting |
-| **GraphDB Integration** | [graphdb-integration.md](graphdb-integration.md) | Deep-dive: UC schema layout, resolver design, synced-table pipeline steps |
-| **Cohort Discovery** | [cohort_discovery.md](cohort_discovery.md) | Cohort rule builder, path traversal, predicate namespace handling |
-| **Import / Export** | [import-export.md](import-export.md) | Registry OBX UI (browser) + CLI `registry_transfer.sh` (CI/CD) |
-| **Product** | [product.md](product.md) | Value proposition, slide-ready material, competitive landscape |
+| Guide | What you'll find |
+|-------|------------------|
+| [Get Started](getting-started.md) | Install, first run, Databricks setup, environment variables |
+| [Examples](examples.md) | Family-tree and customer-journey walkthroughs |
+
+## Using OntoBricks
+
+| Guide | What you'll find |
+|-------|------------------|
+| [User Guide](user-guide.md) | Domain cockpit, Studio, Knowledge Store, staged Generate, mapping, Explorer quality/rules/jobs, SPARQL, GitHub mirror. Ends with the [feature inventory](user-guide.md#feature-inventory) |
+| [Advanced features](advanced_features.md) | [Ontology specifics](advanced_features.md#ontology-specifics) (`name` vs `label`, URI minting, `ontobricks:` vocabulary), [registry import and export](advanced_features.md#registry-import-and-export) (OBX, `registry_transfer.sh`), [cohort discovery](advanced_features.md#cohort-discovery) |
+| [MCP](mcp.md) | MCP server, Playground, clients, [Unity Catalog + Genie One registration](mcp.md#register-the-mcp-in-unity-catalog-and-genie-one) |
+
+## Platform
+
+Each domain picks a graph engine (Lakebase, Lakehouse / Delta, Neo4j, or none).
+
+| Guide | What you'll find |
+|-------|------------------|
+| [Graph backends](backend.md) | [Lakebase graph store](backend.md#lakebase-graph-store) (Postgres schema, write modes, bootstrap), [Neo4j backend](backend.md#neo4j-backend) (Aura / Community / Enterprise), [engine integration](backend.md#engine-integration) (backend contract, UC layout, [query optimizations](backend.md#graph-query-optimizations)) |
+| [Architecture](architecture.md) | System design, standards, agents, OntoViz, [Lakehouse UC objects](architecture.md#lakehouse-unity-catalog-objects), [data access engine map](architecture.md#data-access-engine-map) |
+| [API](api.md) | External REST & GraphQL, internal REST |
+
+## Deploy & develop
+
+| Guide | What you'll find |
+|-------|------------------|
+| [Deployment](deployment.md) | Local dev, Databricks Apps, grants, MCP deploy, plus the [deployment checklist](deployment.md#deployment-checklist), [Asset Bundle reference](deployment.md#asset-bundle-reference) and [sizing questionnaire](deployment.md#production-sizing-questionnaire) |
+| [Development](development.md) | Dependencies, tests, permissions, [code map](development.md#code-map) |
+
+## About
+
+| Guide | What you'll find |
+|-------|------------------|
+| [Product](product.md) | Value proposition and slide-ready GTM material |
 
 ---
+
+## Outside the Help Center
+
+The Databricks App bundle excludes these (`databricks.yml` / `.databricksignore`):
+
+- `sphinx/` — Sphinx build (local)
+- `diagrams/` — diagram sources (local)
+- `superpowers/` — agent planning scratch (gitignored, not published)
+- `pr47-neo4j-demo/` — historical Neo4j demo notes (local)
+
+Reviewer process: [`.github/PR_REVIEW_CHECKLIST.md`](../.github/PR_REVIEW_CHECKLIST.md).
+Project overview: root [README](../README.md).
 
 ## Assets
 
@@ -34,15 +120,17 @@ OntoBricks is a **Knowledge Graph Builder** for the Databricks platform. It lets
 |------|---------|
 | [images/](images/) | Architecture and standards diagrams (SVG) |
 | [screenshots/](screenshots/) | UI screenshots |
-| [../data/customer/README.md](../data/customer/README.md) | Sample dataset README |
 
-## Generated API Docs (Sphinx)
+## Sphinx site
 
-- **Build:** `scripts/build_docs.sh` from the repo root (requires **Sphinx** and **myst-parser** — see `pyproject.toml` dev dependencies).
-- **Output:** `docs/sphinx/_build/html/index.html` — the topic guides above are pulled into the same site via MyST `{include}`, keeping Markdown as the single source of truth.
-- **Quick open:** root [`documentation.html`](../documentation.html) redirects to the Sphinx build.
+- **Build:** `ci/build_docs.sh` from the repository root (Sphinx + myst-parser;
+  see `pyproject.toml` extras).
+- **Output:** `docs/sphinx/_build/html/index.html` — topic guides are MyST
+  `{include}`s of the Markdown above.
 
-## Quick Links
+## Quick links
 
-- [Main README](../README.md) — project overview
-- [Swagger UI](http://localhost:8000/docs) — interactive API docs (when running locally)
+- [Main README](../README.md)
+- [Release notes V0.9.1](../releases/ReleaseNotes_V0.9.1.md)
+- [Release notes V0.9.0](../releases/ReleaseNotes_V0.9.0.md)
+- [Swagger UI](http://localhost:8000/docs) (local run)

@@ -1,10 +1,11 @@
 /* -----------------------------------------------------------------
-   Registry → Teams matrix
+   Settings → Admin → Teams matrix
    A compact Principals × Domains grid with sticky headers.
    ----------------------------------------------------------------- */
 
 .teams-matrix-wrapper {
-    max-height: calc(100vh - 280px);
+    flex: 1;
+    min-height: 0;
     overflow: auto;
     border: 1px solid var(--bs-border-color, #dee2e6);
     border-radius: 0.375rem;
@@ -23,7 +24,7 @@
 .teams-matrix thead th {
     position: sticky;
     top: 0;
-    background: #f8f9fa;
+    background: #ffffff;
     z-index: 3;
     border-bottom: 1px solid #dee2e6;
     padding: 0.5rem 0.75rem;
@@ -39,7 +40,7 @@
     z-index: 4;
     text-align: left;
     min-width: 260px;
-    background: #f8f9fa;
+    background: #ffffff;
     border-right: 1px solid #dee2e6;
 }
 

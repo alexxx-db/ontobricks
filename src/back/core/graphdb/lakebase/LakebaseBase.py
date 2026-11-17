@@ -8,6 +8,9 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from back.core.errors import InfrastructureError
 from back.core.graphdb.GraphDBBackend import GraphDBBackend
+from back.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 DEFAULT_GRAPH_SCHEMA = "ontobricks_graph"
 
@@ -19,6 +22,31 @@ def default_schema() -> str:
     return DEFAULT_GRAPH_SCHEMA
 
 
+def resolve_postgres_database_override(cfg: Optional[Dict[str, Any]]) -> str:
+    """Return Lakebase's Postgres ``database`` override from engine config.
+
+    Accepts a Lakebase section, a nested ``graph_engine_config`` root, or a
+    legacy flat blob. Nested storage keeps backends fully separated; the
+    flat-era heuristic (ignore ``database: "neo4j"`` when a Neo4j URI /
+    ``neo4j_database`` is also present) remains for unmigrated saves.
+    """
+    data = cfg if isinstance(cfg, dict) else {}
+    if isinstance(data.get("lakebase"), dict) or isinstance(data.get("neo4j"), dict):
+        from back.core.graphdb.engine_config import lakebase_section
+
+        data = lakebase_section(data)
+        return str(data.get("database") or "").strip()
+    raw = str(data.get("database") or "").strip()
+    if not raw:
+        return ""
+    if raw.lower() == "neo4j" and (
+        str(data.get("uri") or "").strip()
+        or str(data.get("neo4j_database") or "").strip()
+    ):
+        return ""
+    return raw
+
+
 def validate_graph_schema(name: str) -> str:
     """Return a safe Postgres schema name or raise ValueError."""
     s = (name or "").strip() or DEFAULT_GRAPH_SCHEMA
@@ -28,7 +56,33 @@ def validate_graph_schema(name: str) -> str:
 
 
 _ALLOWED_SYNC_MODES = ("app_managed", "managed_synced")
-_ALLOWED_SYNC_TABLE_MODES = ("snapshot", "triggered", "continuous")
+_LEGACY_UNSUPPORTED_SYNC_TABLE_MODES = frozenset({"triggered", "continuous"})
+
+
+def normalize_sync_table_mode(value: Any = None) -> str:
+    """Return the Lakeflow schedule OntoBricks can run against an R2RML view.
+
+    Triggered and Continuous need Change Data Feed. The mapped source is a
+    Unity Catalog view, so only Snapshot is valid. Legacy values are coerced.
+    """
+    if value is None:
+        return "snapshot"
+    if not isinstance(value, str):
+        raise ValueError("graph_engine_config.sync_table_mode must be a string")
+    v = value.strip().lower()
+    if not v or v == "snapshot":
+        return "snapshot"
+    if v in _LEGACY_UNSUPPORTED_SYNC_TABLE_MODES:
+        logger.warning(
+            "sync_table_mode=%r is not supported for R2RML views (no Change Data "
+            "Feed); using snapshot",
+            value,
+        )
+        return "snapshot"
+    raise ValueError(
+        "graph_engine_config.sync_table_mode must be snapshot "
+        "(triggered and continuous require CDF and cannot sync a view)"
+    )
 
 
 def validate_engine_config_keys(config: Dict[str, Any]) -> Tuple[bool, str]:
@@ -40,9 +94,11 @@ def validate_engine_config_keys(config: Dict[str, Any]) -> Tuple[bool, str]:
     * ``schema``           -- fallback graph schema name when **Settings → Registry**
       has no Volume schema; otherwise ``RegistryCfg.schema`` **always** overrides
       for Lakebase (Postgres ``search_path`` + UC synced-table middle segment).
-    * ``sync_mode``        -- ``app_managed`` (default) or ``managed_synced``.
-    * ``sync_table_mode``  -- Lakeflow scheduling: ``snapshot`` / ``triggered`` /
-      ``continuous`` (only ``snapshot`` is wired in Phase 1).
+    * ``sync_mode``        -- ``app_managed`` (runtime default when omitted) or
+      ``managed_synced`` (what Settings proposes when the key is unset).
+    * ``sync_table_mode``  -- Lakeflow scheduling. Only ``snapshot`` is
+      supported (source is a view with no CDF). Legacy ``triggered`` /
+      ``continuous`` values are coerced to ``snapshot``.
     * ``sync_timeout_s``   -- positive integer; how long to wait for a sync run.
     * ``sync_uc_catalog``  -- UC catalog where the synced table is registered;
       defaults to the snapshot Delta catalog used by the build pipeline.
@@ -74,15 +130,10 @@ def validate_engine_config_keys(config: Dict[str, Any]) -> Tuple[bool, str]:
             )
     sync_table_mode = config.get("sync_table_mode", None)
     if sync_table_mode is not None:
-        if (
-            not isinstance(sync_table_mode, str)
-            or sync_table_mode not in _ALLOWED_SYNC_TABLE_MODES
-        ):
-            return (
-                False,
-                "graph_engine_config.sync_table_mode must be one of "
-                + ", ".join(_ALLOWED_SYNC_TABLE_MODES),
-            )
+        try:
+            config["sync_table_mode"] = normalize_sync_table_mode(sync_table_mode)
+        except ValueError as exc:
+            return False, str(exc)
     sync_timeout_s = config.get("sync_timeout_s", None)
     if sync_timeout_s is not None:
         if not isinstance(sync_timeout_s, int) or sync_timeout_s <= 0:
@@ -142,9 +193,11 @@ class LakebaseBase(GraphDBBackend):
         return "sql"
 
     def get_query_translator(self, table_name: str = "") -> Any:
-        from back.core.reasoning.SWRLSQLTranslator import SWRLSQLTranslator
+        from back.core.reasoning.swrl.SWRLSQLTranslator import SWRLSQLTranslator
 
-        return SWRLSQLTranslator()
+        # Lakebase is Postgres: without the dialect, builtin filters emit
+        # Databricks-only TRY_CAST/DOUBLE and fail with a syntax error.
+        return SWRLSQLTranslator(dialect="postgres")
 
     def get_connection(self) -> Any:
         raise InfrastructureError(
@@ -189,5 +242,5 @@ class LakebaseBase(GraphDBBackend):
         pool = self._pool()
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(f'SET search_path TO "{self._schema}", public')
+                cur.execute('SET search_path TO "%s", public' % self._schema.replace('"', '""'))
                 yield cur

@@ -4,9 +4,13 @@ Internal API -- Settings / configuration JSON endpoints.
 Moved from app/frontend/settings/routes.py during the front/back split.
 """
 
+import asyncio
 import json
 
-from fastapi import APIRouter, Request, Depends
+from typing import Optional
+
+from fastapi import APIRouter, Request, Depends, Query, Response, Form, File, UploadFile
+from fastapi.responses import PlainTextResponse
 
 from shared.config.settings import get_settings, Settings
 from shared.config.constants import DEFAULT_BASE_URI
@@ -14,13 +18,15 @@ from back.core.errors import ValidationError
 from back.objects.session import SessionManager, get_session_manager
 from back.core.helpers import resolve_default_base_uri, resolve_default_emoji, run_blocking
 from back.objects.session import get_domain
-from back.objects.registry import ROLE_ADMIN, require
+from api.routers.internal._guards import require
+from back.objects.registry import ROLE_ADMIN
 
 from api.routers.internal._permissions import filter_visible_domains
 from api.routers.internal._helpers import map_route_errors
-from back.core.logging import get_logger
+from back.core.logging import get_logger, LogManager
 
 from back.objects.domain import SettingsService as config_service
+from back.objects.domain.settings import GitHubSettings
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
 logger = get_logger(__name__)
@@ -121,6 +127,49 @@ async def select_warehouse(
     )
 
 
+@router.post("/select-build-warehouse")
+async def select_build_warehouse(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Select the non-RT SQL warehouse used for build DDL and writes."""
+    data = await request.json()
+    email, _display_name, user_token, _user_role, _user_domain_role = (
+        _settings_request_identity(request)
+    )
+    return config_service.select_build_warehouse(
+        data.get("warehouse_id"),
+        data.get("warehouse_type"),
+        False,
+        email,
+        user_token,
+        session_mgr,
+        settings,
+    )
+
+
+@router.post("/select-delta-warehouse")
+async def select_delta_warehouse(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Select the SQL warehouse used for Delta triple-store graph queries."""
+    data = await request.json()
+    email, _display_name, user_token, _user_role, _user_domain_role = (
+        _settings_request_identity(request)
+    )
+    return config_service.select_delta_warehouse(
+        data.get("warehouse_id"),
+        email,
+        user_token,
+        session_mgr,
+        settings,
+        use_sea=bool(data.get("use_sea", False)),
+    )
+
+
 # ===========================================
 # Catalog/Schema/Volume Navigation
 # ===========================================
@@ -188,6 +237,44 @@ async def get_volumes_path(
     )
 
 
+@router.get("/uc-assets")
+async def get_uc_assets(
+    catalog: str,
+    schema: str,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List Unity Catalog tables and views in a schema (with table_type)."""
+    return await config_service.fetch_uc_assets(catalog, schema, session_mgr, settings)
+
+
+@router.get("/uc-functions")
+async def get_uc_functions(
+    catalog: str,
+    schema: str,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List Unity Catalog functions in a schema (with parameter metadata)."""
+    return await config_service.fetch_uc_functions(
+        catalog, schema, session_mgr, settings
+    )
+
+
+@router.get("/jobs")
+async def get_entity_jobs(
+    q: str = "",
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List Databricks Jobs that declare an entity_id parameter (class Job picker)."""
+    from back.objects.domain.settings.RegistrySettings import RegistrySettings
+
+    return await RegistrySettings.fetch_entity_jobs(
+        session_mgr, settings, query=q
+    )
+
+
 # ===========================================
 # Domain Registry
 # ===========================================
@@ -202,33 +289,75 @@ async def get_registry(
     return await run_blocking(config_service.build_registry_get_payload, session_mgr, settings)
 
 
+@router.get("/registry/check")
+async def check_registry_access(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Probe UC schema/Volume existence + Lakebase registry permissions.
+
+    Combines three independent checks:
+    - UC schema: exists + USE SCHEMA privilege (REST API, no warehouse needed)
+    - UC Volume: exists + READ VOLUME privilege (REST API, no warehouse needed)
+    - Lakebase: connection, schema USAGE/CREATE, and per-table CRUD privileges
+
+    Each check runs independently; a failure in one does not stop the others.
+    """
+    uc_result, lb_result = await asyncio.gather(
+        config_service.check_registry_access(session_mgr, settings),
+        config_service.check_lakebase_permissions(session_mgr, settings),
+        return_exceptions=True,
+    )
+    # Unwrap exceptions from gather — surface as error payloads
+    if isinstance(uc_result, Exception):
+        uc_result = {"success": False, "error": str(uc_result)}
+    if isinstance(lb_result, Exception):
+        lb_result = {"success": False, "error": str(lb_result)}
+
+    return {
+        "success": True,
+        "uc": uc_result,
+        "lakebase": lb_result,
+    }
+
+
 @router.post("/registry/initialize")
 async def initialize_registry(
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    """Create the registry Volume (and root marker) if they do not exist."""
-    return config_service.initialize_registry_result(session_mgr, settings)
+    """Create the registry Volume (and root marker) if they do not exist.
+
+    On the Lakebase backend this also self-serves the project/schema/UC
+    grants the app + MCP service principals need (in-app port of
+    ``scripts/bootstrap/lakebase-perms.sh``); the per-SP outcome is
+    returned under the ``permissions`` key.
+    """
+    return await run_blocking(
+        config_service.initialize_registry_result, session_mgr, settings
+    )
 
 
-@router.get(
-    "/registry/lakebase-stats",
+@router.post(
+    "/registry/grant-permissions",
     dependencies=[Depends(require(ROLE_ADMIN))],
 )
-async def get_lakebase_stats(
+async def grant_registry_permissions(
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    """Return per-table row counts for the Lakebase registry schema.
+    """Re-apply Lakebase grants for the registry schema to the app SPs.
 
-    Powers the read-only inventory grid in the Registry Location
-    panel. Raises :class:`~back.core.errors.ValidationError` or
-    :class:`~back.core.errors.InfrastructureError` when the Lakebase
-    resource is not bound, the backend is not installed, or the store
-    cannot be queried.
+    Admin-only, in-app equivalent of ``scripts/bootstrap/lakebase-perms.sh``:
+    grants ``CAN_USE`` on the project, ``USAGE``/DML on the registry schema,
+    and ``ALL_PRIVILEGES`` on the UC catalog to the app + MCP service
+    principals. Idempotent — safe to re-run after a rebind/redeploy that
+    dropped the schema GRANTs. Control-plane grants are best-effort.
     """
-    with map_route_errors("registry lakebase stats", logger):
-        return config_service.lakebase_stats_result(session_mgr, settings)
+    with map_route_errors("registry grant permissions", logger):
+        return await config_service.grant_registry_permissions_result(
+            session_mgr, settings
+        )
 
 
 @router.get("/registry/domains")
@@ -241,7 +370,11 @@ async def list_registry_domains(
 
     Non-admin users only see domains they have a role on; admins see all.
     """
-    result = config_service.list_registry_domains_result(session_mgr, settings)
+    result = config_service.list_registry_domains_result(
+        session_mgr,
+        settings,
+        user_role=getattr(request.state, "user_role", "") or "",
+    )
     result["domains"] = filter_visible_domains(
         request, session_mgr, settings, result.get("domains", [])
     )
@@ -262,10 +395,11 @@ async def delete_registry_domain(
     domain_name: str,
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
+    delete_github: bool = Query(False),
 ):
     """Delete a domain folder and all its versions from the registry."""
     return config_service.delete_registry_domain_result(
-        domain_name, session_mgr, settings
+        domain_name, session_mgr, settings, delete_github=delete_github
     )
 
 
@@ -273,35 +407,19 @@ async def delete_registry_domain(
 async def delete_registry_version(
     domain_name: str,
     version: str,
+    request: Request,
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
+    delete_github: bool = Query(False),
 ):
     """Delete a single version file from a domain in the registry."""
     return config_service.delete_registry_version_result(
         domain_name,
         version,
-        session_mgr,
-        settings,
-    )
-
-
-@router.post("/registry/domains/{domain_name}/versions/{version}/active")
-async def set_registry_version_active(
-    domain_name: str,
-    version: str,
-    request: Request,
-    session_mgr: SessionManager = Depends(get_session_manager),
-    settings: Settings = Depends(get_settings),
-):
-    """Set or clear the Active flag on a version in the registry."""
-    data = await request.json()
-    enabled = bool(data.get("enabled", False))
-    return config_service.set_registry_version_active_result(
-        domain_name,
-        version,
-        enabled,
-        session_mgr,
-        settings,
+        user_role=getattr(request.state, "user_role", "") or "",
+        session_mgr=session_mgr,
+        settings=settings,
+        delete_github=delete_github,
     )
 
 
@@ -404,15 +522,24 @@ async def import_registry_obx(
     Multipart fields:
 
     * ``file`` -- the uploaded `.obx` JSON body.
+    * ``from_github`` -- ``1`` to rebuild and import from the GitHub
+      repository (no file; blobs are read at confirm time).
     * ``decisions`` -- JSON string ``[{"name": <folder>,
       "action": "skip"|"overwrite"|"rename", "new_name": <str>}]``.
       Missing entries default to ``"skip"``.
     """
     form = await request.form()
-    upload = form.get("file")
-    if upload is None:
-        raise ValidationError("No file provided")
-    file_bytes = await upload.read()
+    from_github = str(form.get("from_github") or "").lower() in ("1", "true", "yes")
+    if from_github:
+        email, _, _, _, _ = _settings_request_identity(request)
+        file_bytes = await run_blocking(
+            GitHubSettings.github_import_bytes, email, session_mgr, settings
+        )
+    else:
+        upload = form.get("file")
+        if upload is None:
+            raise ValidationError("No file provided")
+        file_bytes = await upload.read()
 
     decisions_raw = form.get("decisions") or "[]"
     try:
@@ -427,6 +554,85 @@ async def import_registry_obx(
     return config_service.import_registry_obx_result(
         file_bytes, decisions, session_mgr, settings
     )
+
+
+# ===========================================
+# GitHub repository mirror (one repository per instance)
+# ===========================================
+
+
+@router.get("/github", dependencies=[Depends(require(ROLE_ADMIN))])
+async def get_github_settings(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Return the GitHub mirror settings and the last sync status."""
+    return await run_blocking(GitHubSettings.get_github_result, session_mgr, settings)
+
+
+@router.post("/github", dependencies=[Depends(require(ROLE_ADMIN))])
+async def save_github_settings(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Save the GitHub mirror settings (the token stays in a Databricks secret)."""
+    data = await request.json()
+    if not isinstance(data, dict):
+        raise ValidationError("Body must be a JSON object")
+    return await run_blocking(
+        GitHubSettings.save_github_result, data, session_mgr, settings
+    )
+
+
+@router.post("/github/test", dependencies=[Depends(require(ROLE_ADMIN))])
+async def test_github_settings(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Check repository access and claim it for this instance.
+
+    Body (optional): ``{"take_over": true}`` to claim a repository already
+    used by another OntoBricks instance.
+    """
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    take_over = bool(data.get("take_over")) if isinstance(data, dict) else False
+    with map_route_errors("GitHub connection test", logger):
+        return await run_blocking(
+            GitHubSettings.test_github_result, take_over, session_mgr, settings
+        )
+
+
+@router.post("/github/sync-all", dependencies=[Depends(require(ROLE_ADMIN))])
+async def sync_all_github(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Rewrite every registry domain/version into the repository in one commit."""
+    email, _, _, _, _ = _settings_request_identity(request)
+    with map_route_errors("GitHub sync all", logger):
+        return await run_blocking(
+            GitHubSettings.sync_all_github_result, email, session_mgr, settings
+        )
+
+
+@router.get("/github/obx", dependencies=[Depends(require(ROLE_ADMIN))])
+async def github_obx_envelope(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List domains/versions in the GitHub repository (feeds the import modal)."""
+    email, _, _, _, _ = _settings_request_identity(request)
+    with map_route_errors("GitHub import read", logger):
+        return await run_blocking(
+            GitHubSettings.github_obx_envelope_result, email, session_mgr, settings
+        )
 
 
 # ===========================================
@@ -492,6 +698,60 @@ async def save_base_uri(
 # ===========================================
 # Branding (Navbar Logo)
 # ===========================================
+
+
+@router.get("/ui-branding")
+async def get_ui_branding(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+    _role: str = Depends(require(ROLE_ADMIN)),
+):
+    """Return normalized UI branding settings (admin only)."""
+    email, _display_name, user_token, _user_role, _user_domain_role = (
+        _settings_request_identity(request)
+    )
+    return config_service.get_ui_branding_result(
+        email, user_token, session_mgr, settings
+    )
+
+
+@router.post("/ui-branding")
+async def save_ui_branding(
+    request: Request,
+    app_title: str = Form(""),
+    primary_color: str = Form(""),
+    aurora_color: str = Form(""),
+    reset_logo: bool = Form(False),
+    logo_file: UploadFile | None = File(None),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Save title/color/Aurora/logo atomically from multipart form data (admin only)."""
+    logo_content = None
+    logo_mime = None
+    if logo_file is not None:
+        filename = (getattr(logo_file, "filename", "") or "").strip()
+        content = await logo_file.read()
+        # Match legacy upload behavior: ignore placeholder/empty file parts.
+        if filename and content:
+            logo_content = content
+            logo_mime = (getattr(logo_file, "content_type", "") or "")
+    email, _display_name, user_token, _user_role, _user_domain_role = (
+        _settings_request_identity(request)
+    )
+    return config_service.save_ui_branding_result(
+        app_title=app_title,
+        primary_color=primary_color,
+        aurora_color=aurora_color,
+        logo_content=logo_content,
+        logo_mime=logo_mime,
+        reset_logo=reset_logo,
+        email=email,
+        user_token=user_token,
+        session_mgr=session_mgr,
+        settings=settings,
+    )
 
 
 @router.get("/navbar-logo")
@@ -572,6 +832,143 @@ async def save_registry_cache_ttl(
     )
 
 
+@router.get("/graph-limits")
+async def get_graph_limits(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Get effective graph-read bounds (statement timeout + chat result cap)."""
+    return config_service.get_graph_limits_result(session_mgr, settings)
+
+
+@router.post("/save-graph-limits")
+async def save_graph_limits(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Save graph-read bounds (admin only, stored globally). ``0`` = unset."""
+    data = await request.json()
+
+    def _opt_int(key: str):
+        if key not in data or data[key] is None or data[key] == "":
+            return None
+        try:
+            return int(data[key])
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"{key} must be an integer") from exc
+
+    email, _display_name, user_token, _user_role, _user_domain_role = (
+        _settings_request_identity(request)
+    )
+    return config_service.save_graph_limits_result(
+        _opt_int("graph_query_timeout_s"),
+        _opt_int("graph_chat_result_cap"),
+        email,
+        user_token,
+        session_mgr,
+        settings,
+    )
+
+
+@router.get("/data-assets-import-limit")
+async def get_data_assets_import_limit(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Get the max number of Unity Catalog data assets a domain may import."""
+    return config_service.get_data_assets_import_limit_result(session_mgr, settings)
+
+
+@router.post("/save-data-assets-import-limit")
+async def save_data_assets_import_limit(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Save the data-assets import cap (admin only, stored globally). Default 40."""
+    data = await request.json()
+    try:
+        limit = int(data.get("data_assets_import_limit", 40))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("data_assets_import_limit must be an integer") from exc
+    email, _display_name, user_token, _user_role, _user_domain_role = (
+        _settings_request_identity(request)
+    )
+    return config_service.save_data_assets_import_limit_result(
+        limit, email, user_token, session_mgr, settings
+    )
+
+
+@router.get("/edit-lock-ttl")
+async def get_edit_lock_ttl(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Get the effective DRAFT edit-lock lease TTL in seconds (0 = disabled)."""
+    return config_service.get_edit_lock_ttl_result(session_mgr, settings)
+
+
+@router.post("/save-edit-lock-ttl")
+async def save_edit_lock_ttl(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Save the DRAFT edit-lock lease TTL in seconds (admin only, global; 0 disables)."""
+    data = await request.json()
+    ttl_s = int(data.get("edit_lock_ttl_s", 600))
+    email, _display_name, user_token, _user_role, _user_domain_role = (
+        _settings_request_identity(request)
+    )
+    return config_service.save_edit_lock_ttl_result(
+        ttl_s, email, user_token, session_mgr, settings
+    )
+
+
+@router.get("/analytics-job-enabled")
+async def get_analytics_job_enabled(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Get whether oversized graphs may use the serverless analytics job."""
+    return config_service.get_analytics_job_enabled_result(session_mgr, settings)
+
+
+@router.post("/save-analytics-job-enabled")
+async def save_analytics_job_enabled(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Save the serverless analytics job toggle (admin only, global)."""
+    data = await request.json()
+    enabled = bool(data.get("analytics_job_enabled", False))
+    email, _display_name, user_token, _user_role, _user_domain_role = (
+        _settings_request_identity(request)
+    )
+    return config_service.save_analytics_job_enabled_result(
+        enabled, email, user_token, session_mgr, settings
+    )
+
+
+@router.post("/save-cloud-fetch")
+async def save_cloud_fetch(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Save the global CloudFetch toggle (admin only)."""
+    data = await request.json()
+    enabled = bool(data.get("use_cloud_fetch", False))
+    email, _display_name, user_token, _user_role, _user_domain_role = (
+        _settings_request_identity(request)
+    )
+    return config_service.save_use_cloud_fetch_result(
+        enabled, email, user_token, session_mgr, settings
+    )
+
+
 # ===========================================
 # Permissions Management
 # ===========================================
@@ -628,8 +1025,8 @@ async def list_app_permissions(
 ):
     """Return the Databricks App principals (users + groups).
 
-    Read-only mirror of the App's ACL.  Used by Settings → Permissions
-    and as the row source for Registry → Teams.
+    Read-only mirror of the App's ACL. Used as the row source for
+    Settings → Admin → Teams.
     """
     return config_service.list_app_principals_result(session_mgr, settings)
 
@@ -726,7 +1123,7 @@ async def delete_domain_permission(
 
 
 # ===========================================
-# Teams (Registry → Teams matrix)
+# Teams (Settings → Admin → Teams matrix)
 # ===========================================
 
 
@@ -761,30 +1158,43 @@ async def teams_save_batch(
 # ===========================================
 
 
-@router.get("/graph-engine")
-async def get_graph_engine(
+# NOTE: The graph backend *selection* (formerly GET/POST /graph-engine and
+# GET/POST /triple-store-backend) moved to a mandatory per-domain choice — see
+# the Domain -> General -> Knowledge Graph tab (POST /domain/info). Only the
+# Delta connection info (which SQL warehouse) remains a workspace-global read.
+
+
+@router.get("/delta-warehouse")
+async def get_delta_warehouse(
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    """Return the currently configured graph DB engine."""
-    return config_service.get_graph_engine_result(session_mgr, settings)
+    """Return the Delta SQL-warehouse selection + registry location."""
+    return config_service.get_delta_warehouse_result(session_mgr, settings)
 
 
-@router.post("/graph-engine")
-async def set_graph_engine(
-    request: Request,
+@router.get("/triple-store/databricks-health")
+async def get_triple_store_databricks_health(
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    """Set the graph DB engine (admin only, stored globally)."""
-    data = await request.json()
-    engine = data.get("graph_engine", "lakebase")
-    email, _display_name, user_token, _user_role, _user_domain_role = (
-        _settings_request_identity(request)
-    )
-    return config_service.set_graph_engine_result(
-        engine, email, user_token, session_mgr, settings
-    )
+    """Report effective permissions on the Registry UC schema for the app principal."""
+    with map_route_errors("Databricks triple store health", logger):
+        return config_service.triple_store_databricks_health_result(
+            session_mgr, settings
+        )
+
+
+@router.get("/triple-store/databricks-objects")
+async def get_triple_store_databricks_objects(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List UC triple-store objects in the Registry schema, grouped by domain."""
+    with map_route_errors("Databricks triple store objects", logger):
+        return config_service.triple_store_databricks_objects_result(
+            session_mgr, settings
+        )
 
 
 @router.get("/graph-engine-config")
@@ -804,6 +1214,137 @@ async def get_graph_engine_lakebase_health(
     """Probe Lakebase connectivity and graph schema (saved global config)."""
     with map_route_errors("graph engine Lakebase health", logger):
         return config_service.graph_engine_lakebase_health_result(session_mgr, settings)
+
+
+@router.post("/graph-engine/neo4j-test")
+async def post_graph_engine_neo4j_test(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Probe Neo4j Bolt connectivity for a named connection or draft fields.
+
+    Body (optional JSON)::
+
+        {
+          "connection_name": "Aura Prod",
+          "draft": { "name": "...", "uri": "...", "username": "...", ... }
+        }
+    """
+    with map_route_errors("graph engine Neo4j connection test", logger):
+        try:
+            data = await request.json()
+        except Exception:  # noqa: BLE001
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        draft = data.get("draft") if isinstance(data.get("draft"), dict) else None
+        return config_service.graph_engine_neo4j_test_result(
+            session_mgr,
+            settings,
+            connection_name=str(data.get("connection_name") or "").strip(),
+            draft=draft,
+        )
+
+
+@router.get(
+    "/graph-engine/neo4j-secret-scopes",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def get_graph_engine_neo4j_secret_scopes(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List Databricks secret scopes for the Neo4j password "Secret scope" dropdown."""
+    with map_route_errors("graph engine Neo4j secret scopes", logger):
+        return config_service.graph_engine_neo4j_secret_scopes_result(session_mgr, settings)
+
+
+@router.get(
+    "/graph-engine/neo4j-secret-keys",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def get_graph_engine_neo4j_secret_keys(
+    scope: str = "",
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List secret keys within ``scope`` for the Neo4j password "Secret key" dropdown."""
+    with map_route_errors("graph engine Neo4j secret keys", logger):
+        return config_service.graph_engine_neo4j_secret_keys_result(
+            scope, session_mgr, settings
+        )
+
+
+@router.get("/graph-engine/neo4j-connections")
+async def get_graph_engine_neo4j_connections(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List named Neo4j connection profiles from Settings (no passwords)."""
+    with map_route_errors("graph engine Neo4j connections", logger):
+        return config_service.graph_engine_neo4j_connections_result(
+            session_mgr, settings
+        )
+
+
+@router.get("/graph-engine/neo4j-databases")
+async def get_graph_engine_neo4j_databases(
+    connection_name: str = "",
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List Neo4j databases on the server for a named connection (admin)."""
+    with map_route_errors("graph engine Neo4j databases", logger):
+        return config_service.graph_engine_neo4j_databases_result(
+            session_mgr, settings, connection_name=connection_name
+        )
+
+
+@router.get("/graph-engine/neo4j-labels")
+async def get_graph_engine_neo4j_labels(
+    connection_name: str = "",
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List materialised Neo4j graphs (marker labels) with node/edge counts."""
+    with map_route_errors("graph engine Neo4j labels", logger):
+        return config_service.graph_engine_neo4j_labels_result(
+            session_mgr, settings, connection_name=connection_name
+        )
+
+
+@router.get("/graph-engine/neo4j-health")
+async def get_graph_engine_neo4j_health(
+    connection_name: str = "",
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Bolt health probe for the Neo4j admin Health tab."""
+    with map_route_errors("graph engine Neo4j health", logger):
+        return config_service.graph_engine_neo4j_health_result(
+            session_mgr, settings, connection_name=connection_name
+        )
+
+
+@router.post("/graph-engine/neo4j-drop-label")
+async def post_graph_engine_neo4j_drop_label(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Drop one Neo4j graph (marker label) and its schema map (admin).
+
+    Body: ``{ "label": "<marker label>", "connection_name": "..." }``
+    """
+    with map_route_errors("graph engine Neo4j drop label", logger):
+        data = await request.json()
+        return config_service.graph_engine_neo4j_drop_label_result(
+            (data.get("label") or "").strip(),
+            session_mgr,
+            settings,
+            connection_name=str(data.get("connection_name") or "").strip(),
+        )
 
 
 @router.get("/graph-engine/uc-catalogs")
@@ -866,13 +1407,14 @@ async def get_graph_engine_lakebase_pg_databases(
 @router.get("/graph-engine/lakebase-pg-schemas")
 async def get_graph_engine_lakebase_pg_schemas(
     database: str = "",
+    branch_path: str = "",
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
     """List Postgres schemas in a Lakebase database."""
     with map_route_errors("graph engine Lakebase PG schemas", logger):
         return config_service.graph_engine_lakebase_pg_schemas_result(
-            database, session_mgr, settings
+            database, session_mgr, settings, branch_path=branch_path
         )
 
 
@@ -895,6 +1437,44 @@ async def get_graph_engine_lakebase_objects(
         )
 
 
+@router.get("/graph-engine/lakebase-sync-objects")
+async def get_graph_engine_lakebase_sync_objects(
+    database: str = "",
+    branch_path: str = "",
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List Unity Catalog / Lakeflow synced-table registrations for the Lakebase graph.
+
+    Only meaningful when ``sync_mode == managed_synced``.  Probes each ``_sync``
+    Postgres table against the Databricks synced-tables API in parallel and returns
+    state + pipeline_id for each entry.
+    """
+    with map_route_errors("graph engine Lakebase sync objects", logger):
+        return config_service.graph_engine_lakebase_sync_objects_result(
+            database, branch_path, session_mgr, settings
+        )
+
+
+@router.post("/graph-engine/drop-uc-object")
+async def post_graph_engine_drop_uc_object(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Drop a Unity Catalog table or Lakeflow synced-table registration.
+
+    Body: ``{ "full_name": "catalog.schema.table", "is_sync": true|false }``
+    """
+    with map_route_errors("drop UC object", logger):
+        data = await request.json()
+        full_name = (data.get("full_name") or "").strip()
+        is_sync = bool(data.get("is_sync", False))
+        return config_service.graph_engine_drop_uc_object_result(
+            full_name, is_sync, session_mgr, settings
+        )
+
+
 @router.post("/graph-engine/lakebase-drop-object")
 async def post_graph_engine_lakebase_drop_object(
     request: Request,
@@ -910,8 +1490,68 @@ async def post_graph_engine_lakebase_drop_object(
             name=data.get("name", ""),
             database=data.get("database", ""),
             branch_path=data.get("branch_path", ""),
-            session_mgr=session_mgr,
-            settings=settings,
+            _session_mgr=session_mgr,
+            _settings=settings,
+        )
+
+
+@router.get(
+    "/graph-engine/lakebase-pg-roles",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def get_graph_engine_lakebase_pg_roles(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List Postgres roles on the graph Lakebase branch + overlay app-user status (admin only)."""
+    with map_route_errors("graph engine Lakebase pg roles", logger):
+        return config_service.graph_engine_lakebase_pg_roles_result(session_mgr, settings)
+
+
+@router.post(
+    "/graph-engine/lakebase-grant-superuser",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def post_graph_engine_lakebase_grant_superuser(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Grant DATABRICKS_SUPERUSER to a user on the graph Lakebase branch (admin only).
+
+    Body: ``{ "user_email": "user@example.com" }``
+    """
+    with map_route_errors("graph engine Lakebase grant superuser", logger):
+        data = await request.json()
+        user_email = (data.get("user_email") or "").strip()
+        return config_service.graph_engine_lakebase_grant_superuser_result(
+            user_email, session_mgr, settings
+        )
+
+
+@router.post(
+    "/graph-engine/lakebase-provision",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def post_graph_engine_lakebase_provision(
+    request: Request,
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Provision a new Lakebase graph DB from scratch (admin only, async).
+
+    Creates the Lakebase instance/project + Postgres database + graph schema
+    and grants the app + MCP service principals. Returns a ``task_id`` the UI
+    polls via ``GET /tasks/{id}``.
+
+    Body: ``{ name, capacity, branch, database, schema, mcp_app_name,
+    grant_uc_catalog }``.
+    """
+    data = await request.json()
+    email, _dn, user_token, _ur, _udr = _settings_request_identity(request)
+    with map_route_errors("provision Lakebase graph DB", logger):
+        return config_service.graph_engine_lakebase_provision_result(
+            data, email, user_token, session_mgr, settings
         )
 
 
@@ -931,7 +1571,10 @@ async def set_graph_engine_config(
 
 
 # ===========================================
-# Scheduled Builds
+# Scheduled tasks (builds, cohorts, analytics, inference)
+#
+# One generic surface for every task type: the type is a path/body
+# field, and its options travel in the ``config`` object.
 # ===========================================
 
 
@@ -940,7 +1583,7 @@ async def list_schedules(
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    """Return all per-domain build schedules."""
+    """Return every schedule, of every task type, plus the type catalogue."""
     return config_service.list_schedules_result(session_mgr, settings)
 
 
@@ -950,21 +1593,9 @@ async def save_schedule(
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    """Create or update a build schedule for a domain."""
+    """Create or update a schedule of any task type."""
     data = await request.json()
     return config_service.save_schedule_result(data, session_mgr, settings)
-
-
-@router.get("/schedules/{domain_name}/history")
-async def get_schedule_history(
-    domain_name: str,
-    session_mgr: SessionManager = Depends(get_session_manager),
-    settings: Settings = Depends(get_settings),
-):
-    """Return the run history for a single domain schedule."""
-    return config_service.get_schedule_history_result(
-        domain_name, session_mgr, settings
-    )
 
 
 @router.get("/schedules/status")
@@ -973,43 +1604,7 @@ async def scheduler_status():
     return config_service.scheduler_status_payload()
 
 
-@router.delete("/schedules/{domain_name}")
-async def delete_schedule(
-    domain_name: str,
-    session_mgr: SessionManager = Depends(get_session_manager),
-    settings: Settings = Depends(get_settings),
-):
-    """Remove a build schedule for a domain."""
-    return config_service.delete_schedule_result(domain_name, session_mgr, settings)
-
-
-@router.post("/schedules/{domain_name}/run-now")
-async def run_schedule_now(
-    domain_name: str,
-    session_mgr: SessionManager = Depends(get_session_manager),
-    settings: Settings = Depends(get_settings),
-):
-    """Fire the build schedule for *domain_name* immediately (one-shot)."""
-    return config_service.trigger_schedule_now_result(
-        domain_name, session_mgr, settings
-    )
-
-
-# ===========================================
-# Scheduled Cohort Materialisations
-# ===========================================
-
-
-@router.get("/cohort-schedules")
-async def list_cohort_schedules(
-    session_mgr: SessionManager = Depends(get_session_manager),
-    settings: Settings = Depends(get_settings),
-):
-    """Return all per-(domain, rule) cohort schedules."""
-    return config_service.list_cohort_schedules_result(session_mgr, settings)
-
-
-@router.get("/cohort-schedules/rules/{domain_name}")
+@router.get("/schedules/rules/{domain_name}")
 async def list_cohort_rules_for_domain(
     domain_name: str,
     session_mgr: SessionManager = Depends(get_session_manager),
@@ -1021,51 +1616,280 @@ async def list_cohort_rules_for_domain(
     )
 
 
-@router.post("/cohort-schedules")
-async def save_cohort_schedule(
+@router.get("/schedules/{task_type}/{domain_name}/history")
+async def get_schedule_history(
+    task_type: str,
+    domain_name: str,
+    target: str = Query(default=""),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Return the run history for a single schedule."""
+    return config_service.get_schedule_history_result(
+        task_type, domain_name, session_mgr, settings, target_key=target
+    )
+
+
+@router.delete("/schedules/{task_type}/{domain_name}")
+async def delete_schedule(
+    task_type: str,
+    domain_name: str,
+    target: str = Query(default=""),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Remove a schedule."""
+    return config_service.delete_schedule_result(
+        task_type, domain_name, session_mgr, settings, target_key=target
+    )
+
+
+@router.post("/schedules/{task_type}/{domain_name}/run-now")
+async def run_schedule_now(
+    task_type: str,
+    domain_name: str,
+    target: str = Query(default=""),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Fire a schedule immediately (one-shot, off its own clock)."""
+    return config_service.trigger_schedule_now_result(
+        task_type, domain_name, session_mgr, settings, target_key=target
+    )
+
+
+@router.get("/runs/build")
+async def get_all_build_runs(
+    domain: Optional[str] = Query(default=None),
+    limit: int = Query(default=25, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """One page of build runs across every domain (newest-first).
+
+    Backs the build tab of Settings → Automation → Runs. ``domain`` is
+    optional: absent or empty means every domain in the registry. Admin-only
+    by virtue of the ``/settings`` prefix.
+    """
+    return config_service.get_all_build_runs_result(
+        session_mgr, settings, folder=domain or None, limit=limit, offset=offset
+    )
+
+
+@router.get("/runs/analytics")
+async def get_all_analytics_runs(
+    domain: Optional[str] = Query(default=None),
+    limit: int = Query(default=25, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """One page of analytics runs across every domain (newest-first).
+
+    The analytics tab's counterpart to :func:`get_all_build_runs`; spans every
+    version, since the Runs page has no version filter.
+    """
+    return config_service.get_all_analytics_runs_result(
+        session_mgr, settings, folder=domain or None, limit=limit, offset=offset
+    )
+
+
+@router.get("/build-runs/{domain_name}")
+async def get_build_runs(
+    domain_name: str,
+    version: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Return the build-run trace for a domain (newest-first, optional version)."""
+    return config_service.get_build_runs_result(
+        domain_name, session_mgr, settings, version=version, limit=limit
+    )
+
+
+@router.get("/build-analytics/{domain_name}")
+async def get_build_analytics(
+    domain_name: str,
+    version: Optional[str] = Query(default=None),
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """Return aggregate build statistics for a domain (optional version)."""
+    return config_service.get_build_analytics_result(
+        domain_name, session_mgr, settings, version=version
+    )
+
+
+# ===========================================
+# Domain edit locks (admin overview)
+# ===========================================
+
+
+@router.get(
+    "/locks",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def list_edit_locks(
+    session_mgr: SessionManager = Depends(get_session_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """List all active domain edit-locks across the registry (admin only)."""
+    from back.objects.registry.collab import EditLockService
+
+    with map_route_errors("list edit locks", logger):
+        return EditLockService.list_all(session_mgr, settings)
+
+
+@router.post(
+    "/locks/release",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def release_edit_lock_admin(
     request: Request,
     session_mgr: SessionManager = Depends(get_session_manager),
     settings: Settings = Depends(get_settings),
 ):
-    """Create or update a cohort materialisation schedule."""
+    """Force-unlock a ``(folder, version)`` edit-lock (admin only)."""
+    from back.objects.registry.collab import EditLockService
+
     data = await request.json()
-    return config_service.save_cohort_schedule_result(data, session_mgr, settings)
+    folder = (data.get("folder") or "").strip()
+    version = (data.get("version") or "").strip()
+    if not folder or not version:
+        raise ValidationError("folder and version are required")
+    with map_route_errors("force release edit lock", logger):
+        return EditLockService.admin_release(
+            session_mgr, settings, folder, version
+        )
 
 
-@router.get("/cohort-schedules/{domain_name}/{rule_id}/history")
-async def get_cohort_schedule_history(
-    domain_name: str,
-    rule_id: str,
-    session_mgr: SessionManager = Depends(get_session_manager),
-    settings: Settings = Depends(get_settings),
+# ===========================================
+# Diagnostics
+# ===========================================
+
+
+@router.get(
+    "/diagnostics",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def run_diagnostics(settings: Settings = Depends(get_settings)):
+    """Run grouped diagnostic checks for all application subsystems (admin only).
+
+    Returns four check groups:
+
+    * **Unity Catalog — Registry** — catalog/schema/volume access + DDL privileges
+    * **Lakebase — Registry** — Postgres connection, registry tables, permissions
+    * **Lakebase — Graph DB** — graph schema connectivity, tables, permissions
+    * **Delta Triple Store** — Delta warehouse, UC objects, Accelerated Sync
+
+    Each group contains individual ``{name, label, status, detail, duration_ms}``
+    checks that mirror the shape used by ``GET /settings/diagnostics/readiness``.
+    """
+    from shared.fastapi.health import run_diagnostics_checks
+
+    return await run_blocking(run_diagnostics_checks, settings)
+
+
+@router.get(
+    "/diagnostics/readiness",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def run_readiness(settings: Settings = Depends(get_settings)):
+    """Run the flat dependency readiness probes (admin only).
+
+    Warehouse ``SELECT 1``, registry view DDL, Databricks auth and
+    Lakebase probes; their details name hosts, catalogs and schemas, so
+    they are never exposed on the anonymous ``GET /health``.
+    """
+    from shared.fastapi.health import run_readiness_checks
+
+    return await run_blocking(run_readiness_checks, settings)
+
+
+# ===========================================
+# Application Logs
+# ===========================================
+
+
+@router.get(
+    "/logs",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def get_app_logs(
+    lines: int = Query(default=200, ge=1, le=5000),
 ):
-    """Return the run history for a single cohort schedule."""
-    return config_service.get_cohort_schedule_history_result(
-        domain_name, rule_id, session_mgr, settings
+    """Return the last *lines* lines of the rotating application log file (admin only)."""
+    from pathlib import Path as _Path
+
+    mgr = LogManager.instance()
+    log_path = mgr.log_path
+    if not log_path:
+        return {"log_path": None, "log_level": mgr.level, "lines": [], "total_lines": 0}
+
+    def _read() -> list[str]:
+        p = _Path(log_path)
+        if not p.exists():
+            return []
+        return p.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    try:
+        all_lines: list[str] = await run_blocking(_read)
+        tail = all_lines[-lines:]
+        return {
+            "log_path": log_path,
+            "log_level": mgr.level,
+            "lines": tail,
+            "total_lines": len(all_lines),
+        }
+    except Exception as exc:
+        logger.warning("Failed to read log file %s: %s", log_path, exc)
+        return {
+            "log_path": log_path,
+            "log_level": mgr.level,
+            "lines": [f"[Error reading log file: {exc}]"],
+            "total_lines": 0,
+        }
+
+
+@router.get(
+    "/logs/download",
+    dependencies=[Depends(require(ROLE_ADMIN))],
+)
+async def download_app_logs():
+    """Download the full rotating log file as a plain-text attachment (admin only).
+
+    Reads the file atomically into memory so Content-Length always matches the
+    actual body — avoids a Content-Length mismatch on a live log that is still
+    being written to.
+    """
+    from pathlib import Path as _Path
+
+    mgr = LogManager.instance()
+    log_path = mgr.log_path
+    if not log_path:
+        return PlainTextResponse("Log file not configured.", status_code=404)
+
+    p = _Path(log_path)
+    if not p.exists():
+        return PlainTextResponse(f"Log file not found: {log_path}", status_code=404)
+
+    try:
+        content: bytes = await run_blocking(p.read_bytes)
+    except Exception as exc:
+        logger.warning("Failed to read log file for download %s: %s", log_path, exc)
+        return PlainTextResponse(f"Error reading log file: {exc}", status_code=500)
+
+    from datetime import datetime as _dt
+    stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+    stem = p.stem   # e.g. "ontobricks"
+    filename = f"{stem}_{stamp}.log"
+
+    return Response(
+        content=content,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
-@router.delete("/cohort-schedules/{domain_name}/{rule_id}")
-async def delete_cohort_schedule(
-    domain_name: str,
-    rule_id: str,
-    session_mgr: SessionManager = Depends(get_session_manager),
-    settings: Settings = Depends(get_settings),
-):
-    """Remove a cohort schedule for *(domain_name, rule_id)*."""
-    return config_service.delete_cohort_schedule_result(
-        domain_name, rule_id, session_mgr, settings
-    )
-
-
-@router.post("/cohort-schedules/{domain_name}/{rule_id}/run-now")
-async def run_cohort_schedule_now(
-    domain_name: str,
-    rule_id: str,
-    session_mgr: SessionManager = Depends(get_session_manager),
-    settings: Settings = Depends(get_settings),
-):
-    """Fire the cohort schedule for *(domain_name, rule_id)* immediately."""
-    return config_service.trigger_cohort_schedule_now_result(
-        domain_name, rule_id, session_mgr, settings
-    )

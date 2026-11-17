@@ -13,11 +13,11 @@
 }
 
 .rich-grid th {
-    background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+    background: #FCFBFA;
     padding: 0.5rem 0.75rem;
     text-align: left;
     font-weight: 600;
-    border-bottom: 2px solid #dee2e6;
+    border-bottom: 1px solid var(--db-border);
     position: relative;
     cursor: pointer;
     user-select: none;
@@ -28,7 +28,7 @@
 }
 
 .rich-grid th:hover {
-    background: linear-gradient(135deg, #e9ecef 0%, #dee2e6 100%);
+    background: #FCFBFA;
 }
 
 .rich-grid th .sort-icon {
@@ -57,7 +57,7 @@
 
 .rich-grid td {
     padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid #f0f0f0;
+    border-bottom: 1px solid var(--db-border-light);
     max-width: 300px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -65,7 +65,7 @@
 }
 
 .rich-grid tr:hover td {
-    background: #f8f9fa;
+    background: #ffffff;
 }
 
 .rich-grid .uri-cell {
@@ -86,8 +86,8 @@
     width: 100%;
     height: 550px;
     border: 2px solid var(--db-border-light);
-    border-radius: 12px;
-    background: #ffffff;
+    border-radius: var(--db-radius-card);
+    background: var(--db-surface-warm);
     position: relative;
     overflow: hidden;
 }
@@ -221,7 +221,7 @@
 }
 
 /* ==========================================================================
-   Home Page - Workflow Section & Cards
+   Home Page - Workflow Section (shared section wrapper + header)
    ========================================================================== */
 .workflow-section {
     margin-bottom: 2rem;
@@ -234,179 +234,6 @@
     font-size: 0.85rem;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-}
-
-.workflow-cards {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 1.5rem;
-}
-
-@media (max-width: 992px) {
-    .workflow-cards {
-        grid-template-columns: 1fr;
-    }
-}
-
-.workflow-card {
-    background: white;
-    border-radius: 16px;
-    padding: 1.75rem;
-    border: 2px solid var(--db-border);
-    text-decoration: none;
-    color: inherit;
-    display: flex;
-    flex-direction: column;
-    transition: all 0.3s ease;
-    position: relative;
-}
-
-.workflow-card:hover {
-    transform: translateY(-4px);
-    box-shadow: 0 8px 30px rgba(0,0,0,0.12);
-    border-color: var(--db-primary);
-    color: inherit;
-}
-
-.workflow-card .step-badge {
-    position: absolute;
-    top: -12px;
-    left: 20px;
-    background: var(--db-primary);
-    color: white;
-    font-size: 0.75rem;
-    font-weight: 700;
-    padding: 4px 12px;
-    border-radius: 12px;
-}
-
-.workflow-card .card-icon {
-    font-size: 2.5rem;
-    margin-bottom: 1rem;
-}
-
-.workflow-card.taxonomy .card-icon { color: #4CAF50; }
-.workflow-card.mapping .card-icon { color: #2196F3; }
-.workflow-card.query .card-icon { color: #9C27B0; }
-
-.workflow-card h4 {
-    font-weight: 600;
-    margin-bottom: 0.5rem;
-}
-
-.workflow-card p {
-    color: var(--db-text-muted);
-    font-size: 0.9rem;
-    margin-bottom: 1rem;
-    flex-grow: 1;
-}
-
-.workflow-card .card-status {
-    font-size: 0.8rem;
-    padding: 6px 12px;
-    border-radius: 6px;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-}
-
-.workflow-card .card-status.ready {
-    background: #e8f5e9;
-    color: #2e7d32;
-}
-
-.workflow-card .card-status.pending {
-    background: #fff3e0;
-    color: #ef6c00;
-}
-
-.workflow-card .card-actions {
-    margin-top: 1rem;
-    display: flex;
-    gap: 0.5rem;
-    align-items: center;
-}
-
-.workflow-card .card-action {
-    padding: 0.6rem 1.2rem;
-    background: var(--db-primary);
-    color: white;
-    border-radius: 8px;
-    font-weight: 600;
-    font-size: 0.9rem;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    transition: background 0.2s;
-    text-decoration: none;
-}
-
-.workflow-card .card-action:hover {
-    background: var(--db-primary-dark);
-    color: white;
-}
-
-.workflow-card .card-reset-btn {
-    padding: 0.5rem 0.75rem;
-    background: transparent;
-    color: var(--db-text-muted);
-    border: 1px solid var(--db-border);
-    border-radius: 6px;
-    font-size: 0.8rem;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    cursor: pointer;
-    transition: all 0.2s;
-}
-
-.workflow-card .card-reset-btn:hover {
-    background: #e9ecef;
-    color: #212529;
-    border-color: #495057;
-}
-
-/* ==========================================================================
-   Home Page - Session Stats (within Project Panel)
-   ========================================================================== */
-
-.session-stats {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 1rem;
-}
-
-@media (max-width: 768px) {
-    .session-stats {
-        grid-template-columns: repeat(2, 1fr);
-    }
-}
-
-.stat-item {
-    text-align: center;
-    padding: 1rem;
-    background: var(--db-light-gray);
-    border-radius: 12px;
-}
-
-.stat-item .stat-icon {
-    font-size: 1.5rem;
-    margin-bottom: 0.5rem;
-}
-
-.stat-item .stat-icon.active { color: #4CAF50; }
-.stat-item .stat-icon.inactive { color: #bdbdbd; }
-
-.stat-item .stat-value {
-    font-size: 1.5rem;
-    font-weight: 700;
-    color: var(--db-text);
-}
-
-.stat-item .stat-label {
-    font-size: 0.8rem;
-    color: var(--db-text-muted);
-    margin-top: 0.25rem;
 }
 
 /* ==========================================================================
@@ -424,7 +251,7 @@
 .quick-link {
     padding: 0.5rem 1rem;
     background: var(--db-light-gray);
-    border-radius: 8px;
+    border-radius: var(--db-radius-control);
     font-size: 0.85rem;
     color: var(--db-text);
     text-decoration: none;
@@ -449,12 +276,12 @@
    Home Page - Project Management Panel
    ========================================================================== */
 .domain-panel {
-    background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-    border-radius: 16px;
+    background: var(--db-surface-warm);
+    border-radius: var(--db-radius-card);
     padding: 1.5rem;
-    border: 2px solid var(--db-border);
+    border: 1px solid var(--db-border);
     margin-bottom: 2rem;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.06);
+    box-shadow: none;
 }
 
 .domain-header {
@@ -486,7 +313,7 @@
 .quick-link-sm {
     padding: 0.35rem 0.75rem;
     background: var(--db-light-gray);
-    border-radius: 6px;
+    border-radius: var(--db-radius-control);
     font-size: 0.8rem;
     color: var(--db-text);
     text-decoration: none;
@@ -505,107 +332,22 @@
     font-size: 0.9rem;
 }
 
-.domain-panel .session-stats {
-    margin-bottom: 1.25rem;
-}
-
 .domain-description {
     color: var(--db-text-muted);
     font-size: 0.9rem;
     margin-bottom: 1.25rem;
 }
 
-.domain-actions {
-    display: flex;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-}
-
-.domain-btn {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 0.75rem 1rem;
-    border-radius: 10px;
-    border: 1px solid var(--db-border);
-    background: var(--db-light-gray);
-    cursor: pointer;
-    transition: all 0.2s ease;
-    min-width: 85px;
-    text-decoration: none;
-}
-
-.domain-btn i {
-    font-size: 1.25rem;
-    margin-bottom: 0.35rem;
-    color: var(--db-text-muted);
-}
-
-.domain-btn span {
-    font-size: 0.75rem;
-    font-weight: 500;
-    color: var(--db-text);
-}
-
-.domain-btn:hover {
-    background: var(--db-primary);
-    border-color: var(--db-primary);
-}
-
-.domain-btn:hover i,
-.domain-btn:hover span {
-    color: white;
-}
-
-/* Project Button Dropdowns */
-.domain-actions .dropdown {
-    position: relative;
-}
-
-.domain-actions .dropdown-toggle::after {
-    display: none; /* Hide default caret, icon is enough */
-}
-
-.domain-actions .dropdown-menu {
-    min-width: 200px;
-    border-radius: 8px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-    border: 1px solid var(--db-border);
-    margin-top: 0.25rem;
-}
-
-.domain-actions .dropdown-menu .dropdown-item {
-    padding: 0.5rem 1rem;
-    font-size: 0.875rem;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-}
-
-.domain-actions .dropdown-menu .dropdown-item i {
-    font-size: 1rem;
-    color: var(--db-primary);
-}
-
-.domain-actions .dropdown-menu .dropdown-item:hover {
-    background: var(--db-light-gray);
-}
-
-.domain-actions .dropdown-menu .dropdown-item:hover i {
-    color: var(--db-primary);
-}
-
 /* Project Status Messages */
 .domain-status {
     margin-top: 1rem;
     padding: 0.75rem 1rem;
-    border-radius: 8px;
+    border-radius: var(--db-radius-control);
     font-size: 0.85rem;
     display: flex;
     align-items: center;
     gap: 8px;
-    background: var(--db-light-gray);
+    background: var(--db-surface-warm);
     border: 1px solid var(--db-border);
     color: var(--db-text);
 }
@@ -623,66 +365,15 @@
 }
 
 .domain-status.success {
-    border-left: 3px solid #16a34a;
+    border-left: 3px solid var(--db-status-success);
 }
 
 .domain-status.error {
-    border-left: 3px solid #dc2626;
+    border-left: 3px solid var(--db-status-danger);
 }
 
 .domain-status.warning {
-    border-left: 3px solid #d97706;
-}
-
-@media (max-width: 768px) {
-    .domain-actions {
-        justify-content: center;
-    }
-    
-    .domain-btn {
-        flex: 1 1 calc(50% - 0.75rem);
-        min-width: 100px;
-    }
-}
-
-/* ==========================================================================
-   Home Page - Info Cards
-   ========================================================================== */
-.info-cards {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 1rem;
-    margin-top: 2rem;
-}
-
-@media (max-width: 992px) {
-    .info-cards {
-        grid-template-columns: 1fr;
-    }
-}
-
-.info-card {
-    background: var(--db-light-gray);
-    border-radius: 12px;
-    padding: 1.25rem;
-}
-
-.info-card h6 {
-    font-weight: 600;
-    margin-bottom: 0.5rem;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-.info-card h6 i {
-    color: var(--db-primary);
-}
-
-.info-card p {
-    font-size: 0.85rem;
-    color: var(--db-text-muted);
-    margin: 0;
+    border-left: 3px solid var(--db-status-warning);
 }
 
 /* ==========================================================================
@@ -728,7 +419,7 @@
     transition: background-color 0.2s ease;
 }
 .notif-item:hover {
-    background-color: #f8f9fa;
+    background-color: #ffffff;
 }
 @keyframes notifFlash {
     0%   { transform: scale(1); }
@@ -753,10 +444,10 @@
 }
 .error-toast-popup {
     pointer-events: auto;
-    background: #dc3545;
+    background: var(--db-status-danger);
     color: #fff;
     padding: 12px 16px;
-    border-radius: 8px;
+    border-radius: var(--db-radius-control);
     box-shadow: 0 6px 20px rgba(220, 53, 69, 0.4);
     font-size: 0.875rem;
     word-break: break-word;
@@ -768,10 +459,10 @@
 }
 .success-toast-popup {
     pointer-events: auto;
-    background: #198754;
+    background: var(--db-status-success);
     color: #fff;
     padding: 12px 16px;
-    border-radius: 8px;
+    border-radius: var(--db-radius-control);
     box-shadow: 0 6px 20px rgba(25, 135, 84, 0.35);
     font-size: 0.875rem;
     word-break: break-word;
@@ -781,10 +472,10 @@
 .success-toast-popup:not(.show) { opacity: 0; }
 .warning-toast-popup {
     pointer-events: auto;
-    background: #ffc107;
+    background: var(--db-status-warning);
     color: #212529;
     padding: 12px 16px;
-    border-radius: 8px;
+    border-radius: var(--db-radius-control);
     box-shadow: 0 6px 20px rgba(255, 193, 7, 0.35);
     font-size: 0.875rem;
     word-break: break-word;
@@ -866,47 +557,6 @@
 }
 
 /* ==========================================================================
-   Custom Tab Styling (Mapping, Taxonomy, R2RML pages)
-   Override default nav-tabs with black text on gray background
-   ========================================================================== */
-.custom-tabs .nav-item {
-    margin-right: 0.5rem;
-}
-
-.custom-tabs .nav-item:last-child {
-    margin-right: 0;
-}
-
-.custom-tabs .nav-link,
-.custom-tabs .nav-link:link,
-.custom-tabs .nav-link:visited {
-    color: var(--db-text) !important;
-    background-color: var(--db-border);
-    border: 1px solid var(--db-border-light);
-    border-radius: 6px 6px 0 0;
-    font-weight: 500;
-}
-
-.custom-tabs .nav-link:hover,
-.custom-tabs .nav-link:focus {
-    color: var(--db-text) !important;
-    background-color: var(--db-light-gray);
-}
-
-.custom-tabs .nav-link.active,
-.custom-tabs .nav-link.active:hover,
-.custom-tabs .nav-link.active:focus {
-    color: white !important;
-    background-color: var(--db-primary);
-    border-color: var(--db-primary);
-    font-weight: 600;
-}
-
-.custom-tabs .nav-link i {
-    margin-right: 5px;
-}
-
-/* ==========================================================================
    Mapping Page Styles
    ========================================================================== */
 .mapping-card {
@@ -920,8 +570,8 @@
     width: 100%;
     height: 600px;
     border: 1px solid var(--db-border-light);
-    border-radius: 8px;
-    background-color: #fafafa;
+    border-radius: var(--db-radius-card);
+    background-color: var(--db-surface-warm);
 }
 
 /* Smaller graph container variant */
@@ -933,7 +583,7 @@
    Status Banners
    ========================================================================== */
 .status-banner {
-    border-radius: 8px;
+    border-radius: var(--db-radius-control);
 }
 
 .status-banner.success {
@@ -1064,8 +714,8 @@
     align-items: center;
     gap: 0.5rem;
     padding: 0.25rem 0.5rem;
-    background: white;
-    border-radius: 4px;
+    background: var(--db-surface-warm);
+    border-radius: var(--db-radius-control);
     font-size: 0.85rem;
 }
 
@@ -1159,7 +809,7 @@
     line-height: 1.5;
     max-height: 75vh;
     overflow: auto;
-    background: #f8f9fa;
+    background: #ffffff;
     color: #000000;
     white-space: pre-wrap;
     word-break: break-word;
@@ -1177,7 +827,7 @@
 .doc-preview-md h4 { font-size: 1.1rem; margin-top: 1rem; }
 .doc-preview-md h5 { font-size: 1rem; margin-top: 0.8rem; }
 .doc-preview-md code {
-    background: #f0f0f0;
+    background: #ffffff;
     padding: 0.15em 0.4em;
     border-radius: 3px;
     font-size: 0.85em;

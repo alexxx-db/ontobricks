@@ -3,33 +3,66 @@
 <!-- JS: /static/ontology/js/ontology-map.js, /static/ontology/js/ontology-assistant.js -->
 <div class="section-header d-flex justify-content-between align-items-center">
     <div>
-        <h4 class="mb-1"><i class="bi bi-diagram-3 me-2"></i>Ontology Designer</h4>
+        <h4 class="mb-1"><i class="bi bi-pencil me-2"></i>Ontology Studio</h4>
         <p class="text-muted mb-0 small">Interactive force-directed graph of your ontology</p>
     </div>
     <div class="d-flex align-items-center gap-2">
-            <button class="btn btn-sm btn-outline-secondary" id="mapZoomIn" title="Zoom In">
+        <div class="btn-group btn-group-sm" role="group" aria-label="Zoom and view">
+            <button class="btn btn-outline-secondary" id="mapZoomIn" title="Zoom In" aria-label="Zoom in">
                 <i class="bi bi-zoom-in"></i>
             </button>
-            <button class="btn btn-sm btn-outline-secondary" id="mapZoomOut" title="Zoom Out">
+            <button class="btn btn-outline-secondary" id="mapZoomOut" title="Zoom Out" aria-label="Zoom out">
                 <i class="bi bi-zoom-out"></i>
             </button>
-            <button class="btn btn-sm btn-outline-secondary" id="mapResetView" title="Reset View">
+            <button class="btn btn-outline-secondary" id="mapResetView" title="Reset View" aria-label="Reset view">
                 <i class="bi bi-arrows-fullscreen"></i>
             </button>
-            <div class="vr mx-1"></div>
-            <button class="btn btn-sm btn-outline-secondary" id="mapResetLayout" title="Reset Layout (Auto-arrange)">
+        </div>
+        <div class="btn-group btn-group-sm" role="group" aria-label="Layout and display">
+            <button class="btn btn-outline-secondary" id="mapResetLayout" title="Reset Layout (Auto-arrange)" aria-label="Reset layout">
                 <i class="bi bi-shuffle"></i>
             </button>
-            <button class="btn btn-sm btn-outline-secondary" id="mapAutoAssignIcons" title="Auto-map icons based on entity names">
-                <i class="bi bi-emoji-smile"></i>
+            <button class="btn btn-outline-secondary active" id="mapToggleInheritance" title="Show/hide inheritance links" aria-label="Show or hide inheritance links" aria-pressed="true">
+                <i class="bi bi-diagram-3"></i>
+            </button>
+            <button class="btn btn-outline-secondary active" id="mapToggleGrid" title="Hide dot grid" aria-label="Show or hide the canvas dot grid" aria-pressed="true">
+                <i class="bi bi-grid-3x3-gap"></i>
+            </button>
+            <button class="btn btn-outline-secondary" id="mapToggleSelect" title="Select entities (or hold Ctrl/Cmd)" aria-label="Select entities (or hold Ctrl/Cmd)" aria-pressed="false">
+                <i class="bi bi-bounding-box"></i>
+            </button>
+            <button class="btn btn-outline-secondary" id="mapSearchBtn" title="Search entity" aria-label="Search entity">
+                <i class="bi bi-search"></i>
             </button>
         </div>
+        <!-- These two are hidden outright for viewers (permissions.css), so they stay
+             out of the groups above: a hidden member would leave its neighbour with a
+             squared edge. -->
+        <button type="button" class="btn btn-sm btn-outline-secondary ontology-edit-btn" id="mapImportEntity"
+                title="Import entities from another domain" aria-label="Import entities from another domain">
+            <i class="bi bi-box-arrow-in-down me-1"></i> Import entity
+        </button>
+        <button class="btn btn-sm btn-outline-secondary" id="mapAutoAssignIcons" data-requires-llm
+                title="Auto-map icons based on entity names" aria-label="Auto-assign icons">
+            <i class="bi bi-emoji-smile"></i>
+        </button>
+        <button class="btn btn-sm btn-outline-secondary" id="mapToggleAssistant" data-requires-llm
+                title="Ontology assistant" aria-label="Open the ontology assistant">
+            <i class="bi bi-stars"></i>
+        </button>
+        <button class="btn btn-sm btn-outline-primary" id="mapDiscuss" title="Open the ontology discussion (optionally tag an entity/relationship)" aria-label="Open the ontology discussion">
+            <i class="bi bi-chat-dots"></i>
+        </button>
+        <button type="button" class="btn btn-sm btn-outline-secondary" id="mapDownloadOwl" title="Export the generated OWL (Turtle)" aria-label="Export OWL">
+            <i class="bi bi-download me-1"></i> Export
+        </button>
+    </div>
 </div>
-<div class="card border-0 shadow-sm h-100">
+<div class="card border-0 h-100 ob-split-shell">
     <div class="card-body p-0 position-relative">
         <div id="ontology-map-wrapper" class="ontology-map-wrapper">
             <!-- Main map container -->
-            <div id="ontology-map-container">
+            <div id="ontology-map-container" class="ob-split-pane map-grid-visible">
                 <!-- Loading Overlay -->
                 <div id="ontologyMapLoading" class="designer-loading-overlay">
                     <div class="ob-loading-spinner">
@@ -59,16 +92,22 @@
                 </div>
             </div>
         </div>
-        <!-- Floating AI Assistant FAB (bottom-right of canvas) -->
-        <button id="mapToggleAssistant" class="assistant-fab" title="AI Assistant">
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" width="28" height="28">
-                <line x1="6" y1="26" x2="22" y2="10" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
-                <rect x="20" y="6" width="6" height="6" rx="1" transform="rotate(45 23 9)" fill="#fff"/>
-                <path d="M10 4 l.7-2 .7 2 2 .7-2 .7-.7 2-.7-2-2-.7Z" fill="#fff"/>
-                <path d="M4 14 l.5-1.5.5 1.5 1.5.5-1.5.5-.5 1.5-.5-1.5-1.5-.5Z" fill="#fff" opacity=".7"/>
-                <path d="M18 2 l.4-1.2.4 1.2 1.2.4-1.2.4-.4 1.2-.4-1.2-1.2-.4Z" fill="#fff" opacity=".6"/>
-            </svg>
-        </button>
+        <!-- Entity Search Popup -->
+        <div id="mapSearchPopup" class="map-search-popup map-search-popup--hidden">
+            <div class="map-search-popup-header">
+                <span><i class="bi bi-search me-1"></i>Find Entity</span>
+                <button type="button" class="btn-close btn-close-sm" id="mapSearchClose" title="Close"></button>
+            </div>
+            <div class="map-search-popup-body">
+                <select id="mapSearchSelect" class="form-select form-select-sm">
+                    <option value="" disabled selected>Select an entity…</option>
+                </select>
+                <button class="btn btn-sm btn-primary w-100 mt-2" id="mapSearchGo">
+                    <i class="bi bi-search me-1"></i>Focus
+                </button>
+            </div>
+        </div>
+
         <!-- Floating AI Assistant Popup -->
         <div id="assistantPopup" class="assistant-popup">
             <div class="assistant-popup-header">
@@ -79,16 +118,19 @@
             </div>
             <div class="assistant-messages" id="assistantMessages">
                 <div class="assistant-welcome">
-                    <div class="assistant-welcome-icon"><img src="/static/global/img/favicon.svg" alt="OntoBricks" width="40" height="40"></div>
+                    <div class="assistant-welcome-icon"><img data-brand-icon src="{{ ui_branding_for().logo_url }}" alt="{{ ui_branding_for().app_title }}" width="40" height="40"></div>
                     <p>Modify your ontology with natural language:</p>
                     <div class="assistant-suggestions">
-                        <button class="btn btn-sm btn-outline-primary assistant-suggestion" data-message="Show me all entities and their attributes">
+                        <button class="btn btn-sm btn-outline-primary assistant-suggestion" data-requires-llm
+                                data-message="Show me all entities and their attributes">
                             <i class="bi bi-list-ul me-1"></i>List entities
                         </button>
-                        <button class="btn btn-sm btn-outline-primary assistant-suggestion" data-message="Show me all relationships">
+                        <button class="btn btn-sm btn-outline-primary assistant-suggestion" data-requires-llm
+                                data-message="Show me all relationships">
                             <i class="bi bi-arrow-left-right me-1"></i>List relationships
                         </button>
-                        <button class="btn btn-sm btn-outline-danger assistant-suggestion" data-message="Remove all the entities that have no relationship and no inheritance">
+                        <button class="btn btn-sm btn-outline-danger assistant-suggestion" data-requires-llm
+                                data-message="Remove all the entities that have no relationship and no inheritance">
                             <i class="bi bi-trash me-1"></i>Clean orphans
                         </button>
                     </div>
@@ -96,8 +138,10 @@
             </div>
             <div class="assistant-input-area">
                 <div class="assistant-input-wrapper">
-                    <textarea id="assistantInput" class="form-control" placeholder="Ask me to modify your ontology…" rows="1"></textarea>
-                    <button id="assistantSendBtn" class="btn btn-primary" title="Send message" disabled>
+                    <textarea id="assistantInput" class="form-control" data-requires-llm-submit
+                              placeholder="Ask me to modify your ontology…" rows="1"></textarea>
+                    <button id="assistantSendBtn" class="btn btn-primary" data-requires-llm
+                            title="Send message" disabled>
                         <i class="bi bi-send-fill"></i>
                     </button>
                 </div>

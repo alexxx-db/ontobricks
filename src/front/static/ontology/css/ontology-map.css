@@ -3,14 +3,17 @@
  * Extracted from ontology templates per code_instructions.txt
  */
 
-/* Map section: full-height canvas, no page scroll */
+/* Map section: full-height canvas, no page scroll. Insets mirror the Knowledge
+   Graph Explorer (query-sigmagraph.css): flush vertically with the sidebar and
+   a 0.5rem horizontal inset. */
 .sidebar-content:has(#map-section.active) {
     overflow: hidden;
-    padding: 0.5rem;
+    padding: 0;
 }
 
 #map-section.active {
     overflow: hidden;
+    padding: 0 0.5rem;
 }
 
 #map-section .section-header {
@@ -36,13 +39,31 @@
     min-width: 0;
     height: 100%;
     overflow: hidden;
-    background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+    background-color: var(--db-surface-warm);
     position: relative;
+}
+
+/* Viewport-fixed dotted grid, matching OntoViz `.ovz-canvas` (24px / 1px dots). */
+#ontology-map-container.map-grid-visible {
+    background-image: radial-gradient(
+        circle at 1px 1px,
+        color-mix(in srgb, var(--db-text) 18%, transparent) 1px,
+        transparent 0
+    );
+    background-size: 24px 24px;
 }
 
 #ontology-map-container svg {
     width: 100%;
     height: 100%;
+}
+
+#ontology-map-container.map-select-mode {
+    cursor: crosshair;
+}
+
+#ontology-map-container.map-select-mode .map-node {
+    cursor: pointer;
 }
 
 /* Entity nodes - icon only, no circles */
@@ -70,6 +91,24 @@
     pointer-events: none;
 }
 
+/* Badge shown on entities that have a Dashboard, Dataset, Actions, or
+   Bridges configured under the entity panel's "References" tab. */
+.map-node-external-badge-bg {
+    fill: #333333;
+    stroke: #ffffff;
+    stroke-width: 2px;
+    pointer-events: none;
+}
+
+.map-node-external-badge-icon {
+    font-family: "bootstrap-icons" !important;
+    font-size: 12px;
+    fill: #ffc107;
+    text-anchor: middle;
+    dominant-baseline: central;
+    pointer-events: none;
+}
+
 .map-node-hitarea {
     fill: transparent;
     stroke: none;
@@ -77,8 +116,8 @@
 }
 
 .map-node.selected .map-node-hitarea {
-    fill: rgba(108, 117, 125, 0.15);
-    stroke: rgba(73, 80, 87, 0.5);
+    fill: rgba(var(--db-primary-rgb), 0.18);
+    stroke: var(--db-primary);
     stroke-width: 2px;
 }
 
@@ -87,7 +126,14 @@
 }
 
 .map-node.selected .map-node-icon {
-    filter: drop-shadow(0 0 12px rgba(73, 80, 87, 0.9));
+    filter: drop-shadow(0 0 12px rgba(var(--db-primary-rgb), 0.9));
+}
+
+.map-selection-marquee {
+    fill: var(--db-primary-light);
+    stroke: var(--db-primary);
+    stroke-width: 1px;
+    pointer-events: none;
 }
 
 /* Relationship links */
@@ -103,6 +149,12 @@
     stroke: #495057;
     stroke-opacity: 1;
     stroke-width: 3px;
+}
+
+/* Reverse-direction relationships — arrow at the source end, not the target end */
+.map-link.reverse {
+    marker-end: none;
+    marker-start: url(#map-arrow-start);
 }
 
 /* Self-loop relationships */
@@ -130,6 +182,13 @@
     stroke-dasharray: 5, 5;
     stroke-width: 2px;
     marker-end: url(#map-arrow-inheritance);
+}
+
+.map-link.inherited {
+    stroke: var(--db-text-muted, #6c757d);
+    stroke-dasharray: 4, 4;
+    stroke-width: 1.5px;
+    opacity: 0.85;
 }
 
 /* Link labels */
@@ -191,6 +250,16 @@
     );
 }
 
+.map-legend-line.inherited {
+    background: repeating-linear-gradient(
+        90deg,
+        #6c757d 0px,
+        #6c757d 4px,
+        transparent 4px,
+        transparent 8px
+    );
+}
+
 /* Context Menu */
 .map-context-menu {
     position: absolute;
@@ -217,7 +286,7 @@
 
 .map-context-header {
     padding: 10px 14px;
-    background: #f8f9fa;
+    background: #ffffff;
     border-bottom: 1px solid #e9ecef;
     display: flex;
     align-items: center;
@@ -255,7 +324,12 @@
 }
 
 .map-context-item:hover {
-    background: #f8f9fa;
+    background: #e8f4fd;
+    color: #1a73e8;
+}
+
+.map-context-item:hover i {
+    color: #1a73e8;
 }
 
 .map-context-item i {
@@ -272,7 +346,65 @@
     background: #fff5f5;
 }
 
-/* Connection Mode Styles */
+/* ─── Neighborhood highlight (on node click) ─── */
+
+/* Dim everything that is not selected/neighbor/highlighted */
+.map-node.dimmed .map-node-icon {
+    opacity: 0.15;
+    filter: none;
+}
+.map-node.dimmed .map-node-label {
+    opacity: 0.15;
+}
+.map-node.dimmed .map-node-external-badge-bg,
+.map-node.dimmed .map-node-external-badge-icon {
+    opacity: 0.15;
+}
+
+/* Neighbor nodes get a soft glow ring — same indigo as the selection, one
+   step lighter so the selected node still reads as the focus. */
+.map-node.neighbor .map-node-hitarea {
+    fill: rgba(var(--db-primary-rgb), 0.08);
+    stroke: rgba(var(--db-primary-rgb), 0.35);
+    stroke-width: 2px;
+}
+.map-node.neighbor .map-node-icon {
+    filter: drop-shadow(0 0 8px rgba(var(--db-primary-rgb), 0.5));
+}
+
+/* Highlighted links (connected to selected node) */
+.map-link.highlighted {
+    stroke: var(--db-primary);
+    stroke-opacity: 1;
+    stroke-width: 2.5px;
+}
+.map-link.highlighted.inheritance {
+    stroke: #6f42c1;
+    stroke-dasharray: 5, 5;
+}
+.map-link.dimmed {
+    stroke-opacity: 0.08;
+}
+
+/* Link labels */
+.map-link-label.highlighted {
+    fill: var(--db-primary);
+    font-weight: 700;
+    opacity: 1;
+}
+.map-link-label.dimmed {
+    opacity: 0.08;
+}
+
+/* Hitarea dots */
+.map-link-hitarea.highlighted {
+    fill: rgba(var(--db-primary-rgb), 0.2) !important;
+    stroke: var(--db-primary) !important;
+    stroke-width: 2px !important;
+}
+.map-link-hitarea.dimmed {
+    opacity: 0.12;
+}
 .map-connecting {
     cursor: crosshair !important;
 }
@@ -282,7 +414,7 @@
 }
 
 .map-connection-line {
-    stroke: #0d6efd;
+    stroke: var(--db-primary);
     stroke-width: 3px;
     stroke-dasharray: 8, 4;
     stroke-linecap: round;
@@ -297,13 +429,13 @@
 }
 
 .map-node.connection-source .map-node-hitarea {
-    fill: rgba(13, 110, 253, 0.2);
-    stroke: #0d6efd;
+    fill: rgba(var(--db-primary-rgb), 0.2);
+    stroke: var(--db-primary);
     stroke-width: 3px;
 }
 
 .map-node.connection-source .map-node-icon {
-    filter: drop-shadow(0 0 12px rgba(13, 110, 253, 0.8));
+    filter: drop-shadow(0 0 12px rgba(var(--db-primary-rgb), 0.8));
 }
 
 .map-node.connection-target .map-node-hitarea {
@@ -371,4 +503,50 @@
 
 .map-node.inheritance-target .map-node-icon {
     filter: drop-shadow(0 0 12px rgba(253, 126, 20, 0.8));
+}
+
+/* ── Entity Search Popup ─────────────────────────────────────── */
+.map-search-popup {
+    position: absolute;
+    top: 56px;
+    right: 12px;
+    width: 240px;
+    background: #fff;
+    border: 1px solid #dee2e6;
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.12);
+    z-index: 900;
+    animation: mapContextFadeIn 0.15s ease;
+}
+
+.map-search-popup--hidden {
+    display: none;
+}
+
+.map-search-popup-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #1e293b;
+    border-bottom: 1px solid #e9ecef;
+}
+
+.map-search-popup-body {
+    padding: 12px 14px 14px;
+}
+
+@media (max-width: 768px) {
+    .sidebar-content:has(#map-section.active),
+    #map-section.active {
+        overflow: visible;
+    }
+}
+
+/* Studio "Import entity" modal: both columns scroll independently. */
+#entityImportModal .entity-import-list {
+    max-height: 22rem;
+    overflow-y: auto;
 }

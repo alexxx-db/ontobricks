@@ -37,24 +37,22 @@ if app is None:
     
     app = FastAPI(title="OntoBricks - Error")
     
+    # The traceback goes to the app logs only; these routes are anonymous.
     @app.get("/", response_class=HTMLResponse)
     def error_page():
-        error_html = startup_error.replace('\n', '<br>') if startup_error else "Unknown error"
-        return f"""
+        return """
         <html>
         <head><title>OntoBricks - Startup Error</title></head>
-        <body style="font-family: monospace; padding: 20px;">
-            <h1 style="color: red;">OntoBricks Failed to Start</h1>
-            <h3>Error:</h3>
-            <pre style="background: #f0f0f0; padding: 15px; overflow: auto;">{error_html}</pre>
-            <p>Please check the logs for more details.</p>
+        <body>
+            <h1>OntoBricks Failed to Start</h1>
+            <p>Please check the app logs for details.</p>
         </body>
         </html>
         """
     
     @app.get("/health")
     def health():
-        return {"status": "error", "message": "App failed to start", "error": startup_error}
+        return {"status": "error", "message": "App failed to start"}
 
 if __name__ == '__main__':
     import logging
@@ -75,12 +73,29 @@ if __name__ == '__main__':
             log_config=None,
         )
     else:
-        uvicorn.run(
-            "shared.fastapi.main:app",
+        # Pass env_file so uvicorn reload workers also see the .env
+        # variables without re-running load_dotenv inside the app module.
+        _env_file = os.path.join(os.path.dirname(__file__), ".env")
+        # Auto-reload restarts the process on any src/ save, which kills
+        # in-flight background task threads (Auto-Map, KG build) and drops the
+        # in-memory TaskManager state. Set ONTOBRICKS_NO_RELOAD=1 when running
+        # long live jobs — notably `make scenario-campaign` — so a concurrent
+        # edit cannot abort them mid-run.
+        _no_reload = os.getenv("ONTOBRICKS_NO_RELOAD", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        _uvicorn_kwargs = dict(
             host='127.0.0.1',
             port=port,
-            reload=True,
-            reload_dirs=["src/back", "src/front", "src/api", "src/shared", "src/agents"],
             log_level="info",
             log_config=None,
         )
+        if not _no_reload:
+            _uvicorn_kwargs["reload"] = True
+            _uvicorn_kwargs["reload_dirs"] = [
+                "src/back", "src/front", "src/api", "src/shared", "src/agents"
+            ]
+        _log.info("Uvicorn auto-reload %s", "DISABLED" if _no_reload else "enabled")
+        if os.path.isfile(_env_file):
+            _uvicorn_kwargs["env_file"] = _env_file
+        uvicorn.run("shared.fastapi.main:app", **_uvicorn_kwargs)

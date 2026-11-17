@@ -35,6 +35,34 @@ MAX_ITERATIONS = 12
 LLM_TIMEOUT = 120
 
 _TRACE_NAME = "dtwin_chat"
+_UNREADABLE_REPLY = "I couldn't display that answer. Please try again."
+
+
+def _extract_reply_text(content: object) -> list[str]:
+    """Recursively extract user-visible text from model content blocks."""
+    if isinstance(content, str):
+        return [content] if content.strip() else []
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            parts.extend(_extract_reply_text(item))
+        return parts
+    if isinstance(content, dict):
+        block_type = content.get("type")
+        if block_type and block_type not in ("text", "output_text"):
+            return []
+        for key in ("text", "content", "value"):
+            if key in content:
+                return _extract_reply_text(content[key])
+    return []
+
+
+def normalize_reply_content(content: object) -> str:
+    """Return readable Markdown for a model response content payload."""
+    if isinstance(content, str) and content.strip():
+        return content
+    parts = [part.strip() for part in _extract_reply_text(content) if part.strip()]
+    return "\n\n".join(parts) if parts else _UNREADABLE_REPLY
 
 
 @dataclass
@@ -47,11 +75,18 @@ class AgentResult:
     iterations: int = 0
     error: str = ""
     usage: Dict[str, int] = field(default_factory=dict)
+    pending_action: Optional[dict] = None
+
+
+def _finalize_result(result: AgentResult, ctx: ToolContext) -> AgentResult:
+    """Copy session-side state onto the result before any return path."""
+    result.pending_action = ctx.pending_action
+    return result
 
 
 SYSTEM_PROMPT = """\
 You are the Graph Chat assistant for OntoBricks. You help the user
-explore a Digital Twin knowledge graph with natural-language questions.
+explore a Knowledge Graph with natural-language questions.
 
 CONTEXT
 The user has already selected a domain (knowledge graph). You do NOT
@@ -83,11 +118,12 @@ TOOLS
       Use only for bulk typed look-ups (e.g. "all Customers with their
       Orders") where you already know the schema covers the data you need.
 
-  - run_sparql(query, limit?)
-      Translates SPARQL to SQL over the WAREHOUSE MAPPING VIEWS — NOT the
-      graph store. Does NOT include triples added by inference or
-      materialisation. Use only for aggregations (COUNT, GROUP BY) or
-      cross-type joins over warehouse data.
+  CONTEXT (ontology design)
+  - get_entity_context(entity_uri, fetch_dataset_rows?, follow_bridges?)
+      Fetch linked Dataset rows and/or cross-domain Bridge entities.
+  - request_entity_action(entity_uri, action)
+      Propose a class Action (UC function). Does NOT execute it.
+      The UI will ask the user to Confirm or Cancel.
 
 WORKFLOW
   1. If you are unsure what the graph contains, call ``list_entity_types``
@@ -101,8 +137,8 @@ WORKFLOW
      Use depth=2 only when the user explicitly asks for indirect or extended
      relationships (e.g. "related through claims", "all connected entities").
   3. After ``describe_entity`` confirms what relationships exist, you may use
-     ``query_graphql`` for bulk typed look-ups or ``run_sparql`` for
-     aggregations, but treat ``describe_entity`` as the authoritative source.
+     ``query_graphql`` for bulk typed look-ups, but treat ``describe_entity``
+     as the authoritative source.
   4. Reply with a concise, well-formatted answer. Never invent URIs or counts.
 
 RULES
@@ -110,6 +146,10 @@ RULES
   * If a tool returns an error, read the error and try a different
     approach (e.g. narrower search, simpler SPARQL, different type).
   * Do NOT try to mutate data; mutating SPARQL is rejected.
+  * Never claim an Action ran unless a later tool/UI result says it completed.
+  * Only request actions that appeared in tool output (allow-listed fullName).
+  * Prefer describe_entity first; use get_entity_context when the user needs
+    table rows or bridge-linked entities.
   * Keep final answers short and relevant. Include URIs only when the
     user asks for them.
 
@@ -156,6 +196,7 @@ def run_agent(
     conversation_history: Optional[List[dict]] = None,
     session_headers: Optional[dict] = None,
     on_step: Optional[Callable[[str], None]] = None,
+    on_event: Optional[Callable[["AgentStep"], None]] = None,
     describe_depth: int = 1,
 ) -> AgentResult:
     """Run one turn of the Graph Chat agent.
@@ -243,7 +284,7 @@ def run_agent(
                 "dtwin_chat: %s at iteration %d", error_msg, iteration + 1
             )
             result.error = error_msg
-            return result
+            return _finalize_result(result, ctx)
 
         accumulate_usage(result.usage, llm_response.get("usage", {}))
 
@@ -254,7 +295,7 @@ def run_agent(
                 iteration + 1,
             )
             result.error = "No choices in LLM response"
-            return result
+            return _finalize_result(result, ctx)
 
         message = choices[0].get("message", {})
         content = message.get("content", "") or ""
@@ -284,13 +325,14 @@ def run_agent(
                     tool_name,
                 )
 
-                result.steps.append(
-                    AgentStep(
-                        step_type="tool_call",
-                        content=json.dumps(arguments, default=str),
-                        tool_name=tool_name,
-                    )
+                call_step = AgentStep(
+                    step_type="tool_call",
+                    content=json.dumps(arguments, default=str),
+                    tool_name=tool_name,
                 )
+                result.steps.append(call_step)
+                if on_event:
+                    on_event(call_step)
 
                 tool_t0 = time.time()
                 tool_result = dispatch_tool(
@@ -302,14 +344,15 @@ def run_agent(
                 )
                 tool_elapsed = int((time.time() - tool_t0) * 1000)
 
-                result.steps.append(
-                    AgentStep(
-                        step_type="tool_result",
-                        content=tool_result[:500],
-                        tool_name=tool_name,
-                        duration_ms=tool_elapsed,
-                    )
+                result_step = AgentStep(
+                    step_type="tool_result",
+                    content=tool_result[:500],
+                    tool_name=tool_name,
+                    duration_ms=tool_elapsed,
                 )
+                result.steps.append(result_step)
+                if on_event:
+                    on_event(result_step)
 
                 messages.append(
                     {
@@ -319,21 +362,23 @@ def run_agent(
                     }
                 )
         else:
+            content = normalize_reply_content(content)
             result.success = True
             result.reply = content
-            result.steps.append(
-                AgentStep(step_type="output", content=content[:500])
-            )
+            output_step = AgentStep(step_type="output", content=content[:500])
+            result.steps.append(output_step)
+            if on_event:
+                on_event(output_step)
             logger.info(
                 "===== DTWIN CHAT DONE ===== iterations=%d, reply_len=%d",
                 result.iterations,
                 len(content),
             )
-            return result
+            return _finalize_result(result, ctx)
 
     result.error = "Max iterations reached"
     result.reply = (
         "I ran out of steps before I could answer. "
         "Could you simplify or narrow down your question?"
     )
-    return result
+    return _finalize_result(result, ctx)

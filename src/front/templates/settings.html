@@ -1,486 +1,1359 @@
 {% extends "base.html" %}
 
-{% block title %}Settings - OntoBricks{% endblock %}
+{% block page_id %}settings{% endblock %}
+{% block title %}{{ brand_page_title('Settings') }}{% endblock %}
 
 {% block extra_css %}
-<!-- Settings page specific styles -->
-<link rel="stylesheet" href="{{ url_for('static', filename='global/css/config.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='global/css/config.css') }}?v={{ asset_version }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='query/css/query-api.css') }}?v={{ asset_version }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='registry/css/registry-teams.css') }}?v={{ asset_version }}">
 {% endblock %}
 
 {% block content %}
 <div class="container-fluid px-0">
     <div class="sidebar-layout">
+        <!-- Left Sidebar Menu (driven by menu_config.json) -->
+        <div class="sidebar-nav">
+            {% set sidebar_menu = get_menu('settings') %}
+            {% include "partials/layout/_sidebar_nav.html" %}
+        </div>
+
+        <!-- Right Content Area -->
         <div class="sidebar-content">
-            <div id="settings-section" class="sidebar-section active">
+
+            <!-- ==================== DATABRICKS SECTION ==================== -->
+            <div id="databricks-section" class="sidebar-section active">
                 <div class="content-section">
-<div class="section-header d-flex justify-content-between align-items-center mb-4">
-    <div>
-        <h4 class="mb-1"><i class="bi bi-gear me-2"></i>Settings</h4>
-        <p class="text-muted mb-0 small">Configure Databricks connection, permissions, and global preferences</p>
-    </div>
-    <button type="button" class="btn btn-primary" id="btnSaveAllSettings">
-        <i class="bi bi-check-circle me-1"></i> Save
-    </button>
-</div>
-
-<!-- Tab navigation -->
-<ul class="nav nav-tabs ob-tabs mb-0" id="settingsTabs" role="tablist">
-    <li class="nav-item" role="presentation">
-        <button class="nav-link active" id="tab-databricks" data-bs-toggle="tab" data-bs-target="#pane-databricks"
-                type="button" role="tab" aria-controls="pane-databricks" aria-selected="true">
-            <i class="bi bi-database me-1"></i> Databricks
-        </button>
-    </li>
-    {% if user_role == 'admin' %}
-    <li class="nav-item" role="presentation" id="tab-permissions-wrapper">
-        <button class="nav-link" id="tab-permissions" data-bs-toggle="tab" data-bs-target="#pane-permissions"
-                type="button" role="tab" aria-controls="pane-permissions" aria-selected="false">
-            <i class="bi bi-shield-lock me-1"></i> Permissions
-        </button>
-    </li>
-    <li class="nav-item" role="presentation" id="tab-registry-wrapper">
-        <button class="nav-link" id="tab-registry" data-bs-toggle="tab" data-bs-target="#pane-registry"
-                type="button" role="tab" aria-controls="pane-registry" aria-selected="false">
-            <i class="bi bi-archive me-1"></i> Registry
-        </button>
-    </li>
-    <li class="nav-item" role="presentation" id="tab-health-wrapper">
-        <button class="nav-link" id="tab-health" data-bs-toggle="tab" data-bs-target="#pane-health"
-                type="button" role="tab" aria-controls="pane-health" aria-selected="false">
-            <i class="bi bi-heart-pulse me-1"></i> Health
-        </button>
-    </li>
-    {% endif %}
-    <li class="nav-item" role="presentation">
-        <button class="nav-link" id="tab-graphdb" data-bs-toggle="tab" data-bs-target="#pane-graphdb"
-                type="button" role="tab" aria-controls="pane-graphdb" aria-selected="false">
-            <i class="bi bi-diagram-3 me-1"></i> Graph DB
-        </button>
-    </li>
-    <li class="nav-item" role="presentation">
-        <button class="nav-link" id="tab-global" data-bs-toggle="tab" data-bs-target="#pane-global"
-                type="button" role="tab" aria-controls="pane-global" aria-selected="false">
-            <i class="bi bi-sliders me-1"></i> Global
-        </button>
-    </li>
-</ul>
-
-<div class="card">
-    <div class="card-body">
-        <div class="tab-content" id="settingsTabContent">
-
-            <!-- ==================== DATABRICKS TAB ==================== -->
-            <div class="tab-pane fade show active" id="pane-databricks" role="tabpanel" aria-labelledby="tab-databricks">
-                <div id="envNotice" class="alert alert-info hidden-initial">
-                    <i class="bi bi-info-circle"></i> Using credentials from environment
-                </div>
-
-                <div class="mb-4">
-                    <label class="form-label fw-semibold">Databricks Host</label>
-                    <div class="form-control-plaintext bg-light p-2 rounded font-monospace" id="currentHostDisplay">
-                        <i class="bi bi-hourglass-split"></i> Loading...
-                    </div>
-                    <small class="text-muted">Set via environment variable DATABRICKS_HOST</small>
-                </div>
-
-                <div class="mb-4">
-                    <label class="form-label fw-semibold">Authentication</label>
-                    <div id="tokenStatus" class="d-flex align-items-center gap-2">
-                        <span class="badge bg-secondary" id="tokenBadge">
-                            <i class="bi bi-question-circle"></i> Checking...
-                        </span>
-                        <span class="text-muted small" id="authModeDisplay"></span>
-                    </div>
-                    <small class="text-muted" id="tokenHelp">Set via environment variable DATABRICKS_TOKEN or OAuth (Databricks Apps)</small>
-                </div>
-
-                <div class="mb-4">
-                    <label class="form-label fw-semibold">
-                        SQL Warehouse
-                        <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
-                            <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
-                        </span>
-                    </label>
-                    <div class="input-group">
-                        <select class="form-select" id="settingsWarehouseSelect">
-                            <option value="">Loading warehouses...</option>
-                        </select>
-                        <button type="button" class="btn btn-outline-secondary" id="btnRefreshWarehouses" title="Refresh warehouses">
-                            <i class="bi bi-arrow-clockwise"></i>
+                    <div class="section-header d-flex justify-content-between align-items-center mb-4">
+                        <div>
+                            <h4 class="mb-1"><i class="ob-brand-icon ob-icon-databricks me-2"></i>Databricks</h4>
+                            <p class="text-muted mb-0 small">Configure Databricks connection and SQL Warehouse</p>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-primary btn-save-settings">
+                            <i class="bi bi-check-circle me-1"></i> Save
                         </button>
                     </div>
-                    <small class="text-muted" id="warehouseHelp">Required for Unity Catalog operations. Stored globally for all users.</small>
-                </div>
 
-                <div class="mb-0">
-                    <button type="button" class="btn btn-sm btn-outline-primary" id="btnTestConnection">
-                        <i class="bi bi-plug me-1"></i> Test Connection
-                    </button>
-                    <div id="connectionResult" class="mt-3 hidden-initial"></div>
+                    <div id="envNotice" class="alert alert-info hidden-initial">
+                        <i class="bi bi-info-circle"></i> Using credentials from environment
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="form-label fw-semibold">Databricks Host</label>
+                        <div class="form-control-plaintext bg-light p-2 rounded font-monospace" id="currentHostDisplay">
+                            <i class="bi bi-hourglass-split"></i> Loading...
+                        </div>
+                        <small class="text-muted">Set via environment variable DATABRICKS_HOST</small>
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="form-label fw-semibold">Authentication</label>
+                        <div id="tokenStatus" class="d-flex align-items-center gap-2">
+                            <span class="badge bg-secondary" id="tokenBadge">
+                                <i class="bi bi-question-circle"></i> Checking...
+                            </span>
+                            <span class="text-muted small" id="authModeDisplay"></span>
+                        </div>
+                        <small class="text-muted" id="tokenHelp">Set via environment variable DATABRICKS_TOKEN or OAuth (Databricks Apps)</small>
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="form-label fw-semibold">
+                            Build SQL Warehouse
+                            <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                            </span>
+                        </label>
+                        <div class="input-group">
+                            <select class="form-select" id="settingsWarehouseSelect">
+                                <option value="">Loading warehouses...</option>
+                            </select>
+                            <button type="button" class="btn btn-outline-secondary" id="btnRefreshWarehouses" title="Refresh warehouses">
+                                <i class="bi bi-arrow-clockwise"></i>
+                            </button>
+                        </div>
+                        <small class="text-muted" id="warehouseHelp">
+                            Required for Knowledge Graph views and materialization. Lakehouse//RT
+                            warehouses cannot be used because builds execute DDL and writes.
+                        </small>
+                        <div class="form-check mt-3">
+                            <input class="form-check-input" type="checkbox" id="useCloudFetch" checked>
+                            <label class="form-check-label small" for="useCloudFetch">
+                                Use CloudFetch
+                                <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                    <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                                </span>
+                            </label>
+                            <div class="form-text small">
+                                Download large SQL result files from Databricks storage. Disable
+                                this when Databricks Apps cannot reach the CloudFetch endpoint
+                                (Explorer searches then time out after retries).
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mb-0">
+                        <button type="button" class="btn btn-sm btn-outline-primary" id="btnTestConnection">
+                            <i class="bi bi-plug me-1"></i> Test Connection
+                        </button>
+                        <div id="connectionResult" class="mt-3 hidden-initial"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ==================== DELTA TRIPLE STORE SECTION ==================== -->
+            <div id="delta-section" class="sidebar-section">
+                <div class="content-section">
+                    <div class="section-header d-flex justify-content-between align-items-center mb-4">
+                        <div>
+                            <h4 class="mb-1"><i class="ob-brand-icon ob-icon-lakehouse me-2"></i>Lakehouse</h4>
+                            <p class="text-muted mb-0 small">
+                                Unity Catalog Delta tables for the triple store — no separate graph database to provision
+                            </p>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-primary text-nowrap"
+                                id="btnApplyDeltaWarehouse" disabled>
+                            <i class="bi bi-check-circle me-1"></i> Save
+                        </button>
+                    </div>
+
+                    <div id="deltaSectionBanner" class="alert alert-light border d-none align-items-center justify-content-center gap-2 py-3 mb-3" role="status" aria-live="polite">
+                        <span class="spinner-border spinner-border-sm text-primary" aria-hidden="true"></span>
+                        <span class="small text-muted">Loading Lakehouse configuration…</span>
+                    </div>
+
+                    <div id="deltaGraphPanel" style="display:none;">
+                        <div class="card h-100">
+                            <div class="card-body p-0 ob-tabs-wrap">
+                        <ul class="nav nav-tabs ob-tabs nav-fill" id="deltaTabs" role="tablist">
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link active" id="dttab-overview" data-bs-toggle="tab"
+                                        data-bs-target="#dtpane-overview" type="button" role="tab"
+                                        aria-controls="dtpane-overview" aria-selected="true">
+                                    <i class="bi bi-info-circle me-1"></i> Overview
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="dttab-warehouse" data-bs-toggle="tab"
+                                        data-bs-target="#dtpane-warehouse" type="button" role="tab"
+                                        aria-controls="dtpane-warehouse" aria-selected="false">
+                                    <i class="bi bi-hdd-network me-1"></i> SQL Warehouse
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="dttab-objects" data-bs-toggle="tab"
+                                        data-bs-target="#dtpane-objects" type="button" role="tab"
+                                        aria-controls="dtpane-objects" aria-selected="false">
+                                    <i class="bi bi-table me-1"></i> Objects
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="dttab-health" data-bs-toggle="tab"
+                                        data-bs-target="#dtpane-health" type="button" role="tab"
+                                        aria-controls="dtpane-health" aria-selected="false">
+                                    <i class="bi bi-heart-pulse me-1"></i> Health
+                                </button>
+                            </li>
+                        </ul>
+
+                        <div class="tab-content p-3" id="deltaTabContent">
+
+                            <!-- ── TAB 1 · Overview ── -->
+                            <div class="tab-pane fade show active" id="dtpane-overview" role="tabpanel" aria-labelledby="dttab-overview">
+                                <div class="alert alert-info border-0 small mb-0">
+                                    <h6 class="alert-heading fw-semibold mb-2">
+                                        <i class="bi bi-info-circle me-1"></i>How it works
+                                    </h6>
+                                    <p class="mb-2">
+                                        With <strong>Lakehouse</strong> selected as the graph backend, OntoBricks stores triples
+                                        directly in governed Delta tables in Unity Catalog. The
+                                        <strong>Registry catalog and schema</strong> (Settings → Registry) define
+                                        where all triple-store objects live for every domain.
+                                    </p>
+                                    <p class="mb-0">
+                                        Pick a dedicated Query SQL Warehouse on the <strong>SQL Warehouse</strong>
+                                        tab for Lakehouse graph reads. When unset, the Build SQL Warehouse from
+                                        <strong>Settings → Databricks</strong> is also used for reads. Builds always
+                                        use that non-RT Build SQL Warehouse to create the R2RML VIEW and materialize
+                                        the <code>_data</code> Delta table.
+                                    </p>
+                                </div>
+                            </div>
+
+                            <!-- ── TAB 2 · SQL Warehouse ── -->
+                            <div class="tab-pane fade" id="dtpane-warehouse" role="tabpanel" aria-labelledby="dttab-warehouse">
+                                <p class="small text-muted mb-3">
+                                    Used only when <strong>Lakehouse</strong> is the graph backend — graph queries
+                                    and health probes run against this warehouse. Build DDL always uses the
+                                    separate Build SQL Warehouse. Click <strong>Save</strong>
+                                    to persist the selection in the registry.
+                                </p>
+                                <label for="deltaBuildWarehouseSelect"
+                                       class="form-label small fw-semibold mb-1">
+                                    Build SQL Warehouse
+                                </label>
+                                <select id="deltaBuildWarehouseSelect"
+                                        class="form-select form-select-sm mb-2"></select>
+                                <div class="form-text small mb-3">
+                                    Builds require DDL and write support, so Lakehouse//RT warehouses
+                                    are excluded. The selection applies to all users.
+                                </div>
+
+                                <div class="form-check mb-3">
+                                    <input class="form-check-input" type="checkbox" id="deltaUseSea">
+                                    <label class="form-check-label small" for="deltaUseSea">
+                                        Use Lakehouse//RT for queries
+                                    </label>
+                                    <div class="form-text small">
+                                        Enables a separate Query SQL Warehouse and connects through the
+                                        native Kernel backend. Turning this off restores Build as Query.
+                                    </div>
+                                </div>
+
+                                <div id="deltaWarehouseLoading"
+                                     class="d-flex align-items-center gap-2 text-muted small py-1">
+                                    <span class="spinner-border spinner-border-sm" role="status"
+                                          aria-hidden="true"></span>
+                                    <span>Loading warehouses…</span>
+                                </div>
+                                <label for="deltaWarehouseSelect"
+                                       class="form-label small fw-semibold mb-1">
+                                    Query SQL Warehouse
+                                </label>
+                                <div id="deltaWarehouseControls"
+                                     class="d-none d-flex flex-wrap gap-2 align-items-center">
+                                    <select id="deltaWarehouseSelect"
+                                            class="form-select form-select-sm flex-grow-1"
+                                            style="min-width: 12rem;"
+                                            aria-busy="true"></select>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary text-nowrap"
+                                            id="btnRefreshDeltaWarehouses" disabled>
+                                        <i class="bi bi-arrow-clockwise me-1"></i> Refresh list
+                                    </button>
+                                </div>
+                                <p class="text-muted mb-0 mt-2" id="deltaWarehouseHelp">
+                                    <span id="deltaEffectiveWarehouse"></span>
+                                </p>
+                            </div>
+
+                            <!-- ── TAB 3 · Objects ── -->
+                            <div class="tab-pane fade" id="dtpane-objects" role="tabpanel" aria-labelledby="dttab-objects">
+                                <p class="small text-muted mb-3">
+                                    Lists triple-store objects in the Registry UC schema
+                                    (<code>catalog.schema</code>) only for domain versions configured
+                                    with the <strong>Lakehouse</strong> backend.
+                                    Use <strong>Drop</strong> to remove a single object or every artefact
+                                    for one domain version (views are dropped before tables).
+                                </p>
+                                <dl class="row small mb-3">
+                                    <dt class="col-sm-3">Registry</dt>
+                                    <dd class="col-sm-9 font-monospace" id="deltaRegistryLocation">—</dd>
+                                </dl>
+                                <button type="button" class="btn btn-sm btn-outline-secondary mb-3" id="btnLoadDeltaObjects">
+                                    <i class="bi bi-arrow-clockwise me-1"></i> Load objects
+                                </button>
+                                <div id="deltaObjectsResult"></div>
+                            </div>
+
+                            <!-- ── TAB 4 · Health ── -->
+                            <div class="tab-pane fade" id="dtpane-health" role="tabpanel" aria-labelledby="dttab-health">
+                                <p class="small text-muted mb-3">
+                                    Checks effective Unity Catalog permissions for the saved Registry
+                                    <code>catalog.schema</code> and the checked principal.
+                                </p>
+                                <button type="button" class="btn btn-sm btn-outline-primary" id="btnDeltaTripleStoreHealth">
+                                    <i class="bi bi-arrow-clockwise me-1"></i> Refresh status
+                                </button>
+                                <div id="deltaHealthResult" class="mt-3" role="status" aria-live="polite"></div>
+                            </div>
+
+                        </div><!-- /#deltaTabContent -->
+                            </div>
+                        </div>
+                    </div><!-- /#deltaGraphPanel -->
+                </div>
+            </div>
+
+            <!-- ==================== LAKEBASE SECTION ==================== -->
+            <div id="lakebase-section" class="sidebar-section">
+                <div class="content-section">
+                    <div class="section-header d-flex justify-content-between align-items-center mb-3">
+                        <div>
+                            <h4 class="mb-1"><i class="ob-brand-icon ob-icon-postgresql me-2"></i>Lakebase</h4>
+                            <p class="text-muted mb-0 small">Configure the Lakebase (Postgres) connection and bulk-loading mode</p>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button type="button" class="btn btn-sm btn-outline-primary" id="btnOpenProvisionModal"
+                                    data-bs-toggle="modal" data-bs-target="#lakebaseProvisionModal">
+                                <i class="bi bi-magic me-1"></i> Create graph DB
+                            </button>
+                            <button type="button" class="btn btn-sm btn-primary btn-save-settings">
+                                <i class="bi bi-check-circle me-1"></i> Save
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Loading banner (shown while lazy-loading engine config) -->
+                    <div id="lakebaseSectionBanner" class="alert alert-light border d-none align-items-center justify-content-center gap-2 py-3 mb-3" role="status" aria-live="polite">
+                        <span class="spinner-border spinner-border-sm text-primary" aria-hidden="true"></span>
+                        <span class="text-muted small">Loading Lakebase settings…</span>
+                    </div>
+
+                    <div id="lakebaseGraphPanel" style="display:none;">
+                        <div class="card h-100">
+                            <div class="card-body p-0 ob-tabs-wrap">
+
+                        <!-- Tab strip -->
+                        <ul class="nav nav-tabs ob-tabs nav-fill" id="lakebaseTabs" role="tablist">
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link active" id="lktab-connection" data-bs-toggle="tab"
+                                        data-bs-target="#lkpane-connection" type="button" role="tab"
+                                        aria-controls="lkpane-connection" aria-selected="true">
+                                    <i class="bi bi-plug me-1"></i> Connection
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="lktab-bulk" data-bs-toggle="tab"
+                                        data-bs-target="#lkpane-bulk" type="button" role="tab"
+                                        aria-controls="lkpane-bulk" aria-selected="false">
+                                    <i class="bi bi-lightning-charge me-1"></i> Bulk loading
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="lktab-health" data-bs-toggle="tab"
+                                        data-bs-target="#lkpane-health" type="button" role="tab"
+                                        aria-controls="lkpane-health" aria-selected="false">
+                                    <i class="bi bi-heart-pulse me-1"></i> Health
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="lktab-objects" data-bs-toggle="tab"
+                                        data-bs-target="#lkpane-objects" type="button" role="tab"
+                                        aria-controls="lkpane-objects" aria-selected="false">
+                                    <i class="bi bi-table me-1"></i> Objects
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="lktab-perms" data-bs-toggle="tab"
+                                        data-bs-target="#lkpane-perms" type="button" role="tab"
+                                        aria-controls="lkpane-perms" aria-selected="false">
+                                    <i class="bi bi-shield-lock me-1"></i> Permissions
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="lktab-advanced" data-bs-toggle="tab"
+                                        data-bs-target="#lkpane-advanced" type="button" role="tab"
+                                        aria-controls="lkpane-advanced" aria-selected="false">
+                                    <i class="bi bi-code-slash me-1"></i> Advanced
+                                </button>
+                            </li>
+                        </ul>
+
+                        <div class="tab-content p-3" id="lakebaseTabContent">
+
+                            <!-- ── TAB 1 · Connection ── -->
+                            <div class="tab-pane fade show active" id="lkpane-connection" role="tabpanel" aria-labelledby="lktab-connection">
+                                <p class="small text-muted mb-3">
+                                    Select the Autoscaling project, branch, and database where graph triples will be stored.
+                                    Use <strong>Load</strong> to discover available options from the workspace.
+                                </p>
+                                <div class="alert alert-info py-2 px-3 small mb-3">
+                                    <i class="bi bi-info-circle me-1"></i>
+                                    <strong>Architecture note:</strong> the app always connects via the <strong>bound Lakebase</strong>
+                                    (PGHOST set by the platform resource binding). The project and branch selected here are used
+                                    only by the <em>Create Graph DB</em> provisioner. The <strong>database</strong> and
+                                    <strong>schema</strong> fields directly control where graph triples are stored.
+                                    The <strong>registry</strong> always uses a separate database (PGDATABASE).
+                                </div>
+
+                                <!-- Row 1: Project + Branch -->
+                                <div class="row g-3 mb-3">
+                                    <div class="col-12 col-lg-6">
+                                        <label for="lakebaseProject" class="form-label small fw-semibold mb-1">Autoscaling project</label>
+                                        <div class="input-group input-group-sm">
+                                            <select class="form-select form-select-sm" id="lakebaseProject" aria-describedby="lakebaseProjectHelp">
+                                                <option value="">(click Load to discover)</option>
+                                            </select>
+                                            <button type="button" class="btn btn-outline-secondary btn-sm" id="btnLoadLakebaseProjects" title="Load projects">
+                                                <i class="bi bi-arrow-down-circle"></i>
+                                            </button>
+                                        </div>
+                                        <div id="lakebaseProjectHelp" class="form-text small mt-1 mb-0 text-muted">Lakebase Autoscaling project.</div>
+                                    </div>
+                                    <div class="col-12 col-lg-6">
+                                        <label for="lakebaseBranch" class="form-label small fw-semibold mb-1">Branch</label>
+                                        <select class="form-select form-select-sm" id="lakebaseBranch" disabled aria-describedby="lakebaseBranchHelp">
+                                            <option value="">(select a project first)</option>
+                                        </select>
+                                        <div id="lakebaseBranchHelp" class="form-text small mt-1 mb-0 text-muted">Branch within the project.</div>
+                                    </div>
+                                </div>
+
+                                <!-- Row 2: Database + Schema -->
+                                <div class="row g-3">
+                                    <div class="col-12 col-lg-6">
+                                        <label for="lakebaseGraphDb" class="form-label small fw-semibold mb-1">Postgres database</label>
+                                        <select class="form-select form-select-sm" id="lakebaseGraphDb" disabled aria-describedby="lakebaseGraphDbHelp">
+                                            <option value="">(select a branch first)</option>
+                                        </select>
+                                        <div id="lakebaseGraphDbHelp" class="form-text small mt-2 mb-0"></div>
+                                    </div>
+                                    <div class="col-12 col-lg-6">
+                                        <label for="lakebaseGraphSchema" class="form-label small fw-semibold mb-1">Postgres schema</label>
+                                        <div class="input-group input-group-sm">
+                                            <select class="form-select form-select-sm" id="lakebaseGraphSchema" disabled aria-describedby="lakebaseGraphSchemaHelp">
+                                                <option value="">(select a database first)</option>
+                                            </select>
+                                            <input type="text" class="form-control form-control-sm font-monospace d-none" id="lakebaseGraphSchemaInput"
+                                                   value="ontobricks_graph" maxlength="63" autocomplete="off" placeholder="ontobricks_graph">
+                                            <button type="button" class="btn btn-outline-secondary btn-sm" id="btnToggleLakebaseSchemaInput"
+                                                    title="Type schema name manually" data-mode="select">
+                                                <i class="bi bi-pencil"></i>
+                                            </button>
+                                        </div>
+                                        <div id="lakebaseGraphSchemaHelp" class="form-text small mt-2 mb-0 text-muted">
+                                            Postgres schema for graph triple tables. Click <i class="bi bi-pencil"></i> to type manually.
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- ── TAB 2 · Bulk loading ── -->
+                            <div class="tab-pane fade" id="lkpane-bulk" role="tabpanel" aria-labelledby="lktab-bulk">
+                                <p class="small text-muted mb-3">
+                                    Choose how R2RML triples reach Postgres.
+                                    <strong>Managed sync</strong> is the recommended path: Databricks Lakeflow copies the mapped view into Postgres (needs UC registration).
+                                    <strong>App-managed</strong> streams rows through the app when you need the COPY path.
+                                </p>
+                                <div class="row g-3 align-items-start mb-0">
+                                    <div class="col-12">
+                                        <label for="lakebaseSyncMode" class="form-label small fw-semibold mb-1">Mode</label>
+                                        <select class="form-select form-select-sm" id="lakebaseSyncMode" aria-describedby="lakebaseSyncModeHelp">
+                                            <option value="managed_synced" selected>Managed sync — Lakeflow syncs the Delta view to Postgres (recommended)</option>
+                                            <option value="app_managed">App-managed — stream from SQL warehouse into Postgres</option>
+                                        </select>
+                                        <div id="lakebaseSyncModeHelp" class="form-text small mt-2 mb-0">
+                                            <span data-lk-mode="app_managed" class="d-none">The app runs the warehouse query and COPYs rows; no Unity Catalog object is required for the load.</span>
+                                            <span data-lk-mode="managed_synced">Lakeflow keeps a synced table; the app only orchestrates. Requires a valid <code>catalog.schema</code> in Unity Catalog for registration.</span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div id="lakebaseManagedSyncPanel" class="border rounded p-3 mt-3 bg-body-tertiary">
+                                    <div class="fw-semibold small mb-2">Managed sync options</div>
+                                    <div class="row g-3">
+                                        <div class="col-12 col-lg-6">
+                                            <label for="lakebaseSyncTableMode" class="form-label small fw-semibold mb-1">Lakeflow schedule</label>
+                                            <select class="form-select form-select-sm" id="lakebaseSyncTableMode">
+                                                <option value="snapshot" selected>Snapshot — full refresh on each Knowledge Graph build</option>
+                                            </select>
+                                            <div class="form-text small mt-1 mb-0 text-muted">
+                                                Snapshot is the only schedule that works here: the Lakeflow source is an R2RML view, which has no Change Data Feed.
+                                                Triggered and Continuous need CDF on a Delta table.
+                                            </div>
+                                        </div>
+                                        <div class="col-12 col-lg-6">
+                                            <label for="lakebaseSyncTimeout" class="form-label small fw-semibold mb-1">Sync wait (seconds)</label>
+                                            <input type="number" class="form-control form-control-sm" id="lakebaseSyncTimeout"
+                                                   min="1" max="86400" step="1" value="600" autocomplete="off">
+                                            <div class="form-text small mt-1 mb-0 text-muted">How long a build waits for a sync run to finish.</div>
+                                        </div>
+                                        <!-- UC Catalog -->
+                                        <div class="col-12 col-lg-6">
+                                            <label for="lakebaseUcCatalog" class="form-label small fw-semibold mb-1">UC catalog (sync registration)</label>
+                                            <div class="input-group input-group-sm">
+                                                <select class="form-select form-select-sm" id="lakebaseUcCatalog" aria-describedby="lakebaseUcCatalogHelp">
+                                                    <option value="">(click Load to discover)</option>
+                                                </select>
+                                                <button type="button" class="btn btn-outline-secondary btn-sm" id="btnLoadUcCatalogs" title="Load UC catalogs">
+                                                    <i class="bi bi-arrow-down-circle"></i>
+                                                </button>
+                                            </div>
+                                            <div id="lakebaseUcCatalogHelp" class="form-text small mt-1 mb-0 text-muted">
+                                                UC catalog for synced table registration. If empty: Registry catalog, then domain Delta.
+                                            </div>
+                                            <div id="lakebaseUcCatalogLoadMsg" class="form-text small mt-1 d-none text-warning"></div>
+                                        </div>
+                                        <!-- UC Schema (read-only) -->
+                                        <div class="col-12 col-lg-6">
+                                            <label class="form-label small fw-semibold mb-1">UC schema (sync registration)</label>
+                                            <div class="input-group input-group-sm">
+                                                <span class="input-group-text bg-light"><i class="bi bi-diagram-3"></i></span>
+                                                <input type="text" class="form-control form-control-sm font-monospace ob-form-readonly-muted"
+                                                       id="lakebaseUcSchemaDisplay" readonly
+                                                       placeholder="(same as Postgres schema)">
+                                            </div>
+                                            <div class="form-text small mt-1 mb-0 text-muted">
+                                                Always equals the Postgres graph schema — Lakebase places the <code>_sync</code> foreign table in the matching Postgres schema.
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- ── TAB 3 · Health ── -->
+                            <div class="tab-pane fade" id="lkpane-health" role="tabpanel" aria-labelledby="lktab-health">
+                                <p class="small text-muted mb-3">
+                                    Read-only probe against the <strong>saved</strong> engine JSON in the registry (use <strong>Save</strong> after edits).
+                                    Confirms the App-bound Postgres instance reaches the configured database and graph schema.
+                                </p>
+                                <div id="lakebaseGraphHealthMessage" class="small mb-2" style="display:none;"></div>
+                                <dl class="row small mb-2" id="lakebaseGraphHealthDl"></dl>
+                                <button type="button" class="btn btn-sm btn-outline-secondary" id="btnRefreshLakebaseGraphHealth" title="Refresh health probe">
+                                    <i class="bi bi-arrow-clockwise me-1"></i> Refresh health
+                                </button>
+                            </div>
+
+                            <!-- ── TAB 4 · Objects ── -->
+                            <div class="tab-pane fade" id="lkpane-objects" role="tabpanel" aria-labelledby="lktab-objects">
+                                <p class="small text-muted mb-3">
+                                    Lists objects in the connected database owned by you or any principal.
+                                    The <strong>Drop</strong> button is enabled only for objects you own (<code>current_user</code>).
+                                    <strong>Dropping a schema uses CASCADE — all contained tables and views are removed.</strong>
+                                </p>
+                                <button type="button" class="btn btn-sm btn-outline-secondary mb-3" id="btnLoadLakebaseObjects">
+                                    <i class="bi bi-arrow-clockwise me-1"></i> Load objects
+                                </button>
+                                <div id="lakebaseObjectsResult"></div>
+
+                            </div>
+
+                            <!-- ── TAB 5 · Permissions ── -->
+                            <div class="tab-pane fade" id="lkpane-perms" role="tabpanel" aria-labelledby="lktab-perms">
+                                <p class="small text-muted mb-3">
+                                    Grant Postgres superuser access to application users so they can query
+                                    the graph database directly in the Databricks UI.
+                                </p>
+
+                                <!-- Grant row: dropdown of app users + Grant + Refresh -->
+                                <div class="row g-2 align-items-end mb-3">
+                                    <div class="col">
+                                        <label for="lkPermUserSelect" class="form-label small fw-semibold mb-1">Select user</label>
+                                        <select class="form-select form-select-sm" id="lkPermUserSelect">
+                                            <option value="">— loading users… —</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-auto">
+                                        <button class="btn btn-sm btn-primary" id="btnLkPermGrant">
+                                            <i class="bi bi-shield-check me-1"></i>Grant superuser
+                                        </button>
+                                    </div>
+                                    <div class="col-auto">
+                                        <button class="btn btn-sm btn-outline-secondary" id="btnLkPermRefresh">
+                                            <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <!-- Status banner -->
+                                <div id="lkPermBanner" class="alert d-none py-2 px-3 small mb-3" role="alert"></div>
+
+                                <!-- Loading / table -->
+                                <div id="lkPermLoading" class="text-center text-muted small py-3 d-none">
+                                    <div class="spinner-border spinner-border-sm me-2" role="status"></div>Loading roles…
+                                </div>
+                                <div id="lkPermTableWrap" class="d-none">
+                                    <table class="table table-sm table-hover ob-table mb-0">
+                                        <thead class="table-light">
+                                            <tr>
+                                                <th>User</th>
+                                                <th class="text-center">Postgres role</th>
+                                                <th class="text-center">Superuser</th>
+                                                <th class="text-end">Action</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="lkPermTbody"></tbody>
+                                    </table>
+                                    <div id="lkPermEmpty" class="text-center text-muted small py-2 d-none">No users found.</div>
+                                </div>
+                            </div>
+
+                            <!-- ── TAB 6 · Advanced ── -->
+                            <div class="tab-pane fade" id="lkpane-advanced" role="tabpanel" aria-labelledby="lktab-advanced">
+                                <p class="small text-muted mb-3">
+                                    Form fields in the other tabs are merged into this object on <strong>Save</strong>.
+                                    Edit only if you need extra keys not exposed in the UI.
+                                </p>
+                                <textarea class="form-control font-monospace" id="graphEngineConfig"
+                                          rows="8" placeholder="{}" spellcheck="false">{}</textarea>
+                                <div id="graphEngineConfigError" class="text-danger small mt-2" style="display:none;"></div>
+                            </div>
+
+                        </div><!-- /#lakebaseTabContent -->
+                            </div>
+                        </div>
+                    </div><!-- /#lakebaseGraphPanel -->
+
+                    <!-- ── Provision new graph DB modal ── -->
+                    <div class="modal fade" id="lakebaseProvisionModal" tabindex="-1"
+                         aria-labelledby="lakebaseProvisionModalLabel" aria-hidden="true">
+                        <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+                            <div class="modal-content">
+                                <div class="modal-header">
+                                    <h5 class="modal-title" id="lakebaseProvisionModalLabel">
+                                        <i class="bi bi-magic me-2 text-primary"></i>Create graph DB from scratch
+                                    </h5>
+                                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                                </div>
+                                <div class="modal-body">
+                                    <div class="alert alert-warning small py-2 px-3 mb-3" role="alert">
+                                        <i class="bi bi-exclamation-triangle me-1"></i>
+                                        Provisions a <strong>brand-new Lakebase instance</strong> + Postgres database + graph schema,
+                                        then grants <code>CAN_USE</code> on the project and schema privileges to the app and MCP
+                                        service principals. This can take several minutes and requires the app's service principal
+                                        to be allowed to create Lakebase instances. Equivalent to running
+                                        <code>setup-lakebase.sh</code> + <code>bootstrap-lakebase-perms.sh</code>.
+                                    </div>
+                                    <div class="row g-3">
+                                        <div class="col-12 col-lg-6">
+                                            <label for="provInstanceName" class="form-label small fw-semibold mb-1">Instance / project name</label>
+                                            <input type="text" class="form-control form-control-sm font-monospace" id="provInstanceName"
+                                                   maxlength="63" autocomplete="off" placeholder="ontobricks-graph">
+                                        </div>
+                                        <div class="col-12 col-lg-6">
+                                            <label for="provCapacity" class="form-label small fw-semibold mb-1">Compute capacity</label>
+                                            <select class="form-select form-select-sm" id="provCapacity">
+                                                <option value="CU_1">CU_1</option>
+                                                <option value="CU_2" selected>CU_2</option>
+                                                <option value="CU_4">CU_4</option>
+                                                <option value="CU_8">CU_8</option>
+                                            </select>
+                                        </div>
+                                        <div class="col-12 col-lg-6">
+                                            <label for="provBranch" class="form-label small fw-semibold mb-1">Branch</label>
+                                            <input type="text" class="form-control form-control-sm font-monospace" id="provBranch"
+                                                   maxlength="63" autocomplete="off" value="production" disabled>
+                                            <div class="form-text small">A new instance always uses its auto-created <code>production</code> branch.</div>
+                                        </div>
+                                        <div class="col-12 col-lg-6">
+                                            <label for="provDatabase" class="form-label small fw-semibold mb-1">Postgres database</label>
+                                            <input type="text" class="form-control form-control-sm font-monospace" id="provDatabase"
+                                                   maxlength="63" autocomplete="off" placeholder="ontobricks_graph_db">
+                                        </div>
+                                        <div class="col-12 col-lg-6">
+                                            <label for="provSchema" class="form-label small fw-semibold mb-1">Graph schema</label>
+                                            <input type="text" class="form-control form-control-sm font-monospace" id="provSchema"
+                                                   maxlength="63" autocomplete="off" value="ontobricks_graph" placeholder="ontobricks_graph">
+                                        </div>
+                                        <div class="col-12 col-lg-6">
+                                            <label for="provMcpAppName" class="form-label small fw-semibold mb-1">MCP app name</label>
+                                            <input type="text" class="form-control form-control-sm font-monospace" id="provMcpAppName"
+                                                   maxlength="63" autocomplete="off" value=""
+                                                   placeholder="auto (mcp- + main app name)">
+                                            <div class="form-text small">Leave blank to derive <code>mcp-{main app}</code> (matches <code>deploy.config.sh</code>).</div>
+                                        </div>
+                                        <div class="col-12">
+                                            <div class="form-check">
+                                                <input class="form-check-input" type="checkbox" id="provGrantUcCatalog">
+                                                <label class="form-check-label small" for="provGrantUcCatalog">
+                                                    Grant schema-scoped readback on the configured UC catalog (managed sync only)
+                                                </label>
+                                            </div>
+                                            <div class="form-check">
+                                                <input class="form-check-input" type="checkbox" id="provGrantSuperusers">
+                                                <label class="form-check-label small" for="provGrantSuperusers">
+                                                    Promote workspace admins to <code>DATABRICKS_SUPERUSER</code> (opt-in; bypasses schema ACLs)
+                                                </label>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Progress + per-step log -->
+                                    <div id="provProgressArea" class="mt-3 d-none">
+                                        <div class="progress" style="height: 20px;">
+                                            <div class="progress-bar progress-bar-striped progress-bar-animated" id="provProgressBar"
+                                                 role="progressbar" style="width: 0%;">0%</div>
+                                        </div>
+                                        <ul class="list-group list-group-flush small mt-2" id="provStepLog"></ul>
+                                    </div>
+                                </div>
+                                <div class="modal-footer">
+                                    <span class="text-muted small me-auto" id="provStatusText"></span>
+                                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+                                    <button type="button" class="btn btn-primary btn-sm" id="btnProvisionLakebaseGraph">
+                                        <i class="bi bi-magic me-1"></i> Create graph DB
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ==================== NEO4J SECTION ==================== -->
+            <div id="neo4j-section" class="sidebar-section">
+                <div class="content-section">
+                    <div class="section-header d-flex justify-content-between align-items-center mb-3">
+                        <div>
+                            <h4 class="mb-1"><i class="ob-brand-icon ob-icon-neo4j me-2"></i>Neo4j</h4>
+                            <p class="text-muted mb-0 small">Manage named Neo4j (Bolt) connections — Aura or self-hosted</p>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button type="button" class="btn btn-sm btn-primary btn-save-settings">
+                                <i class="bi bi-check-circle me-1"></i> Save
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Loading banner -->
+                    <div id="neo4jSectionBanner" class="alert alert-light border d-none align-items-center justify-content-center gap-2 py-3 mb-3" role="status" aria-live="polite">
+                        <span class="spinner-border spinner-border-sm text-primary" aria-hidden="true"></span>
+                        <span class="text-muted small">Loading Neo4j settings…</span>
+                    </div>
+
+                    <div class="card h-100">
+                        <div class="card-body p-0 ob-tabs-wrap">
+                    <!-- Tab strip (parity with the Lakebase panel) -->
+                    <ul class="nav nav-tabs ob-tabs nav-fill" id="neo4jTabs" role="tablist">
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link active" id="n4tab-connection" data-bs-toggle="tab"
+                                    data-bs-target="#n4pane-connection" type="button" role="tab"
+                                    aria-controls="n4pane-connection" aria-selected="true">
+                                <i class="bi bi-plug me-1"></i> Connections
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="n4tab-objects" data-bs-toggle="tab"
+                                    data-bs-target="#n4pane-objects" type="button" role="tab"
+                                    aria-controls="n4pane-objects" aria-selected="false">
+                                <i class="bi bi-bezier2 me-1"></i> Objects
+                            </button>
+                        </li>
+                    </ul>
+
+                    <div class="tab-content p-3" id="neo4jTabContent">
+
+                    <!-- ── TAB 1 · Connections (master–detail) ── -->
+                    <div class="tab-pane fade show active" id="n4pane-connection" role="tabpanel" aria-labelledby="n4tab-connection">
+
+                    <div class="alert alert-info border-0 mb-3 small">
+                        <strong>Named connections:</strong> each entry is a full Bolt profile
+                        (URI, database, username, Databricks secret). Domains pick a connection by
+                        name under <em>Domain → General → Knowledge Graph</em>.
+                    </div>
+
+                    <div class="alert alert-warning border-0 mb-3 small">
+                        <strong>Requirements:</strong> Neo4j <strong>server 5.x</strong> (Aura, Enterprise,
+                        or Community). OntoBricks assumes it <em>owns</em> the connected database. APOC is not required.
+                        See the <a href="https://github.com/databrickslabs/ontobricks/blob/develop/docs/backend.md#neo4j-backend" target="_blank" rel="noopener">Neo4j backend guide</a>.
+                    </div>
+
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <span class="small fw-semibold">Connections</span>
+                                <button type="button" class="btn btn-sm btn-outline-primary" id="btnAddNeo4jConnection">
+                                    <i class="bi bi-plus-lg me-1"></i> Add
+                                </button>
+                            </div>
+                            <div id="neo4jConnectionList" class="neo4j-connection-list list-group list-group-flush border rounded">
+                                <div class="list-group-item text-muted small" id="neo4jConnectionEmpty">
+                                    No Neo4j connections yet — click Add.
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-8">
+                            <form id="neo4jConfigForm" autocomplete="off">
+                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                    <span class="small fw-semibold" id="neo4jDetailTitle">Select or add a connection</span>
+                                    <div class="d-flex gap-2">
+                                        <button type="button" class="btn btn-sm btn-outline-secondary" id="btnTestNeo4jConnection" disabled>
+                                            <i class="bi bi-plug me-1"></i> Test connection
+                                        </button>
+                                        <button type="button" class="btn btn-sm btn-outline-danger" id="btnDeleteNeo4jConnection" disabled>
+                                            <i class="bi bi-trash me-1"></i> Delete
+                                        </button>
+                                    </div>
+                                </div>
+                                <fieldset id="neo4jDetailFields" disabled>
+                                <div class="row g-3">
+                                    <div class="col-md-12">
+                                        <label for="neo4jConnectionName" class="form-label small fw-semibold mb-1">Connection name <span class="text-danger">*</span></label>
+                                        <input type="text" class="form-control form-control-sm" id="neo4jConnectionName"
+                                               placeholder="Aura Prod" required>
+                                    </div>
+                                    <div class="col-md-12">
+                                        <label for="neo4jUri" class="form-label small fw-semibold mb-1">Bolt URI <span class="text-danger">*</span></label>
+                                        <input type="text" class="form-control form-control-sm" id="neo4jUri"
+                                               placeholder="neo4j+s://&lt;aura-id&gt;.databases.neo4j.io" required>
+                                        <div class="form-text small text-muted">
+                                            Aura uses <code>neo4j+s://</code> (TLS embedded). Self-hosted may use <code>bolt://</code> or <code>neo4j://</code>.
+                                        </div>
+                                    </div>
+
+                                    <div class="col-md-6">
+                                        <label for="neo4jDatabase" class="form-label small fw-semibold mb-1">Database</label>
+                                        <input type="text" class="form-control form-control-sm" id="neo4jDatabase" placeholder="neo4j">
+                                    </div>
+
+                                    <div class="col-md-6">
+                                        <label for="neo4jUsername" class="form-label small fw-semibold mb-1">Username <span class="text-danger">*</span></label>
+                                        <input type="text" class="form-control form-control-sm" id="neo4jUsername" autocomplete="off" required>
+                                    </div>
+
+                                    <div class="col-md-6">
+                                        <label for="neo4jSecretScope" class="form-label small fw-semibold mb-1">
+                                            Secret scope <span class="text-danger">*</span>
+                                            <span class="badge bg-success-subtle text-success-emphasis border border-success-subtle ms-1"
+                                                  title="The password is resolved live from this Databricks secret using the app's own identity — never stored in clear.">
+                                                <i class="bi bi-shield-check me-1"></i>Databricks secret
+                                            </span>
+                                        </label>
+                                        <div class="input-group input-group-sm">
+                                            <select class="form-select form-select-sm" id="neo4jSecretScope" required>
+                                                <option value="">— Select a scope —</option>
+                                            </select>
+                                            <button type="button" class="btn btn-outline-secondary" id="btnRefreshNeo4jSecretScopes" title="Refresh scope list">
+                                                <i class="bi bi-arrow-clockwise"></i>
+                                            </button>
+                                        </div>
+                                        <div class="form-text small text-muted">
+                                            Only scopes your identity can read appear here. Missing one? Grant access:
+                                            <code>databricks secrets put-acl --scope &lt;scope&gt; --principal &lt;app-service-principal&gt; --permission READ</code>.
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label for="neo4jSecretKey" class="form-label small fw-semibold mb-1">Secret name <span class="text-danger">*</span></label>
+                                        <div class="input-group input-group-sm">
+                                            <select class="form-select form-select-sm" id="neo4jSecretKey" disabled required>
+                                                <option value="">— Select a scope first —</option>
+                                            </select>
+                                            <button type="button" class="btn btn-outline-secondary" id="btnRefreshNeo4jSecretKeys" title="Refresh secret list" disabled>
+                                                <i class="bi bi-arrow-clockwise"></i>
+                                            </button>
+                                        </div>
+                                        <div class="form-text small text-muted">
+                                            The password is fetched live at connect time — nothing is persisted in clear. See
+                                            <a href="https://github.com/databrickslabs/ontobricks/blob/develop/docs/neo4j-requirements.md" target="_blank" rel="noopener">setup guide</a>.
+                                        </div>
+                                    </div>
+
+                                    <div class="col-md-12">
+                                        <div class="form-check">
+                                            <input class="form-check-input" type="checkbox" id="neo4jEncrypted" checked>
+                                            <label class="form-check-label small" for="neo4jEncrypted">
+                                                Encrypted connection
+                                                <span class="text-muted">(ignored when the URI scheme is <code>neo4j+s://</code> or <code>bolt+s://</code> — TLS is already embedded)</span>
+                                            </label>
+                                        </div>
+                                    </div>
+                                </div>
+                                </fieldset>
+                                <div id="neo4jTestResult" class="alert d-none mt-3 small" role="status" aria-live="polite"></div>
+                            </form>
+                        </div>
+                    </div>
+                    </div><!-- /#n4pane-connection -->
+
+                    <!-- ── TAB 2 · Objects ── -->
+                    <div class="tab-pane fade" id="n4pane-objects" role="tabpanel" aria-labelledby="n4tab-objects">
+                        <p class="small text-muted mb-3">
+                            Graphs in one Neo4j connection's database. Prefer the connection currently
+                            selected on the Connections tab, or pick another name below.
+                        </p>
+                        <div class="row g-2 align-items-end mb-3">
+                            <div class="col-md-6 col-lg-5">
+                                <label for="neo4jObjectsConnection" class="form-label small fw-semibold mb-1">Connection</label>
+                                <select class="form-select form-select-sm" id="neo4jObjectsConnection">
+                                    <option value="">— Select a connection —</option>
+                                </select>
+                            </div>
+                            <div class="col-auto">
+                                <button type="button" class="btn btn-sm btn-outline-secondary" id="btnLoadNeo4jLabels">
+                                    <i class="bi bi-arrow-clockwise me-1"></i> Load graphs
+                                </button>
+                            </div>
+                        </div>
+                        <div id="neo4jSelectedHintObjects" class="small text-warning mb-2 d-none">
+                            <i class="bi bi-exclamation-triangle me-1"></i>Select a connection first.
+                        </div>
+                        <div id="neo4jLabelsResult"></div>
+                    </div><!-- /#n4pane-objects -->
+
+                    </div><!-- /#neo4jTabContent -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ==================== GLOBAL SECTION ==================== -->
+            <div id="global-section" class="sidebar-section">
+                <div class="content-section">
+                    <div class="section-header d-flex justify-content-between align-items-center mb-4">
+                        <div>
+                            <h4 class="mb-1"><i class="bi bi-sliders me-2"></i>Global</h4>
+                            <p class="text-muted mb-0 small">Global preferences and application settings</p>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-primary btn-save-settings">
+                            <i class="bi bi-check-circle me-1"></i> Save
+                        </button>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="baseUriDefault" class="form-label fw-semibold">
+                            Default Base URI Domain
+                            <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                            </span>
+                        </label>
+                        <input type="text" class="form-control" id="baseUriDefault"
+                               placeholder="https://databricks-ontology.com" value="https://databricks-ontology.com">
+                        <small class="text-muted">
+                            <i class="bi bi-info-circle"></i> This domain is used as the default Base URI when creating new domains. Stored globally for all users.
+                        </small>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="registryCacheTtl" class="form-label fw-semibold">
+                            Registry Cache TTL (seconds)
+                            <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                            </span>
+                        </label>
+                        <input type="number" class="form-control settings-registry-ttl-input" id="registryCacheTtl"
+                               min="10" step="10" value="300">
+                        <small class="text-muted">
+                            <i class="bi bi-info-circle"></i> How long the registry domain list is cached before refreshing from Databricks (minimum 10s).
+                        </small>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="editLockTtlMin" class="form-label fw-semibold">
+                            Edit Lock Lease (minutes)
+                            <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                            </span>
+                        </label>
+                        <input type="number" class="form-control settings-edit-lock-ttl-input" id="editLockTtlMin"
+                               min="0" step="1" value="10">
+                        <small class="text-muted">
+                            <i class="bi bi-info-circle"></i> How long a DRAFT single-editor lock survives with no keep-alive (a crashed / closed tab) before another user can reclaim it. The editor's browser auto-renews while open. Set to <strong>0</strong> to disable the lease (a lock is then held until the editor closes the domain or an admin force-unlocks it).
+                        </small>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="dataAssetsImportLimit" class="form-label fw-semibold">
+                            Data assets import limit
+                            <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                            </span>
+                        </label>
+                        <input type="number" class="form-control" id="dataAssetsImportLimit"
+                               min="1" max="500" step="1" value="40">
+                        <small class="text-muted">
+                            <i class="bi bi-info-circle"></i> Maximum Unity Catalog tables, views and metric views a domain may import. Default <strong>40</strong> (range 1–500). Extra assets in a schema are skipped until you raise the limit or remove existing assets.
+                        </small>
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="form-label fw-semibold">
+                            Graph read limits
+                            <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                            </span>
+                        </label>
+                        <div class="row g-3">
+                            <div class="col-12 col-lg-6">
+                                <label for="graphQueryTimeoutS" class="form-label small fw-semibold mb-1">Statement timeout (seconds)</label>
+                                <input type="number" min="0" step="5" class="form-control form-control-sm"
+                                       id="graphQueryTimeoutS" placeholder="60">
+                                <div class="form-text small mt-1 mb-0 text-muted">
+                                    Max time a single graph read (e.g. a Graph Chat traversal) may run before the
+                                    database cancels it &mdash; applies to both Lakebase and the SQL warehouse. <code>0</code>
+                                    uses the built-in default. Prevents a broad query from freezing the app.
+                                </div>
+                            </div>
+                            <div class="col-12 col-lg-6">
+                                <label for="graphChatResultCap" class="form-label small fw-semibold mb-1">Graph Chat result cap (triples)</label>
+                                <input type="number" min="0" step="100" class="form-control form-control-sm"
+                                       id="graphChatResultCap" placeholder="10000">
+                                <div class="form-text small mt-1 mb-0 text-muted">
+                                    Hard ceiling on triples returned to the Graph Chat agent per query.
+                                    <code>0</code> uses the built-in default.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <hr>
+
+                    <div class="mb-4">
+                        <label class="form-label fw-semibold">
+                            Knowledge-Graph Analytics
+                            <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                            </span>
+                        </label>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="analyticsJobEnabled">
+                            <label class="form-check-label" for="analyticsJobEnabled">
+                                Compute large-graph metrics on Databricks
+                            </label>
+                        </div>
+                        <small class="text-muted d-block mt-1">
+                            <i class="bi bi-info-circle"></i> Graph analytics runs entirely in a serverless Databricks job, which computes counts, average degree, density, degree centrality, the entity-type profiles, <strong>PageRank</strong>, the <strong>clustering coefficient</strong> and the <strong>component count</strong> exactly, plus <strong>betweenness</strong> and <strong>closeness</strong> as sampled estimates. This is the only way analytics runs, so leaving it off disables the Analytics page.
+                        </small>
+                        <small class="text-muted d-block mt-1">
+                            <i class="bi bi-exclamation-triangle"></i> Requires the Databricks bundle to have been deployed, so that the job exists, and the domain to have been built at least once. The job reads the mapped-triples snapshot every Build materialises, so it works the same on the Delta engine, on Lakebase in either mode, and on Neo4j. When a prerequisite is missing the Analytics page says which one rather than falling back to a different calculation. Runs take minutes rather than seconds.
+                        </small>
+                        <small id="analyticsJobEnabledSource" class="text-muted d-block mt-1"></small>
+                    </div>
+
+                    <hr>
+
+                    <div class="mb-0">
+                        <label class="form-label fw-semibold"><i class="bi bi-code-square me-1"></i> API Documentation</label>
+                        <p class="small text-muted mb-2">External API: REST <code>/api/v1/*</code>, domains <code>/api/v1/domains</code> and <code>/api/v1/domain/*</code> (versions, design status, OWL, R2RML, Spark SQL), Knowledge Graph <code>/api/v1/digitaltwin/*</code>, GraphQL <code>/api/v1/graphql/*</code>. In-app GraphQL also lives under <code>/graphql</code>. Other JSON routes are documented under <a href="/docs" target="_blank">/docs</a>.</p>
+                        <div class="d-flex gap-2 flex-wrap">
+                            <a href="/api/docs" target="_blank" class="btn btn-sm btn-outline-primary">
+                                <i class="bi bi-file-earmark-code me-1"></i> Swagger UI
+                            </a>
+                            <a href="/api/redoc" target="_blank" class="btn btn-sm btn-outline-secondary">
+                                <i class="bi bi-journal-text me-1"></i> ReDoc
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ==================== UI SECTION ==================== -->
+            <div id="ui-section" class="sidebar-section">
+                <div class="content-section">
+                    <div class="section-header d-flex justify-content-between align-items-center mb-4">
+                        <div>
+                            <h4 class="mb-1"><i class="bi bi-palette me-2"></i>UI</h4>
+                            <p class="text-muted mb-0 small">Branding and theme settings for the application interface</p>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="uiBrandingDiscardBtn" disabled>
+                                <i class="bi bi-arrow-counterclockwise me-1"></i> Discard changes
+                            </button>
+                            <button type="button"
+                                    class="btn btn-sm btn-outline-warning"
+                                    id="uiBrandingResetDefaultsBtn"
+                                    title="Restore factory UI defaults"
+                                    aria-label="Restore factory UI defaults">
+                                <i class="bi bi-arrow-repeat me-1"></i> Default
+                            </button>
+                            <button type="button" class="btn btn-sm btn-primary" id="uiBrandingSaveBtn" disabled>
+                                <i class="bi bi-check-circle me-1"></i> Save
+                            </button>
+                        </div>
+                    </div>
+
+                    <div id="uiBrandingStatus" class="alert d-none py-2 px-3 mb-3 small" role="status" aria-live="polite"></div>
+
+                    <div class="card shadow-sm mb-4">
+                        <div class="card-body">
+                            <h5 class="card-title mb-3">Branding</h5>
+
+                            <div class="mb-3">
+                                <label for="uiBrandingTitle" class="form-label fw-semibold">
+                                    Application title
+                                    <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                        <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                                    </span>
+                                </label>
+                                <input type="text"
+                                       class="form-control form-control-sm"
+                                       id="uiBrandingTitle"
+                                       maxlength="60"
+                                       aria-describedby="uiBrandingTitleHelp uiBrandingTitleError"
+                                       autocomplete="off"
+                                       placeholder="OntoBricks">
+                                <div id="uiBrandingTitleHelp" class="form-text">Displayed in the navbar and browser page titles. 1&ndash;60 characters.</div>
+                                <div id="uiBrandingTitleError" class="text-danger small mt-1 d-none" aria-live="polite"></div>
+                            </div>
+
+                            <div class="mb-3">
+                                <label class="form-label fw-semibold">
+                                    Application Logo
+                                    <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                        <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                                    </span>
+                                </label>
+                                <div class="d-flex align-items-center gap-3 mb-2">
+                                    <div class="d-flex align-items-center justify-content-center border rounded bg-dark settings-logo-preview-box">
+                                        <img id="navbarLogoPreview"
+                                             data-brand-icon
+                                             src="{{ ui_branding_for().logo_url }}"
+                                             alt="{{ ui_branding_for().app_title }}"
+                                             width="32"
+                                             height="32">
+                                    </div>
+                                    <div class="flex-grow-1">
+                                        <label for="uiBrandingLogoFile" class="form-label small fw-semibold">Logo file</label>
+                                        <input type="file"
+                                               class="form-control form-control-sm"
+                                               id="uiBrandingLogoFile"
+                                               aria-describedby="uiBrandingLogoHelp"
+                                               accept="image/svg+xml,image/png,image/jpeg,image/webp,image/gif">
+                                        <div id="uiBrandingLogoHelp" class="form-text">
+                                            Recommended: <strong>64&times;64&nbsp;px</strong> square.
+                                            SVG, PNG, JPEG, WEBP or GIF, max&nbsp;1&nbsp;MB.
+                                        </div>
+                                        <div class="d-flex gap-2 mt-2">
+                                            <button type="button" class="btn btn-sm btn-outline-secondary" id="uiBrandingResetIconBtn">
+                                                <i class="bi bi-image me-1"></i> Reset icon
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="mb-0">
+                                <label class="form-label fw-semibold">
+                                    Default Entity Icon
+                                    <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
+                                        <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
+                                    </span>
+                                </label>
+                                <div class="d-flex align-items-center gap-2 mb-1">
+                                    <span id="currentDefaultEmoji" class="fs-3">📦</span>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary" id="changeDefaultEmoji">
+                                        <i class="bi bi-pencil me-1"></i> Change
+                                    </button>
+                                </div>
+                                <small class="text-muted d-block">Default icon used for new entities in the ontology. Stored globally for all users.</small>
+                                <div id="defaultEmojiPickerMount"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card shadow-sm">
+                        <div class="card-body">
+                            <h5 class="card-title mb-3">Theme</h5>
+
+                            <div class="row g-3 align-items-end mb-3">
+                                <div class="col-12 col-lg-4">
+                                    <label for="uiBrandingPrimaryColor" class="form-label fw-semibold">Primary color</label>
+                                    <input type="color"
+                                           class="form-control form-control-color"
+                                           id="uiBrandingPrimaryColor"
+                                           aria-describedby="uiBrandingColorHelp uiBrandingColorError"
+                                           value="#4F46E5">
+                                </div>
+                                <div class="col-12 col-lg-8">
+                                    <label for="uiBrandingPrimaryHex" class="form-label fw-semibold">Hex value</label>
+                                    <input type="text"
+                                           class="form-control form-control-sm font-monospace text-uppercase"
+                                           id="uiBrandingPrimaryHex"
+                                           aria-describedby="uiBrandingColorHelp uiBrandingColorError"
+                                           maxlength="7"
+                                           autocomplete="off"
+                                           value="#4F46E5"
+                                           placeholder="#4F46E5">
+                                </div>
+                                <div class="col-12">
+                                    <div id="uiBrandingColorHelp" class="form-text">Use a valid uppercase hex color in the format #RRGGBB.</div>
+                                    <div id="uiBrandingColorError" class="text-danger small mt-1 d-none" aria-live="polite"></div>
+                                </div>
+                            </div>
+
+                            <div class="row g-3 align-items-end mb-3">
+                                <div class="col-12 col-lg-4">
+                                    <label for="uiBrandingAuroraColor" class="form-label fw-semibold">Aurora color</label>
+                                    <input type="color"
+                                           class="form-control form-control-color"
+                                           id="uiBrandingAuroraColor"
+                                           aria-describedby="uiBrandingAuroraHelp uiBrandingAuroraError"
+                                           value="#22A7C8">
+                                </div>
+                                <div class="col-12 col-lg-8">
+                                    <label for="uiBrandingAuroraHex" class="form-label fw-semibold">Hex value</label>
+                                    <input type="text"
+                                           class="form-control form-control-sm font-monospace text-uppercase"
+                                           id="uiBrandingAuroraHex"
+                                           aria-describedby="uiBrandingAuroraHelp uiBrandingAuroraError"
+                                           maxlength="7"
+                                           autocomplete="off"
+                                           value="#22A7C8"
+                                           placeholder="#22A7C8">
+                                </div>
+                                <div class="col-12">
+                                    <div id="uiBrandingAuroraHelp" class="form-text">Accent used for gradients and highlights. Leave unchanged to auto-derive from Primary.</div>
+                                    <div id="uiBrandingAuroraError" class="text-danger small mt-1 d-none" aria-live="polite"></div>
+                                </div>
+                            </div>
+
+                            <div class="row g-2 mb-3 ui-branding-swatches">
+                                <div class="col-6 col-lg-4">
+                                    <div class="ui-branding-swatch ui-branding-swatch-primary" id="uiSwatchPrimary" role="img" aria-label="Primary color #4F46E5" title="Primary color #4F46E5">Primary</div>
+                                </div>
+                                <div class="col-6 col-lg-4">
+                                    <div class="ui-branding-swatch ui-branding-swatch-hover" id="uiSwatchHover" role="img" aria-label="Hover color rgba(79, 70, 229, 0.06)" title="Hover color rgba(79, 70, 229, 0.06)">Hover</div>
+                                </div>
+                                <div class="col-6 col-lg-4">
+                                    <div class="ui-branding-swatch ui-branding-swatch-light" id="uiSwatchLight" role="img" aria-label="Selected color rgba(79, 70, 229, 0.10)" title="Selected color rgba(79, 70, 229, 0.10)">Selected</div>
+                                </div>
+                                <div class="col-6 col-lg-4">
+                                    <div class="ui-branding-swatch ui-branding-swatch-focus" id="uiSwatchFocus" role="img" aria-label="Focus Ring color rgba(79, 70, 229, 0.18)" title="Focus Ring color rgba(79, 70, 229, 0.18)">Focus Ring</div>
+                                </div>
+                                <div class="col-6 col-lg-4">
+                                    <div class="ui-branding-swatch ui-branding-swatch-on-primary" id="uiSwatchOnPrimary" role="img" aria-label="On Primary color #FFFFFF" title="On Primary color #FFFFFF">On Primary</div>
+                                </div>
+                                <div class="col-6 col-lg-4">
+                                    <div class="ui-branding-swatch ui-branding-swatch-aurora" id="uiSwatchAurora" role="img" aria-label="Aurora color #22A7C8" title="Aurora color #22A7C8">Aurora</div>
+                                </div>
+                            </div>
+
+                            <div class="ui-branding-preview" id="uiBrandingPreview" aria-hidden="true">
+                                <button type="button" class="btn btn-sm btn-primary ui-branding-preview-btn">Primary button</button>
+                                <div class="ui-branding-preview-active">Active navigation item</div>
+                                <div class="ui-branding-preview-hover">Hover well</div>
+                                <input type="text" class="form-control form-control-sm ui-branding-preview-focus" value="Focused control" readonly>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
             {% if user_role == 'admin' %}
-            <!-- ==================== PERMISSIONS TAB ==================== -->
-            <div class="tab-pane fade" id="pane-permissions" role="tabpanel" aria-labelledby="tab-permissions">
-                <div class="alert alert-info small d-flex align-items-start mb-3" role="alert">
-                    <i class="bi bi-info-circle me-2 mt-1"></i>
-                    <div>
-                        App-level access is managed in
-                        <strong>Databricks &rarr; App permissions</strong>. This list
-                        mirrors the principals that currently have a permission on the
-                        OntoBricks app. To grant per-domain roles (Viewer / Editor /
-                        Builder), use <strong>Registry &rarr; Teams</strong>.
-                    </div>
-                </div>
+            <!-- ==================== TEAMS SECTION (admin only) ==================== -->
+            <div id="teams-section" class="sidebar-section">
+                {% include "partials/settings/_settings_teams.html" %}
+            </div>
 
-                <div class="d-flex justify-content-between align-items-center mb-3">
-                    <h6 class="mb-0"><i class="bi bi-people me-1"></i> App Principals</h6>
-                    <div class="d-flex gap-2">
-                        <button type="button" class="btn btn-sm btn-outline-secondary" id="btnRefreshPermissions" title="Refresh">
+            <!-- ==================== LOCKS SECTION (admin only) ==================== -->
+            <div id="locks-section" class="sidebar-section">
+                <div class="content-section">
+                    <div class="section-header d-flex justify-content-between align-items-center mb-4">
+                        <div>
+                            <h4 class="mb-1"><i class="bi bi-lock me-2"></i>Locks</h4>
+                            <p class="text-muted mb-0 small">Active domain edit-locks (single-editor concurrency) — force-unlock a stuck lock</p>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="btnRefreshLocks" title="Refresh">
                             <i class="bi bi-arrow-clockwise"></i>
                         </button>
                     </div>
+                    {% include "partials/settings/_settings_locks.html" %}
                 </div>
+            </div>
 
-                <div id="permissionsTableContainer">
-                    <div class="text-center text-muted small py-4">
-                        <span class="spinner-border spinner-border-sm me-1"></span> Loading app principals...
+            <!-- ==================== REGISTRY SECTION (admin only) ==================== -->
+            <div id="registry-section" class="sidebar-section">
+                <div class="content-section">
+                    {% include "partials/registry/_registry_configuration.html" %}
+                </div>
+            </div>
+
+            <!-- ==================== GITHUB SECTION (admin only) ==================== -->
+            <div id="github-section" class="sidebar-section">
+                <div class="content-section">
+                    {% include "partials/settings/_settings_github.html" %}
+                </div>
+            </div>
+
+            <!-- ==================== HEALTH SECTION (admin only) ==================== -->
+            <div id="health-section" class="sidebar-section">
+                <div class="content-section">
+                    <div class="section-header d-flex justify-content-between align-items-center mb-4">
+                        <div>
+                            <h4 class="mb-1"><i class="bi bi-heart-pulse me-2"></i>Health</h4>
+                            <p class="text-muted mb-0 small">System health and readiness diagnostics</p>
+                        </div>
                     </div>
+                    {% include "partials/settings/_settings_health.html" %}
                 </div>
             </div>
 
-            <!-- ==================== REGISTRY TAB ==================== -->
-            <div class="tab-pane fade" id="pane-registry" role="tabpanel" aria-labelledby="tab-registry">
-                {% include "partials/registry/_registry_configuration.html" %}
+            <!-- ==================== LOGS SECTION (admin only) ==================== -->
+            <div id="logs-section" class="sidebar-section">
+                <div class="content-section">
+                    <div class="section-header d-flex justify-content-between align-items-center mb-3">
+                        <div>
+                            <h4 class="mb-1"><i class="bi bi-terminal me-2"></i>Application Logs</h4>
+                            <p class="text-muted mb-0 small">Live tail of the app log file — same output as the Databricks Apps console</p>
+                        </div>
+                        <div class="d-flex align-items-center gap-2">
+                            <div class="form-check form-switch mb-0 small me-1">
+                                <input class="form-check-input" type="checkbox" id="logsAutoRefresh" checked>
+                                <label class="form-check-label text-muted" for="logsAutoRefresh">Auto (10 s)</label>
+                            </div>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="btnRefreshLogs" title="Reload logs now">
+                                <i class="bi bi-arrow-clockwise me-1"></i> Refresh
+                            </button>
+                            <a href="/settings/logs/download" class="btn btn-sm btn-outline-secondary" id="btnDownloadLogs" title="Download full log file" download>
+                                <i class="bi bi-download me-1"></i> Download
+                            </a>
+                        </div>
+                    </div>
+                    {% include "partials/settings/_settings_logs.html" %}
+                </div>
             </div>
-
-            <!-- ==================== HEALTH TAB ==================== -->
-            <div class="tab-pane fade" id="pane-health" role="tabpanel" aria-labelledby="tab-health">
-                {% include "partials/settings/_settings_health.html" %}
+            <!-- ==== AUTOMATION: RUNS (every domain — admin only) ====
+                 Sits in the admin block rather than next to the Scheduler
+                 section it neighbours in the sidebar: it reports every
+                 domain's history, so a non-admin must not even receive the
+                 markup. -->
+            <div id="runs-section" class="sidebar-section">
+                {% include "partials/settings/_settings_runs.html" %}
             </div>
             {% endif %}
 
-            <!-- ==================== GRAPH DB TAB ==================== -->
-            <div class="tab-pane fade" id="pane-graphdb" role="tabpanel" aria-labelledby="tab-graphdb">
-
-                <div id="graphDbTabLoadingBanner" class="alert alert-light border d-none align-items-center justify-content-center gap-2 py-3 mb-3" role="status" aria-live="polite">
-                    <span class="spinner-border spinner-border-sm text-primary" aria-hidden="true"></span>
-                    <span class="text-muted small">Loading Graph DB settings…</span>
-                </div>
-
-                <div id="graphDbTabContent">
-
-                <!-- Graph DB Engine selector -->
-                <div class="mb-4">
-                    <label for="graphEngineSelect" class="form-label fw-semibold mb-2">
-                        Graph DB Engine
-                        <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
-                            <i class="bi bi-shield-lock me-1"></i>Admin only
-                        </span>
-                    </label>
-                    <select class="form-select form-select-sm settings-graph-engine-select" id="graphEngineSelect">
-                        <option value="lakebase">Lakebase (Postgres)</option>
-                    </select>
-                    <small class="text-muted d-block mt-2">
-                        Selects the graph database engine used for building and querying knowledge graphs.
-                        For <strong>Lakebase (Postgres)</strong> use the form above; <strong>Save</strong> at the top persists it.
-                        Optional raw JSON is under <em>Advanced</em> below.
-                    </small>
-                </div>
-
-                <div class="mb-4 border rounded p-3 bg-body-secondary" id="lakebaseGraphPanel" style="display:none;">
-                    <div class="fw-semibold mb-2"><i class="bi bi-database me-1"></i> Lakebase connection</div>
-                    <p class="small text-muted mb-0">
-                        Select the Autoscaling project, branch, and database where graph triples will be stored.
-                        Use <strong>Load</strong> to discover available options from the workspace.
-                    </p>
-                    <hr class="my-3 opacity-25">
-
-                    <!-- Row 1: Project + Branch -->
-                    <div class="row g-3 mb-3">
-                        <div class="col-12 col-lg-6">
-                            <label for="lakebaseProject" class="form-label small fw-semibold mb-1">Autoscaling project</label>
-                            <div class="input-group input-group-sm">
-                                <select class="form-select form-select-sm" id="lakebaseProject" aria-describedby="lakebaseProjectHelp">
-                                    <option value="">(click Load to discover)</option>
-                                </select>
-                                <button type="button" class="btn btn-outline-secondary btn-sm" id="btnLoadLakebaseProjects" title="Load projects">
-                                    <i class="bi bi-arrow-down-circle"></i>
-                                </button>
-                            </div>
-                            <div id="lakebaseProjectHelp" class="form-text small mt-1 mb-0 text-muted">Lakebase Autoscaling project.</div>
-                        </div>
-                        <div class="col-12 col-lg-6">
-                            <label for="lakebaseBranch" class="form-label small fw-semibold mb-1">Branch</label>
-                            <select class="form-select form-select-sm" id="lakebaseBranch" disabled aria-describedby="lakebaseBranchHelp">
-                                <option value="">(select a project first)</option>
-                            </select>
-                            <div id="lakebaseBranchHelp" class="form-text small mt-1 mb-0 text-muted">Branch within the project.</div>
-                        </div>
-                    </div>
-
-                    <!-- Row 2: Database + Schema -->
-                    <div class="row g-3">
-                        <div class="col-12 col-lg-6">
-                            <label for="lakebaseGraphDb" class="form-label small fw-semibold mb-1">Postgres database</label>
-                            <select class="form-select form-select-sm" id="lakebaseGraphDb" disabled aria-describedby="lakebaseGraphDbHelp">
-                                <option value="">(select a branch first)</option>
-                            </select>
-                            <div id="lakebaseGraphDbHelp" class="form-text small mt-2 mb-0"></div>
-                        </div>
-                        <div class="col-12 col-lg-6">
-                            <label for="lakebaseGraphSchema" class="form-label small fw-semibold mb-1">Postgres schema</label>
-                            <div class="input-group input-group-sm">
-                                <select class="form-select form-select-sm" id="lakebaseGraphSchema" disabled aria-describedby="lakebaseGraphSchemaHelp">
-                                    <option value="">(select a database first)</option>
-                                </select>
-                                <input type="text" class="form-control form-control-sm font-monospace d-none" id="lakebaseGraphSchemaInput"
-                                       value="ontobricks_graph" maxlength="63" autocomplete="off" placeholder="ontobricks_graph">
-                                <button type="button" class="btn btn-outline-secondary btn-sm" id="btnToggleLakebaseSchemaInput"
-                                        title="Type schema name manually" data-mode="select">
-                                    <i class="bi bi-pencil"></i>
-                                </button>
-                            </div>
-                            <div id="lakebaseGraphSchemaHelp" class="form-text small mt-2 mb-0 text-muted">
-                                Postgres schema for graph triple tables. Click <i class="bi bi-pencil"></i> to type manually.
-                            </div>
-                        </div>
-                    </div>
-
-                    <hr class="my-3 opacity-25">
-                    <div class="fw-semibold mb-2"><i class="bi bi-lightning-charge me-1"></i> Bulk loading</div>
-                    <p class="small text-muted mb-3 mb-lg-2">
-                        Choose how R2RML triples reach Postgres. Most workspaces start with <strong>App-managed</strong>.
-                        <strong>Managed sync</strong> delegates bulk copy to Databricks Lakeflow (needs UC registration).
-                    </p>
-                    <div class="row g-3 align-items-start">
-                        <div class="col-12">
-                            <label for="lakebaseSyncMode" class="form-label small fw-semibold mb-1">Mode</label>
-                            <select class="form-select form-select-sm" id="lakebaseSyncMode" aria-describedby="lakebaseSyncModeHelp">
-                                <option value="app_managed">App-managed — stream from SQL warehouse into Postgres (default)</option>
-                                <option value="managed_synced">Managed sync — Lakeflow syncs the Delta view to Postgres (data plane)</option>
-                            </select>
-                            <div id="lakebaseSyncModeHelp" class="form-text small mt-2 mb-0">
-                                <span data-lk-mode="app_managed">The app runs the warehouse query and COPYs rows; no Unity Catalog object is required for the load.</span>
-                                <span data-lk-mode="managed_synced" class="d-none">Lakeflow keeps a synced table; the app only orchestrates. Requires a valid <code>catalog.schema</code> in Unity Catalog for registration.</span>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div id="lakebaseManagedSyncPanel" class="border rounded p-3 mt-3 bg-body-tertiary d-none">
-                        <div class="fw-semibold small mb-2">Managed sync options</div>
-                        <div class="row g-3">
-                            <div class="col-12 col-lg-6">
-                                <label for="lakebaseSyncTableMode" class="form-label small fw-semibold mb-1">Lakeflow schedule</label>
-                                <select class="form-select form-select-sm" id="lakebaseSyncTableMode">
-                                    <option value="snapshot">Snapshot — full refresh on trigger (good default)</option>
-                                    <option value="triggered">Triggered — refresh when you trigger</option>
-                                    <option value="continuous">Continuous — keep near real-time</option>
-                                </select>
-                                <div class="form-text small mt-1 mb-0 text-muted">How often Lakeflow updates the Postgres mirror.</div>
-                            </div>
-                            <div class="col-12 col-lg-6">
-                                <label for="lakebaseSyncTimeout" class="form-label small fw-semibold mb-1">Sync wait (seconds)</label>
-                                <input type="number" class="form-control form-control-sm" id="lakebaseSyncTimeout"
-                                       min="1" max="86400" step="1" value="600" autocomplete="off">
-                                <div class="form-text small mt-1 mb-0 text-muted">How long a build waits for a sync run to finish.</div>
-                            </div>
-                            <!-- UC Catalog -->
-                            <div class="col-12 col-lg-6">
-                                <label for="lakebaseUcCatalog" class="form-label small fw-semibold mb-1">UC catalog (sync registration)</label>
-                                <div class="input-group input-group-sm">
-                                    <select class="form-select form-select-sm" id="lakebaseUcCatalog" aria-describedby="lakebaseUcCatalogHelp">
-                                        <option value="">(click Load to discover)</option>
-                                    </select>
-                                    <button type="button" class="btn btn-outline-secondary btn-sm" id="btnLoadUcCatalogs" title="Load UC catalogs">
-                                        <i class="bi bi-arrow-down-circle"></i>
-                                    </button>
-                                </div>
-                                <div id="lakebaseUcCatalogHelp" class="form-text small mt-1 mb-0 text-muted">
-                                    UC catalog for synced table registration. If empty: Registry catalog, then domain Delta.
-                                </div>
-                                <div id="lakebaseUcCatalogLoadMsg" class="form-text small mt-1 d-none text-warning"></div>
-                            </div>
-                            <!-- UC Schema (read-only — always mirrors Postgres graph schema) -->
-                            <div class="col-12 col-lg-6">
-                                <label class="form-label small fw-semibold mb-1">UC schema (sync registration)</label>
-                                <div class="input-group input-group-sm">
-                                    <span class="input-group-text bg-light"><i class="bi bi-diagram-3"></i></span>
-                                    <input type="text" class="form-control form-control-sm font-monospace ob-form-readonly-muted"
-                                           id="lakebaseUcSchemaDisplay" readonly
-                                           placeholder="(same as Postgres schema)">
-                                </div>
-                                <div class="form-text small mt-1 mb-0 text-muted">
-                                    Always equals the Postgres graph schema — Lakebase places the <code>_sync</code> foreign table in the matching Postgres schema.
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <hr class="my-3 opacity-25">
-                    <div class="fw-semibold mb-2"><i class="bi bi-heart-pulse me-1"></i> Lakebase health &amp; connection info</div>
-                    <p class="small text-muted mb-2">
-                        Read-only probe against the <strong>saved</strong> engine JSON in the registry (use <strong>Save</strong> above after edits).
-                        Confirms the App-bound Postgres instance reaches the configured database and graph schema.
-                    </p>
-                    <div id="lakebaseGraphHealthMessage" class="small mb-2" style="display:none;"></div>
-                    <dl class="row small mb-2" id="lakebaseGraphHealthDl"></dl>
-                    <button type="button" class="btn btn-sm btn-outline-secondary" id="btnRefreshLakebaseGraphHealth" title="Refresh health probe">
-                        <i class="bi bi-arrow-clockwise me-1"></i> Refresh health
-                    </button>
-
-                    <hr class="my-3 opacity-25">
-                    <details id="lakebaseObjectsDetails">
-                        <summary class="fw-semibold small user-select-none settings-summary-cursor">
-                            <i class="bi bi-trash me-1"></i> Lakebase objects &mdash; schemas / tables / views
-                        </summary>
-                        <p class="small text-muted mt-2 mb-2">
-                            Lists objects in the connected database owned by you or any principal.
-                            The <strong>Drop</strong> button is enabled only for objects you own (<code>current_user</code>).
-                            <strong>Dropping a schema uses CASCADE — all contained tables and views are removed.</strong>
-                        </p>
-                        <button type="button" class="btn btn-sm btn-outline-secondary mb-3"
-                                id="btnLoadLakebaseObjects">
-                            <i class="bi bi-arrow-clockwise me-1"></i> Load objects
-                        </button>
-                        <div id="lakebaseObjectsResult"></div>
-                    </details>
-
-                    <!-- Drop-object confirmation modal -->
-                    <div class="modal fade" id="lkDropConfirmModal" tabindex="-1" aria-labelledby="lkDropConfirmModalLabel" aria-hidden="true">
-                      <div class="modal-dialog modal-dialog-centered">
-                        <div class="modal-content">
-                          <div class="modal-header">
-                            <h5 class="modal-title" id="lkDropConfirmModalLabel"><i class="bi bi-exclamation-triangle-fill text-danger me-2"></i>Confirm drop</h5>
-                            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-                          </div>
-                          <div class="modal-body" id="lkDropConfirmModalBody">Are you sure?</div>
-                          <div class="modal-footer">
-                            <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
-                            <button type="button" class="btn btn-danger btn-sm" id="lkDropConfirmBtn">Drop</button>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                </div>
-
-                <!-- Optional raw JSON (advanced) -->
-                <details class="mb-4" id="graphEngineConfigDetails">
-                    <summary class="form-label fw-semibold mb-2 user-select-none settings-summary-cursor">
-                        Advanced: raw engine configuration (JSON)
-                        <span class="badge bg-secondary border ms-2 ob-badge-version">optional</span>
-                    </summary>
-                    <p class="small text-muted">Form fields above are merged into this object on <strong>Save</strong>. Edit only if you need extra keys not exposed in the UI.</p>
-                    <textarea class="form-control font-monospace" id="graphEngineConfig"
-                              rows="6" placeholder="{}" spellcheck="false">{}</textarea>
-                    <div id="graphEngineConfigError" class="text-danger small mt-2" style="display:none;"></div>
-                </details>
-
-                </div><!-- /#graphDbTabContent -->
+            <!-- ==================== AUTOMATION: SCHEDULER ==================== -->
+            <div id="schedule-section" class="sidebar-section">
+                {% include "partials/settings/_settings_schedule.html" %}
             </div>
 
-            <!-- ==================== GLOBAL TAB ==================== -->
-            <div class="tab-pane fade" id="pane-global" role="tabpanel" aria-labelledby="tab-global">
-                <div class="mb-4">
-                    <label for="baseUriDefault" class="form-label fw-semibold">
-                        Default Base URI Domain
-                        <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
-                            <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
-                        </span>
-                    </label>
-                    <input type="text" class="form-control" id="baseUriDefault"
-                           placeholder="https://databricks-ontology.com" value="https://databricks-ontology.com">
-                    <small class="text-muted">
-                        <i class="bi bi-info-circle"></i> This domain is used as the default Base URI when creating new domains. Stored globally for all users.
-                    </small>
-                </div>
-
-                <div class="mb-4">
-                    <label class="form-label fw-semibold">
-                        Default Class Icon
-                        <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
-                            <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
-                        </span>
-                    </label>
-                    <div class="d-flex align-items-center gap-2 mb-1">
-                        <span id="currentDefaultEmoji" class="fs-3">📦</span>
-                        <button type="button" class="btn btn-sm btn-outline-secondary" id="changeDefaultEmoji">
-                            <i class="bi bi-pencil me-1"></i> Change
-                        </button>
-                    </div>
-                    <small class="text-muted">Default icon used for new classes in the ontology. Stored globally for all users.</small>
-
-                    <div id="defaultEmojiPickerMount"></div>
-                </div>
-
-                <div class="mb-4">
-                    <label class="form-label fw-semibold">
-                        Application Logo
-                        <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
-                            <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
-                        </span>
-                    </label>
-                    <div class="d-flex align-items-center gap-3 mb-2">
-                        <div class="d-flex align-items-center justify-content-center border rounded bg-dark settings-logo-preview-box">
-                            <img id="navbarLogoPreview"
-                                 src="{{ url_for('static', filename='global/img/favicon.svg') }}?v=2"
-                                 alt="Current logo" width="32" height="32">
-                        </div>
-                        <div class="flex-grow-1">
-                            <input type="file" class="form-control form-control-sm" id="navbarLogoFile"
-                                   accept="image/svg+xml,image/png,image/jpeg,image/webp,image/gif">
-                            <div class="form-text">
-                                Recommended: <strong>64&times;64&nbsp;px</strong> square
-                                (rendered at 24&times;24 in the navbar). SVG, PNG, JPEG, WEBP or GIF, max&nbsp;1&nbsp;MB.
-                            </div>
-                        </div>
-                    </div>
-                    <div class="d-flex gap-2">
-                        <button type="button" class="btn btn-sm btn-outline-primary" id="btnUploadNavbarLogo" disabled>
-                            <i class="bi bi-upload me-1"></i> Upload logo
-                        </button>
-                        <button type="button" class="btn btn-sm btn-outline-secondary" id="btnResetNavbarLogo">
-                            <i class="bi bi-arrow-counterclockwise me-1"></i> Reset to default
-                        </button>
-                        <span id="navbarLogoStatus" class="text-muted small ms-2 align-self-center"></span>
-                    </div>
-                </div>
-
-                <div class="mb-4">
-                    <label for="registryCacheTtl" class="form-label fw-semibold">
-                        Registry Cache TTL (seconds)
-                        <span class="badge bg-warning-subtle text-warning-emphasis border ms-2 settings-badge-admin-note">
-                            <i class="bi bi-shield-lock me-1"></i>Admin only &ndash; applies to all users
-                        </span>
-                    </label>
-                    <input type="number" class="form-control settings-registry-ttl-input" id="registryCacheTtl"
-                           min="10" step="10" value="300">
-                    <small class="text-muted">
-                        <i class="bi bi-info-circle"></i> How long the registry domain list is cached before refreshing from Databricks (minimum 10s).
-                    </small>
-                </div>
-
-                <hr>
-
-                <div class="mb-0">
-                    <label class="form-label fw-semibold"><i class="bi bi-code-square me-1"></i> API Documentation</label>
-                    <p class="small text-muted mb-2">External API: REST <code>/api/v1/*</code>, domains <code>/api/v1/domains</code> and <code>/api/v1/domain/*</code> (versions, design status, OWL, R2RML, Spark SQL), Digital Twin <code>/api/v1/digitaltwin/*</code>, GraphQL <code>/api/v1/graphql/*</code>. In-app GraphQL also lives under <code>/graphql</code>. Other JSON routes are documented under <a href="/docs" target="_blank">/docs</a>.</p>
-                    <div class="d-flex gap-2 flex-wrap">
-                        <a href="/api/docs" target="_blank" class="btn btn-sm btn-outline-primary">
-                            <i class="bi bi-file-earmark-code me-1"></i> Swagger UI
-                        </a>
-                        <a href="/api/redoc" target="_blank" class="btn btn-sm btn-outline-secondary">
-                            <i class="bi bi-journal-text me-1"></i> ReDoc
-                        </a>
-                    </div>
-                </div>
+            <!-- ==================== API SECTION (Developer) ==================== -->
+            <div id="api-section" class="sidebar-section">
+                {% include "partials/settings/_settings_api.html" %}
             </div>
 
         </div>
     </div>
 </div>
-                </div>
+
+<!-- Run details modals for Automation → Runs. Page-level on purpose: a modal
+     inside a hidden .sidebar-section shows its backdrop but leaves the dialog
+     invisible. Bodies are filled by settings-runs.js via RunsRender. -->
+<div class="modal fade" id="srRunDetailsModal" tabindex="-1" aria-labelledby="srRunDetailsModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="srRunDetailsModalLabel">
+                    <i class="bi bi-info-circle me-2"></i>Build Run Details
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="srRunDetailsBody"></div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="srAnalyticsRunDetailsModal" tabindex="-1" aria-labelledby="srAnalyticsRunDetailsModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="srAnalyticsRunDetailsModalLabel">
+                    <i class="bi bi-graph-up-arrow me-2"></i>Analytics Run Details
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="srAnalyticsRunDetailsBody"></div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Shared drop-object confirmation modal (used by both Lakebase and Lakehouse sections) -->
+<div class="modal fade" id="lkDropConfirmModal" tabindex="-1" aria-labelledby="lkDropConfirmModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="lkDropConfirmModalLabel"><i class="bi bi-exclamation-triangle-fill text-danger me-2"></i>Confirm drop</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="lkDropConfirmModalBody">Are you sure?</div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger btn-sm" id="lkDropConfirmBtn">Drop</button>
             </div>
         </div>
     </div>
@@ -488,11 +1361,17 @@
 {% endblock %}
 
 {% block extra_js %}
-<!-- Settings page JavaScript (extracted from template) -->
 <script src="{{ url_for('static', filename='config/js/settings.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='config/js/schedule.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='query/js/query-api.js') }}?v={{ asset_version }}"></script>
 {% if user_role == 'admin' %}
-<script src="{{ url_for('static', filename='config/js/permissions.js') }}?v={{ asset_version }}"></script>
-<script src="{{ url_for('static', filename='registry/js/registry.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='global/js/runs-render.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='config/js/settings-runs.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='config/js/settings-locks.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='registry/js/registry-teams.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='config/js/settings-registry-configuration.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='config/js/settings-health.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='config/js/settings-logs.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='config/js/settings-github.js') }}?v={{ asset_version }}"></script>
 {% endif %}
 {% endblock %}

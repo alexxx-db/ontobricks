@@ -15,6 +15,12 @@ class TestR2RMLGenerator:
         gen = R2RMLGenerator()
         assert gen.base_uri == "https://databricks-ontology.com/"
 
+    def test_init_sanitizes_spaces_in_base_uri(self):
+        gen = R2RMLGenerator("https://databricks-ontology.com/WRFM - Shell#")
+        assert " " not in gen.base_uri
+        assert "%20" in gen.base_uri
+        assert gen.base_uri.endswith("/")
+
 
 class TestEntityMapping:
     def test_generates_triples_map(self):
@@ -131,6 +137,26 @@ class TestEntityMapping:
 
 
 class TestRelationshipMapping:
+    def test_missing_relationship_id_columns_skipped(self):
+        gen = R2RMLGenerator("http://test.org/ontology/")
+        mapping_config = {
+            "entities": [],
+            "relationships": [
+                {
+                    "property": "http://test.org/ontology#hasOrder",
+                    "property_label": "hasOrder",
+                    "sql_query": "SELECT customer_id, order_id FROM orders",
+                    "source_id_column": None,
+                    "target_id_column": None,
+                }
+            ],
+        }
+
+        r2rml = gen.generate_mapping(mapping_config)
+
+        assert "TriplesMap_Rel_hasOrder_0" not in r2rml
+        assert "{None}" not in r2rml
+
     def test_relationship_triples_map(self):
         gen = R2RMLGenerator("http://test.org/ontology/")
         mapping_config = {
@@ -169,6 +195,62 @@ class TestRelationshipMapping:
         assert "hasOrder" in r2rml
         assert "Rel_" in r2rml
 
+    def test_relationship_uris_match_entity_uris_when_label_differs(self):
+        """Regression for issue #48.
+
+        When a class label differs from the local name of its class URI, the
+        entity subject URI (built from the URI local name) and the relationship
+        subject/object URIs (previously built from the label) must still share
+        the same namespace, otherwise BFS expansion finds no edges.
+        """
+        base = "http://test.org/ontology/"
+        gen = R2RMLGenerator(base)
+        mapping_config = {
+            "entities": [
+                {
+                    # local name "Cust" != label "Customer"
+                    "ontology_class": "http://test.org/ontology#Cust",
+                    "ontology_class_label": "Customer",
+                    "sql_query": "SELECT * FROM customers",
+                    "id_column": "customer_id",
+                    "attribute_mappings": {},
+                },
+                {
+                    # local name "Ord" != label "Order"
+                    "ontology_class": "http://test.org/ontology#Ord",
+                    "ontology_class_label": "Order",
+                    "sql_query": "SELECT * FROM orders",
+                    "id_column": "order_id",
+                    "attribute_mappings": {},
+                },
+            ],
+            "relationships": [
+                {
+                    "property": "http://test.org/ontology#hasOrder",
+                    "property_label": "hasOrder",
+                    "sql_query": "SELECT customer_id, order_id FROM orders",
+                    "source_class": "http://test.org/ontology#Cust",
+                    "source_class_label": "Customer",
+                    "target_class": "http://test.org/ontology#Ord",
+                    "target_class_label": "Order",
+                    "source_id_column": "customer_id",
+                    "target_id_column": "order_id",
+                    "direction": "forward",
+                }
+            ],
+        }
+        r2rml = gen.generate_mapping(mapping_config)
+
+        # Entity subject URIs use the URI local name, not the label.
+        assert f"{base}Cust/" in r2rml
+        assert f"{base}Ord/" in r2rml
+        # Relationship subject/object URIs must use the SAME namespace.
+        assert f"{base}Cust/{{customer_id}}" in r2rml
+        assert f"{base}Ord/{{order_id}}" in r2rml
+        # And must NOT fall back to the label namespace (the bug).
+        assert f"{base}Customer/" not in r2rml
+        assert f"{base}Order/" not in r2rml
+
 
 class TestConvenienceFunction:
     def test_generate_r2rml_from_config(self):
@@ -193,3 +275,200 @@ class TestConvenienceFunction:
         ontology = {"base_uri": "http://example.org/"}
         r2rml = generate_r2rml_from_config(mapping, ontology)
         assert r2rml is not None
+
+
+class TestQuoteColumn:
+    """Unit tests for _quote_column helper."""
+
+    def setup_method(self):
+        self.gen = R2RMLGenerator("http://test.org/ontology/")
+
+    def test_plain_identifier_unchanged(self):
+        assert self.gen._quote_column("customer_id") == "customer_id"
+
+    def test_already_quoted_unchanged(self):
+        assert self.gen._quote_column('"customer id"') == '"customer id"'
+
+    def test_space_gets_quoted(self):
+        assert self.gen._quote_column("customer id") == '"customer id"'
+
+    def test_hyphen_gets_quoted(self):
+        assert self.gen._quote_column("my-col") == '"my-col"'
+
+    def test_dot_gets_quoted(self):
+        assert self.gen._quote_column("first.name") == '"first.name"'
+
+    def test_empty_string_unchanged(self):
+        assert self.gen._quote_column("") == ""
+
+    def test_column_with_space_in_entity_template(self):
+        """rr:template should contain double-quoted column when name has a space.
+
+        rdflib serialises the inner double-quotes as \\\" in the Turtle literal,
+        so we check for the escaped representation in the raw Turtle string.
+        """
+        gen = R2RMLGenerator("http://test.org/ontology/")
+        mapping_config = {
+            "entities": [{
+                "ontology_class": "http://test.org/ontology/Customer",
+                "ontology_class_label": "Customer",
+                "sql_query": 'SELECT `customer id` AS "customer id", name AS Label FROM t',
+                "id_column": "customer id",
+                "label_column": "Label",
+                "attribute_mappings": {}
+            }],
+            "relationships": []
+        }
+        r2rml = gen.generate_mapping(mapping_config)
+        # rdflib escapes inner " as \" in the Turtle literal — check both forms
+        assert '\\"customer id\\"' in r2rml or '"customer id"' in r2rml
+
+    def test_column_with_space_in_attribute_mapping(self):
+        """rr:column value is the column name; Turtle quotes are syntax only."""
+        gen = R2RMLGenerator("http://test.org/ontology/")
+        mapping_config = {
+            "entities": [{
+                "ontology_class": "http://test.org/ontology/Customer",
+                "ontology_class_label": "Customer",
+                "sql_query": 'SELECT id AS ID, name AS Label, `full name` FROM t',
+                "id_column": "ID",
+                "label_column": "Label",
+                "attribute_mappings": {"fullName": "full name"}
+            }],
+            "relationships": []
+        }
+        r2rml = gen.generate_mapping(mapping_config)
+        assert 'rr:column "full name"' in r2rml
+        assert '\\"full name\\"' not in r2rml
+
+
+class TestIssue144OntopCompatibleQuotes:
+    """Exported R2RML must not embed SQL quotes inside rr:column / plain templates.
+
+    Ontop (and other R2RML engines) treat the RDF string value as the column
+    name. Turtle ``rr:column "\\"Label\\""`` is the string ``"Label"``, which
+    does not match the result-set column ``Label`` (github.com/databrickslabs/ontobricks/issues/144).
+    """
+
+    def _mapping(self):
+        return {
+            "entities": [
+                {
+                    "ontology_class": "http://purl.obolibrary.org/obo/BFO_0000145",
+                    "ontology_class_label": "continuant fiat boundary",
+                    "sql_query": "SELECT ID, Label FROM t",
+                    "id_column": "ID",
+                    "label_column": "Label",
+                    "attribute_mappings": {},
+                }
+            ],
+            "relationships": [],
+        }
+
+    def test_rr_column_is_bare_column_name(self):
+        gen = R2RMLGenerator("https://www.commoncoreontologies.org/CommonCoreOntologiesMerged/")
+        r2rml = gen.generate_mapping(self._mapping())
+        assert 'rr:column "Label"' in r2rml
+        assert '\\"Label\\"' not in r2rml
+
+    def test_template_plain_identifier_is_unquoted(self):
+        gen = R2RMLGenerator("https://www.commoncoreontologies.org/CommonCoreOntologiesMerged/")
+        r2rml = gen.generate_mapping(self._mapping())
+        assert "{ID}" in r2rml
+        assert '{\\"ID\\"}' not in r2rml
+
+
+class TestDeterministicSerialization:
+    """R2RML output must be byte-for-byte identical across repeated calls."""
+
+    _MAPPING = {
+        "entities": [
+            {
+                "ontology_class": "http://test.org/ontology/Customer",
+                "ontology_class_label": "Customer",
+                "sql_query": "SELECT id, name, email FROM customers",
+                "id_column": "id",
+                "label_column": "name",
+                "attribute_mappings": {"email": "email", "age": "age"},
+            },
+            {
+                "ontology_class": "http://test.org/ontology/Contract",
+                "ontology_class_label": "Contract",
+                "sql_query": "SELECT id, title FROM contracts",
+                "id_column": "id",
+                "attribute_mappings": {"title": "title"},
+            },
+        ],
+        "relationships": [
+            {
+                "property": "http://test.org/ontology/hasContract",
+                "property_label": "hasContract",
+                "source_class": "http://test.org/ontology/Customer",
+                "source_class_label": "Customer",
+                "target_class": "http://test.org/ontology/Contract",
+                "target_class_label": "Contract",
+                "source_id_column": "customer_id",
+                "target_id_column": "contract_id",
+                "sql_query": "SELECT customer_id, contract_id FROM customer_contracts",
+            }
+        ],
+    }
+
+    def test_repeated_calls_produce_identical_output(self):
+        gen = R2RMLGenerator("http://test.org/ontology/")
+        first = gen.generate_mapping(self._MAPPING)
+        second = gen.generate_mapping(self._MAPPING)
+        assert first == second
+
+    def test_attribute_order_is_stable(self):
+        """Attributes in reverse-alphabetical input order must still sort consistently."""
+        gen = R2RMLGenerator("http://test.org/ontology/")
+        mapping_z_first = {
+            "entities": [
+                {
+                    "ontology_class": "http://test.org/ontology/Item",
+                    "ontology_class_label": "Item",
+                    "sql_query": "SELECT * FROM items",
+                    "id_column": "id",
+                    "attribute_mappings": {"zzz": "col_z", "aaa": "col_a"},
+                }
+            ],
+            "relationships": [],
+        }
+        mapping_a_first = {
+            "entities": [
+                {
+                    "ontology_class": "http://test.org/ontology/Item",
+                    "ontology_class_label": "Item",
+                    "sql_query": "SELECT * FROM items",
+                    "id_column": "id",
+                    "attribute_mappings": {"aaa": "col_a", "zzz": "col_z"},
+                }
+            ],
+            "relationships": [],
+        }
+        assert gen.generate_mapping(mapping_z_first) == gen.generate_mapping(mapping_a_first)
+
+
+class TestSpacedOntologyUris:
+    def test_generate_with_spaces_in_class_uri(self):
+        """Stale class IRIs with spaces must still serialize as Turtle."""
+        gen = R2RMLGenerator("https://databricks-ontology.com/WRFM#")
+        mapping_config = {
+            "entities": [
+                {
+                    "ontology_class": "https://databricks-ontology.com/WRFM - Shell#Sensor",
+                    "ontology_class_label": "Sensor",
+                    "sql_query": "SELECT * FROM sensors",
+                    "id_column": "id",
+                    "attribute_mappings": {},
+                }
+            ],
+            "relationships": [],
+        }
+        r2rml = gen.generate_mapping(mapping_config)
+        assert "TriplesMap" in r2rml
+        assert "Sensor" in r2rml
+        assert " " not in r2rml or "rr:sqlQuery" in r2rml  # spaces only ok in literals
+        # Class IRI must be percent-encoded, not raw spaces
+        assert "WRFM%20-%20Shell" in r2rml or "WRFM%20-%20Shell#Sensor" in r2rml

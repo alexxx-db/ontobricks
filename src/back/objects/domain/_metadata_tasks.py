@@ -20,6 +20,7 @@ def run_metadata_load_task(
     schema: str,
     selected_tables: Optional[List[str]],
     existing_metadata: Dict[str, Any],
+    import_limit: Optional[int] = None,
 ) -> None:
     tm = get_task_manager()
     try:
@@ -33,12 +34,14 @@ def run_metadata_load_task(
                 schema=schema,
                 table_names=selected_tables,
                 existing_metadata=existing_metadata,
+                import_limit=import_limit,
             )
         else:
             success, message, metadata = service.load_schema_metadata(
                 catalog=catalog,
                 schema=schema,
                 existing_metadata=existing_metadata,
+                import_limit=import_limit,
             )
         if not success:
             tm.fail_task(task_id, message)
@@ -77,15 +80,47 @@ def run_metadata_update_task(
         tm.advance_step(task_id, f"Updating 0/{len(tables_to_update)} tables...")
         updated_count = 0
         errors: List[str] = []
-        from back.objects.domain.Domain import merge_table_metadata
+        diff: Dict[str, Any] = {}
+        from back.objects.domain.Domain import (
+            compute_column_diff,
+            has_column_changes,
+            merge_table_metadata,
+        )
 
         for i, table_name in enumerate(tables_to_update):
             try:
                 old_table = existing_tables[table_name]
-                new_columns = client.get_table_columns(catalog, schema, table_name)
+                kind = old_table.get("object_kind") or "table"
+                if kind == "metric_view":
+                    new_columns = client.get_metric_view_columns_with_roles(
+                        catalog, schema, table_name
+                    )
+                else:
+                    new_columns = client.get_table_columns(catalog, schema, table_name)
                 table_comment = client.get_table_comment(catalog, schema, table_name)
+                select_probe = client.check_table_select_permission(
+                    catalog,
+                    schema,
+                    table_name,
+                    object_kind=kind,
+                    columns=new_columns,
+                )
+                # Snapshot before the merge — merge_table_metadata replaces
+                # old_table["columns"] in place, so the previous schema is
+                # unrecoverable afterwards.
+                table_diff = compute_column_diff(
+                    old_table.get("columns", []), new_columns
+                )
+                if has_column_changes(table_diff):
+                    diff[table_name] = table_diff
                 merge_table_metadata(
-                    old_table, new_columns, table_comment, catalog, schema, table_name
+                    old_table,
+                    new_columns,
+                    table_comment,
+                    catalog,
+                    schema,
+                    table_name,
+                    select_probe=select_probe,
                 )
                 updated_count += 1
             except Exception as e:
@@ -108,6 +143,7 @@ def run_metadata_update_task(
                 "total_count": len(tables_to_update),
                 "errors": errors,
                 "metadata": existing_metadata,
+                "diff": diff,
             },
             message=message,
         )

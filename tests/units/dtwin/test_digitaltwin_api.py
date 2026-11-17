@@ -1,4 +1,4 @@
-"""Tests for the Digital Twin API module (api.routers.digitaltwin).
+"""Tests for the Knowledge Graph API module (api.routers.digitaltwin).
 
 Covers helper functions, Pydantic models, and endpoint behavior
 with mocked dependencies.
@@ -16,7 +16,65 @@ from api.routers.digitaltwin import (
     _extract_local_id,
     _expand_uri_aliases,
 )
-from back.core.triplestore import TripleStoreBackend
+from back.core.graphdb import GraphDBBackend
+from back.objects.digitaltwin import DigitalTwin
+
+
+# ---------------------------------------------------------------------------
+# DigitalTwin.resolve_domain — read_only fast path
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDomainReadOnly:
+    """read_only resolves from the cached loader and skips generation/save."""
+
+    def _patch(self, svc):
+        return (
+            patch(
+                "back.objects.digitaltwin.DigitalTwin.get_domain"
+            ),
+            patch.object(
+                DigitalTwin,
+                "resolve_registry",
+                return_value={"catalog": "c", "schema": "s", "volume": "v"},
+            ),
+            patch.object(DigitalTwin, "uc_from_domain", return_value=MagicMock()),
+            patch("back.objects.registry.RegistryService", return_value=svc),
+        )
+
+    def test_read_only_uses_cache_and_skips_gen_and_save(self):
+        svc = MagicMock()
+        svc.load_published_domain_data_cached.return_value = (True, {"info": {}}, "2", "")
+        p_get, p_reg, p_uc, p_svc = self._patch(svc)
+        with p_get as get_domain, p_reg, p_uc, p_svc:
+            domain = MagicMock()
+            get_domain.return_value = domain
+
+            out = DigitalTwin.resolve_domain(
+                "mydom", MagicMock(), MagicMock(), read_only=True
+            )
+
+        assert out is domain
+        svc.load_published_domain_data_cached.assert_called_once_with("mydom")
+        svc.load_published_domain_data.assert_not_called()
+        domain.import_from_file.assert_called_once()
+        domain.ensure_generated_content.assert_not_called()
+        domain.save.assert_not_called()
+
+    def test_write_path_generates_and_saves(self):
+        svc = MagicMock()
+        svc.load_published_domain_data.return_value = (True, {"info": {}}, "2", "")
+        p_get, p_reg, p_uc, p_svc = self._patch(svc)
+        with p_get as get_domain, p_reg, p_uc, p_svc:
+            domain = MagicMock()
+            get_domain.return_value = domain
+
+            DigitalTwin.resolve_domain("mydom", MagicMock(), MagicMock())
+
+        svc.load_published_domain_data.assert_called_once_with("mydom")
+        svc.load_published_domain_data_cached.assert_not_called()
+        domain.ensure_generated_content.assert_called_once()
+        domain.save.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +138,7 @@ class TestResolveRegistry:
 
         return RegistryCfg(catalog=catalog, schema=schema, volume=volume)
 
-    @patch("back.objects.registry.RegistryCfg.from_session")
+    @patch("back.objects.registry.RegistryCfg.RegistryCfg.from_session")
     def test_explicit_params_override(self, mock_from_session):
         mock_from_session.return_value = self._make_cfg(
             "session_cat",
@@ -98,7 +156,7 @@ class TestResolveRegistry:
         assert result["schema"] == "override_sch"
         assert result["volume"] == "override_vol"
 
-    @patch("back.objects.registry.RegistryCfg.from_session")
+    @patch("back.objects.registry.RegistryCfg.RegistryCfg.from_session")
     def test_falls_back_to_session(self, mock_from_session):
         mock_from_session.return_value = self._make_cfg(
             "sess_cat",
@@ -110,19 +168,19 @@ class TestResolveRegistry:
         assert result["schema"] == "sess_sch"
         assert result["volume"] == "sess_vol"
 
-    @patch("back.objects.registry.RegistryCfg.from_session")
+    @patch("back.objects.registry.RegistryCfg.RegistryCfg.from_session")
     def test_default_volume_when_key_missing(self, mock_from_session):
         mock_from_session.return_value = self._make_cfg("c", "s", "")
         result = _resolve_registry(MagicMock(), MagicMock())
         assert result["volume"] == ""
 
-    @patch("back.objects.registry.RegistryCfg.from_session")
+    @patch("back.objects.registry.RegistryCfg.RegistryCfg.from_session")
     def test_empty_volume_stays_empty(self, mock_from_session):
         mock_from_session.return_value = self._make_cfg("c", "s", "")
         result = _resolve_registry(MagicMock(), MagicMock())
         assert result["volume"] == ""
 
-    @patch("back.objects.registry.RegistryCfg.from_session")
+    @patch("back.objects.registry.RegistryCfg.RegistryCfg.from_session")
     def test_explicit_volume_overrides(self, mock_from_session):
         mock_from_session.return_value = self._make_cfg("c", "s", "v")
         result = _resolve_registry(MagicMock(), MagicMock(), registry_volume="custom")
@@ -187,6 +245,92 @@ class TestExpandUriAliases:
         assert result == uris
 
 
+class TestFindTriplesBfsContract:
+    def test_find_triples_bfs_returns_has_more_with_paged_fetch(self):
+        store = MagicMock()
+        store.bfs_traversal.return_value = [
+            {"entity": "http://ex.org/Customer/CUST001", "min_lvl": 0},
+            {"entity": "http://ex.org/Order/ORD001", "min_lvl": 1},
+        ]
+        store.find_subjects_by_patterns.return_value = {"http://ex.org/CUST001"}
+        store.get_triples_page_for_subjects.return_value = {
+            "rows": [{"subject": "s1", "predicate": "p1", "object": "o1"}],
+            "total": 5,
+        }
+
+        result = DigitalTwin.find_triples_bfs(
+            store,
+            "cat.sch.graph",
+            search="cust",
+            depth=2,
+            limit=1,
+            offset=0,
+        )
+
+        assert result["has_more"] is True
+        store.get_triples_page_for_subjects.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("offset", "rows", "total", "expected_has_more"),
+        [
+            (
+                2,
+                [
+                    {"subject": "s3", "predicate": "p3", "object": "o3"},
+                    {"subject": "s4", "predicate": "p4", "object": "o4"},
+                ],
+                5,
+                True,
+            ),
+            (
+                3,
+                [
+                    {"subject": "s4", "predicate": "p4", "object": "o4"},
+                    {"subject": "s5", "predicate": "p5", "object": "o5"},
+                ],
+                5,
+                False,
+            ),
+        ],
+    )
+    def test_find_triples_bfs_offset_has_more_and_paged_call_args(
+        self, offset, rows, total, expected_has_more
+    ):
+        store = MagicMock()
+        store.bfs_traversal.return_value = [
+            {"entity": "http://ex.org/Customer/CUST001", "min_lvl": 0},
+            {"entity": "http://ex.org/Order/ORD001", "min_lvl": 1},
+        ]
+        store.find_subjects_by_patterns.return_value = {"http://ex.org/CUST001"}
+        store.get_triples_page_for_subjects.return_value = {
+            "rows": rows,
+            "total": total,
+        }
+
+        result = DigitalTwin.find_triples_bfs(
+            store,
+            "cat.sch.graph",
+            search="cust",
+            depth=2,
+            limit=2,
+            offset=offset,
+        )
+
+        assert result["has_more"] is expected_has_more
+        assert result["count"] == len(rows)
+        assert result["total"] == total
+        store.get_triples_page_for_subjects.assert_called_once()
+        paged_call = store.get_triples_page_for_subjects.call_args
+        assert paged_call.args[0] == "cat.sch.graph"
+        assert set(paged_call.args[1]) == {
+            "http://ex.org/Customer/CUST001",
+            "http://ex.org/Order/ORD001",
+            "http://ex.org/CUST001",
+        }
+        assert paged_call.kwargs["limit"] == 2
+        assert paged_call.kwargs["offset"] == offset
+
+
 # ---------------------------------------------------------------------------
 # _sql_escape
 # ---------------------------------------------------------------------------
@@ -207,12 +351,12 @@ class TestSqlEscape:
 
 
 # ---------------------------------------------------------------------------
-# TripleStoreBackend.bfs_traversal (SQL generation moved from _build_bfs_sql)
+# GraphDBBackend.bfs_traversal (SQL generation moved from _build_bfs_sql)
 # ---------------------------------------------------------------------------
 
 
 class TestBfsTraversalSql:
-    """Verify the SQL generated by TripleStoreBackend.bfs_traversal.
+    """Verify the SQL generated by GraphDBBackend.bfs_traversal.
 
     Uses a thin stub that captures the SQL instead of executing it.
     """
@@ -227,9 +371,13 @@ class TestBfsTraversalSql:
             captured["sql"] = sql
             return []
 
-        store = MagicMock(spec=TripleStoreBackend)
+        store = MagicMock(spec=GraphDBBackend)
         store.execute_query = fake_execute
-        store.bfs_traversal = lambda *a, **kw: TripleStoreBackend.bfs_traversal(
+        # Force the legacy SPO path: this class tests the recursive-CTE SQL
+        # generation, not the adjacency/entity-search companion path.
+        store.adjacency_ready.return_value = False
+        store.entity_search_ready.return_value = False
+        store.bfs_traversal = lambda *a, **kw: GraphDBBackend.bfs_traversal(
             store, *a, **kw
         )
         store.bfs_traversal(table, seed_where, depth)
@@ -301,6 +449,7 @@ class TestPydanticModels:
         r = FindResponse(success=True)
         assert r.seed_count == 0
         assert r.triples == []
+        assert r.has_more is False
 
     def test_triples_response(self):
         from api.routers.digitaltwin import TriplesResponse, TripleRow
@@ -386,7 +535,7 @@ class TestResolveCohortContext:
     when the graph backend is missing, otherwise wires up a CohortService.
     """
 
-    @patch("api.routers.digitaltwin.get_triplestore", return_value=None)
+    @patch("api.routers.digitaltwin.get_graphdb", return_value=None)
     @patch("api.routers.digitaltwin.effective_graph_name", return_value="dom_V1")
     @patch("api.routers.digitaltwin.DigitalTwin.resolve_domain")
     def test_raises_when_no_store(self, mock_resolve, _eff, _store):
@@ -399,7 +548,7 @@ class TestResolveCohortContext:
                 "dom", None, None, None, None, MagicMock(), MagicMock()
             )
 
-    @patch("api.routers.digitaltwin.get_triplestore")
+    @patch("api.routers.digitaltwin.get_graphdb")
     @patch("api.routers.digitaltwin.effective_graph_name", return_value="")
     @patch("api.routers.digitaltwin.DigitalTwin.resolve_domain")
     def test_raises_when_no_graph_name(self, mock_resolve, _eff, _store):
@@ -412,10 +561,11 @@ class TestResolveCohortContext:
                 "dom", None, None, None, None, MagicMock(), MagicMock()
             )
 
-    @patch("api.routers.digitaltwin.get_triplestore")
+    @patch("api.routers.digitaltwin.get_graphdb")
+    @patch("api.routers.digitaltwin.effective_graph_query_table", return_value="dom_V1")
     @patch("api.routers.digitaltwin.effective_graph_name", return_value="dom_V1")
     @patch("api.routers.digitaltwin.DigitalTwin.resolve_domain")
-    def test_returns_service_when_configured(self, mock_resolve, _eff, mock_store):
+    def test_returns_service_when_configured(self, mock_resolve, _eff, _query, mock_store):
         from api.routers.digitaltwin import _resolve_cohort_context
         from back.objects.digitaltwin import CohortService
 
@@ -427,3 +577,149 @@ class TestResolveCohortContext:
         assert graph_name == "dom_V1"
         assert store is mock_store.return_value
         assert isinstance(service, CohortService)
+
+
+# ---------------------------------------------------------------------------
+# GET /triples — backend selection
+# ---------------------------------------------------------------------------
+
+
+class TestDtTriplesBackendSelection:
+    """``backend`` picks the queried relation; neither branch may NameError.
+
+    Regression guard for the undefined ``be`` reference that made every call to
+    ``GET /api/v1/digitaltwin/triples`` raise ``NameError`` — the conditional's
+    test is evaluated whatever ``backend`` is, so the default path failed too.
+    """
+
+    def _store(self):
+        store = MagicMock()
+        store.paginated_count.return_value = 1
+        store.paginated_triples.return_value = [
+            {"subject": "s", "predicate": "p", "object": "o"}
+        ]
+        return store
+
+    @patch("api.routers.digitaltwin.effective_view_table", return_value="c.s.view_V1")
+    @patch(
+        "api.routers.digitaltwin.effective_graph_query_table",
+        return_value="c.s.graph_V1",
+    )
+    @patch("api.routers.digitaltwin.get_graphdb")
+    @patch("api.routers.digitaltwin.DigitalTwin.resolve_domain")
+    async def test_graph_backend_queries_graph_table(
+        self, mock_resolve, mock_store, _query, _view
+    ):
+        from api.routers.digitaltwin import dt_triples
+
+        mock_resolve.return_value = MagicMock()
+        store = self._store()
+        mock_store.return_value = store
+
+        resp = await dt_triples(
+            request=MagicMock(),
+            backend="graph",
+            session_mgr=MagicMock(),
+            settings=MagicMock(),
+        )
+
+        assert resp.total == 1
+        assert store.paginated_count.call_args[0][0] == "c.s.graph_V1"
+
+    @patch("api.routers.digitaltwin.effective_view_table", return_value="c.s.view_V1")
+    @patch(
+        "api.routers.digitaltwin.effective_graph_query_table",
+        return_value="c.s.graph_V1",
+    )
+    @patch("api.routers.digitaltwin.get_graphdb")
+    @patch("api.routers.digitaltwin.DigitalTwin.resolve_domain")
+    async def test_view_backend_queries_view_table(
+        self, mock_resolve, mock_store, _query, _view
+    ):
+        from api.routers.digitaltwin import dt_triples
+
+        mock_resolve.return_value = MagicMock()
+        store = self._store()
+        mock_store.return_value = store
+
+        await dt_triples(
+            request=MagicMock(),
+            backend="view",
+            session_mgr=MagicMock(),
+            settings=MagicMock(),
+        )
+
+        assert store.paginated_count.call_args[0][0] == "c.s.view_V1"
+
+
+class TestTriplesFindHasMorePropagation:
+    @patch("api.routers.digitaltwin.run_blocking")
+    @patch("api.routers.digitaltwin.effective_graph_query_table", return_value="c.s.graph_V1")
+    @patch("api.routers.digitaltwin.get_graphdb")
+    @patch("api.routers.digitaltwin.DigitalTwin.find_triples_bfs")
+    @patch("api.routers.digitaltwin.DigitalTwin.resolve_domain")
+    async def test_external_route_exposes_has_more(
+        self,
+        mock_resolve,
+        mock_find,
+        mock_store,
+        _query,
+        mock_run_blocking,
+    ):
+        from api.routers.digitaltwin import dt_triples_find
+
+        mock_resolve.return_value = MagicMock()
+        mock_store.return_value = MagicMock()
+        mock_find.return_value = {
+            "seed_count": 1,
+            "triples": [{"subject": "s", "predicate": "p", "object": "o"}],
+            "count": 1,
+            "total": 5,
+            "has_more": 1,
+            "entity_count": 1,
+        }
+        mock_run_blocking.side_effect = lambda fn: fn()
+
+        result = await dt_triples_find(
+            request=MagicMock(),
+            search="cust",
+            limit=1,
+            offset=0,
+            session_mgr=MagicMock(),
+            settings=MagicMock(),
+        )
+
+        assert result.has_more is True
+        assert result.total == 5
+        mock_find.assert_called_once()
+
+    @patch("api.routers.internal.dtwin.run_blocking")
+    @patch("api.routers.internal.dtwin._graph_query_table", return_value="c.s.graph_V1")
+    @patch("api.routers.internal.dtwin._require_graph_store")
+    @patch("api.routers.internal.dtwin.get_domain")
+    async def test_internal_route_exposes_has_more(
+        self, mock_get_domain, mock_require_store, _query, mock_run_blocking
+    ):
+        from api.routers.internal.dtwin import dtwin_triples_find
+
+        mock_get_domain.return_value = MagicMock()
+        mock_require_store.return_value = MagicMock()
+        mock_run_blocking.return_value = {
+            "seed_count": 1,
+            "triples": [{"subject": "s", "predicate": "p", "object": "o"}],
+            "count": 1,
+            "total": 2,
+            "has_more": True,
+            "entity_count": 1,
+        }
+
+        result = await dtwin_triples_find(
+            search="cust",
+            limit=1,
+            offset=0,
+            session_mgr=MagicMock(),
+            settings=MagicMock(),
+        )
+
+        assert result["has_more"] is True
+        assert result["total"] == 2

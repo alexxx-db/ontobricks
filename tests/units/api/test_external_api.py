@@ -195,6 +195,48 @@ class TestAPIv1QuerySamples:
 
 
 # =========================================================================
+# domains.py — GET /api/v1/domains
+# =========================================================================
+
+
+class TestDomains:
+    """Tests for GET /api/v1/domains."""
+
+    @patch("api.routers.domains.RegistryService")
+    @patch("api.routers.domains.DigitalTwin")
+    @patch("api.routers.domains.RegistryCfg.from_session")
+    def test_domains_exposes_the_configured_graph_backend(
+        self, mock_from_session, mock_dt, mock_svc_cls, client
+    ):
+        from back.objects.registry import RegistryCfg
+
+        mock_from_session.return_value = RegistryCfg(
+            catalog="c", schema="s", volume="v"
+        )
+        mock_dt.uc_from_domain.return_value = MagicMock()
+        mock_svc_cls.return_value.list_mcp_domains.return_value = (
+            True,
+            [
+                {
+                    "name": "ontology_only",
+                    "description": "Ontology without a graph",
+                    "mcp_policy": {},
+                    "graph_backend": "none",
+                    "has_graph": False,
+                }
+            ],
+            "",
+        )
+
+        response = client.get("/api/v1/domains")
+
+        assert response.status_code == 200
+        domain = response.json()["domains"][0]
+        assert domain["graph_backend"] == "none"
+        assert domain["has_graph"] is False
+
+
+# =========================================================================
 # domains.py — GET /api/v1/domain/versions
 # =========================================================================
 
@@ -217,40 +259,52 @@ class TestDomainVersions:
         response = client.get("/api/v1/domain/versions?domain_name=test")
         assert response.status_code == 400
 
+    # NOTE: the route now does an early ``cfg.is_configured`` check via
+    # ``RegistryCfg.from_session`` and short-circuits with 400 if the
+    # registry isn't configured. The test session has no registry config,
+    # so we pass the catalog/schema/volume as query-string overrides
+    # (which the route honours over the session cfg). With the cfg
+    # populated, the mocked ``RegistryService`` is reached as intended.
+    _REG_QS = "&registry_catalog=c&registry_schema=s&registry_volume=v"
+
     @patch("api.routers.domains.RegistryService")
     @patch("api.routers.domains.DigitalTwin")
     def test_versions_not_found(self, mock_dt, mock_svc_cls, client):
-        mock_dt.resolve_registry.return_value = {
-            "catalog": "c",
-            "schema": "s",
-            "volume": "v",
-        }
         mock_dt.uc_from_domain.return_value = MagicMock()
         svc = MagicMock()
         svc.list_versions_sorted.return_value = []
         mock_svc_cls.return_value = svc
-        response = client.get("/api/v1/domain/versions?domain_name=no_such")
+        response = client.get(
+            f"/api/v1/domain/versions?domain_name=no_such{self._REG_QS}"
+        )
         assert response.status_code == 404
 
     @patch("api.routers.domains.RegistryService")
     @patch("api.routers.domains.DigitalTwin")
     def test_versions_success(self, mock_dt, mock_svc_cls, client):
-        mock_dt.resolve_registry.return_value = {
-            "catalog": "c",
-            "schema": "s",
-            "volume": "v",
-        }
         mock_dt.uc_from_domain.return_value = MagicMock()
         svc = MagicMock()
         svc.list_versions_sorted.return_value = ["3", "2", "1"]
+
+        # Each version carries a lifecycle status; the endpoint reads it
+        # per version (via a cheap single-column lookup) to annotate the
+        # response.
+        statuses = {"3": "PUBLISHED", "2": "IN-REVIEW", "1": "DRAFT"}
+        svc.get_version_status.side_effect = lambda dom, ver: statuses[ver]
         mock_svc_cls.return_value = svc
-        response = client.get("/api/v1/domain/versions?domain_name=mydom")
+        response = client.get(
+            f"/api/v1/domain/versions?domain_name=mydom{self._REG_QS}"
+        )
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
         assert data["latest_version"] == "3"
         assert len(data["versions"]) == 3
         assert data["versions"][0]["is_latest"] is True
+        assert data["versions"][0]["status"] == "PUBLISHED"
+        assert data["versions"][0]["is_published"] is True
+        assert data["versions"][2]["status"] == "DRAFT"
+        assert data["versions"][2]["is_published"] is False
 
 
 # =========================================================================
@@ -273,7 +327,7 @@ class TestDomainDesignStatus:
         domain.is_ontology_valid.return_value = False
         domain.ensure_generated_content.return_value = None
         domain.generated = {}
-        domain._data = {}
+        domain._data = {"domain": {}}
         domain.get_entity_mappings.return_value = []
         domain.get_relationship_mappings.return_value = []
         domain.shacl_shapes = []
@@ -314,7 +368,7 @@ class TestDomainDesignStatus:
         domain.is_ontology_valid.return_value = True
         domain.ensure_generated_content.return_value = None
         domain.generated = {"owl": "<owl/>"}
-        domain._data = {}
+        domain._data = {"domain": {}}
         domain.get_entity_mappings.return_value = []
         domain.get_relationship_mappings.return_value = []
         domain.shacl_shapes = []
@@ -746,6 +800,37 @@ class TestGraphQLListDomains:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is False
+
+    @patch("back.fastapi.graphql_routes.RegistryService")
+    def test_graphql_list_omits_domains_without_a_graph(self, mock_svc_cls, client):
+        svc = MagicMock()
+        svc.cfg.is_configured = True
+        svc.list_mcp_domains.return_value = (
+            True,
+            [
+                {
+                    "name": "ontology_only",
+                    "description": "No graph",
+                    "graph_backend": "none",
+                    "has_graph": False,
+                },
+                {
+                    "name": "customer360",
+                    "description": "Built graph",
+                    "graph_backend": "lakebase",
+                    "has_graph": True,
+                },
+            ],
+            "",
+        )
+        mock_svc_cls.from_context.return_value = svc
+
+        response = client.get("/api/v1/graphql")
+
+        assert response.status_code == 200
+        assert [item["name"] for item in response.json()["domains"]] == [
+            "customer360"
+        ]
 
 
 # =========================================================================

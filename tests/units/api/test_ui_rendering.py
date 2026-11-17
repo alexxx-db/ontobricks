@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -28,8 +29,30 @@ class _TagCollector(HTMLParser):
         self.tags.append((tag, d))
 
 
+_WORKSPACE_PAGE_PREFIXES = ("/ontology", "/mapping", "/domain", "/dtwin")
+
+
+def ensure_loaded_domain(client) -> None:
+    """Give the test session a named domain so workspace HTML pages render."""
+    if getattr(client, "_ob_workspace_domain_seeded", False):
+        return
+    resp = client.post("/domain/info", json={"name": "TestDomain"})
+    assert resp.status_code == 200, resp.text
+    client._ob_workspace_domain_seeded = True
+
+
+def _is_workspace_page(path: str) -> bool:
+    route = path.split("?", 1)[0]
+    return any(
+        route == prefix or route.startswith(prefix + "/")
+        for prefix in _WORKSPACE_PAGE_PREFIXES
+    )
+
+
 def _html(client, path: str) -> str:
-    resp = client.get(path)
+    if _is_workspace_page(path):
+        ensure_loaded_domain(client)
+    resp = client.get(path, headers={"accept": "text/html"})
     assert resp.status_code == 200, f"GET {path} returned {resp.status_code}"
     return resp.text
 
@@ -105,7 +128,10 @@ class TestBaseTemplate:
         brand = _find(tags, tag="a", class_="navbar-brand")
         assert brand is not None
         assert brand.get("href") == "/"
-        assert "OntoBricks" in html
+        logo = _find(tags, tag="img", id_="brandLogoImg")
+        assert logo is not None
+        assert "data-brand-icon" in logo
+        assert 'data-brand-title' in html
 
     @pytest.mark.parametrize("path", ["/", "/settings", "/ontology"])
     def test_has_notification_container(self, client, path):
@@ -122,13 +148,75 @@ class TestBaseTemplate:
         html = _html(client, path)
         assert any("utils.js" in src for src in _script_srcs(html))
 
-    def test_navbar_has_domain_dropdown(self, client):
-        html = _html(client, "/")
-        assert _find(_tags(html), id_="domainDropdown") is not None
+    @pytest.mark.parametrize("path", ["/", "/domain"])
+    def test_review_modals_assets_loaded(self, client, path):
+        """Shared review comment/chat popups must be available on every page."""
+        html = _html(client, path)
+        assert any("review-modals.js" in src for src in _script_srcs(html))
+        assert "review-modals.css" in html
 
-    def test_navbar_has_digital_twin_dropdown(self, client):
+    def test_navbar_uses_l2_domain_context_trigger(self, client):
+        """Domain L1 item is replaced by the level-2 context trigger contract."""
         html = _html(client, "/")
-        assert _find(_tags(html), id_="digitaltwinDropdown") is not None
+        tags = _tags(html)
+
+        assert _find(tags, id_="domainL1NavItem") is None
+        context_trigger = _find(tags, id_="domainContextTrigger")
+        assert context_trigger is not None
+        trigger_match = re.search(
+            r'<a\b[^>]*id="domainContextTrigger"[^>]*>(.*?)</a>',
+            html,
+            flags=re.DOTALL,
+        )
+        assert trigger_match is not None
+        trigger_html = trigger_match.group(1)
+        assert 'id="currentDomainName"' in trigger_html
+
+        registry_toggle = _find(tags, id_="registryModalToggle")
+        assert registry_toggle is not None
+        assert registry_toggle.get("title") == "Registry"
+        assert registry_toggle.get("aria-label") == "Open Registry"
+        registry_match = re.search(
+            r'<a\b[^>]*id="registryModalToggle"[^>]*>(.*?)</a>',
+            html,
+            flags=re.DOTALL,
+        )
+        assert registry_match is not None
+        registry_inner = registry_match.group(1)
+        assert re.search(r'<i\b[^>]*class="[^"]*\bbi-boxes\b[^"]*"[^>]*>', registry_inner)
+        assert "<span" not in registry_inner
+
+    def test_subnav_has_domain_dropdown(self, client):
+        """Domain dropdown is in the L2 subnav."""
+        html = _html(client, "/")
+        assert _find(_tags(html), id_="subnavDomainDropdown") is not None
+
+    def test_subnav_has_knowledge_graph_dropdown(self, client):
+        """Knowledge Graph is a dropdown in the L2 subnav with its sections."""
+        html = _html(client, "/")
+        tags = _tags(html)
+        kg_toggles = [t for t in tags if t[0] == "a" and t[1].get("data-subnav-route") == "/dtwin/"]
+        assert len(kg_toggles) > 0
+        assert _find(tags, id_="subnavKgDropdown") is not None
+
+    def test_subnav_has_mutually_exclusive_workspace_and_settings_slots(self, client):
+        html = _html(client, "/")
+        tags = _tags(html)
+        assert _find(tags, tag="nav", id_="obSubnav") is not None
+        assert _find(tags, id_="domainWorkspaceSubnavNav") is not None
+        assert _find(tags, id_="settingsDomainReturnNav") is not None
+        settings_return_link = _find(tags, tag="a", id_="settingsDomainReturnLink")
+        assert settings_return_link is not None
+        assert settings_return_link.get("href") == "/domain/"
+        assert settings_return_link.get("title") == "Back to domain"
+        assert settings_return_link.get("aria-label") == "Back to domain"
+
+    def test_subnav_has_ontology_and_mapping_dropdowns(self, client):
+        """Ontology and Mapping are dropdowns in the L2 subnav."""
+        html = _html(client, "/")
+        tags = _tags(html)
+        assert _find(tags, id_="subnavOntologyDropdown") is not None
+        assert _find(tags, id_="subnavMappingDropdown") is not None
 
     def test_navbar_has_ontology_link_under_domain(self, client):
         """Ontology appears as a sub-item under the Domain dropdown (navbar_hidden)."""
@@ -171,18 +259,20 @@ class TestHomePage:
         assert _find(_tags(html), class_="home-hero") is not None
         assert "OntoBricks" in html
 
-    def test_domain_panel(self, client):
+    def test_kpi_band_moved_off_home(self, client):
+        """The current-domain KPI / health band now lives on Domain →
+        Information; the Home page no longer renders it."""
         html = _html(client, "/")
-        assert _find(_tags(html), id_="sessionPanel") is not None
-        assert _find(_tags(html), id_="homeDomainName") is not None
+        assert _find(_tags(html), id_="sessionPanel") is None
+        assert _find(_tags(html), id_="homeDomainName") is None
+        assert _find(_tags(html), id_="kpiEntities") is None
 
-    def test_stat_items(self, client):
+    def test_domain_gateway(self, client):
         html = _html(client, "/")
-        assert _find(_tags(html), id_="classCount") is not None
-        assert _find(_tags(html), id_="propCount") is not None
-        assert _find(_tags(html), id_="mappingCount") is not None
+        assert _find(_tags(html), id_="domainGateway") is not None
 
-    def test_quick_links(self, client):
+    def test_no_quick_links(self, client):
+        """Settings / About quick links were removed from the Home page."""
         html = _html(client, "/")
         tags = _tags(html)
         hrefs = [
@@ -190,8 +280,14 @@ class TestHomePage:
             for t, a in tags
             if t == "a" and _has_class(a, "quick-link-sm")
         ]
-        assert "/settings" in hrefs
-        assert "/about" in hrefs
+        assert "/settings" not in hrefs
+        assert "/about" not in hrefs
+
+    def test_my_tasks_before_domains(self, client):
+        """My Tasks now sits above the All Domains gateway."""
+        html = _html(client, "/")
+        assert "homeTasksSection" in html
+        assert html.index("homeTasksSection") < html.index("domainGateway")
 
 
 # =====================================================
@@ -204,11 +300,10 @@ class TestSettingsPage:
         html = _html(client, "/settings")
         assert "Settings" in _title_text(html)
 
-    def test_tabs_present(self, client):
+    def test_sidebar_sections_present(self, client):
         html = _html(client, "/settings")
-        tags = _tags(html)
-        assert _find(tags, id_="tab-databricks") is not None
-        assert _find(tags, id_="tab-global") is not None
+        assert 'id="databricks-section"' in html
+        assert 'id="global-section"' in html
 
     def test_host_display(self, client):
         html = _html(client, "/settings")
@@ -221,6 +316,15 @@ class TestSettingsPage:
     def test_warehouse_select(self, client):
         html = _html(client, "/settings")
         assert _find(_tags(html), id_="settingsWarehouseSelect") is not None
+        assert "Build SQL Warehouse" in html
+        assert _find(_tags(html), id_="buildUseSea") is None
+        assert _find(_tags(html), id_="useCloudFetch") is not None
+        assert "Query SQL Warehouse" in html
+        lakehouse_build = _find(
+            _tags(html), tag="select", id_="deltaBuildWarehouseSelect"
+        )
+        assert lakehouse_build is not None
+        assert "disabled" not in lakehouse_build
 
     def test_test_connection_button(self, client):
         html = _html(client, "/settings")
@@ -230,7 +334,7 @@ class TestSettingsPage:
 
     def test_save_all_button(self, client):
         html = _html(client, "/settings")
-        assert _find(_tags(html), id_="btnSaveAllSettings") is not None
+        assert 'btn-save-settings' in html
 
     def test_graph_db_lakebase_health_block_present(self, client):
         html = _html(client, "/settings")
@@ -241,17 +345,82 @@ class TestSettingsPage:
         assert _find(_tags(html), id_="lakebaseSyncMode") is not None
         assert _find(_tags(html), id_="lakebaseManagedSyncPanel") is not None
 
-    def test_registry_pane_moved_to_registry_page(self, client):
-        html = _html(client, "/registry/")
-        assert _find(_tags(html), id_="registryDomainsSection") is not None
+    def test_registry_modal_on_home(self, client):
+        html = _html(client, "/")
+        tags = _tags(html)
+        assert _find(tags, id_="registryModal") is not None
+        assert _find(tags, id_="registryDomainsSection") is not None
+        assert _find(tags, id_="registryModalToggle") is not None
+        tabs = _find(tags, id_="registryModalTabs")
+        assert tabs is not None
+        tab_classes = _class_tokens(tabs.get("class", ""))
+        assert "mb-3" not in tab_classes
+        assert "nav-tabs" in tab_classes
+        assert "ob-tabs" in tab_classes
+        content = _find(tags, id_="registryModalTabContent")
+        assert content is not None
+        assert "ob-tab-content" not in _class_tokens(content.get("class", ""))
+        assert 'id="registryDropdown"' not in html
 
-    def test_schedule_on_registry_page(self, client):
-        html = _html(client, "/registry/")
+    def test_registry_legacy_url_redirects(self, client):
+        resp = client.get("/registry/", follow_redirects=False)
+        assert resp.status_code in (301, 302, 307, 308)
+        assert "open=registry" in (resp.headers.get("location") or "")
+
+    def test_teams_on_settings_admin_page(self, client):
+        settings_html = _html(client, "/settings")
+        home_html = _html(client, "/")
+        assert _find(_tags(settings_html), id_="teamsMatrixContainer") is not None
+        assert 'id="teams-section"' in settings_html
+        assert 'teamsMatrixContainer' not in home_html
+
+    def test_schedule_on_settings_page(self, client):
+        html = _html(client, "/settings")
         assert _find(_tags(html), id_="schedulesTableContainer") is not None
+        assert 'id="schedule-section"' in html
 
-    def test_api_on_registry_page(self, client):
-        html = _html(client, "/registry/")
+    def test_runs_on_settings_page(self, client):
+        html = _html(client, "/settings")
+        assert _find(_tags(html), id_="settingsRunsDomain") is not None
+        assert 'id="runs-section"' in html
+
+    def test_api_on_settings_page(self, client):
+        html = _html(client, "/settings")
         assert _find(_tags(html), id_="apiEndpointCards") is not None
+        assert 'id="api-section"' in html
+
+    def test_body_has_page_id_settings(self, client):
+        """<body data-page="settings"> must be set so the lifecycle gate's
+        generic form-field disabler does not grey out Settings when a
+        PUBLISHED domain is loaded (issue #78)."""
+        html = _html(client, "/settings")
+        assert 'data-page="settings"' in html
+
+    def test_settings_subnav_has_only_return_link_markup(self, client):
+        html = _html(client, "/settings")
+        tags = _tags(html)
+        settings_nav = _find(tags, id_="settingsDomainReturnNav")
+        assert settings_nav is not None
+        workspace_nav = _find(tags, id_="domainWorkspaceSubnavNav")
+        assert workspace_nav is not None
+        settings_link = _find(tags, tag="a", id_="settingsDomainReturnLink")
+        assert settings_link is not None
+        assert settings_link.get("href") == "/domain/"
+        assert settings_link.get("title") == "Back to domain"
+        assert settings_link.get("aria-label") == "Back to domain"
+        settings_inner = re.search(
+            r'<a\b[^>]*id="settingsDomainReturnLink"[^>]*>(.*?)</a>',
+            html,
+            flags=re.DOTALL,
+        )
+        assert settings_inner is not None
+        assert "Back to domain" in settings_inner.group(1)
+        assert "Back to domain management" not in settings_inner.group(1)
+        assert re.search(
+            r'<a\b[^>]*id="settingsDomainReturnLink"[^>]*>.*\bbi-arrow-left\b.*</a>',
+            html,
+            flags=re.DOTALL,
+        )
 
 
 # =====================================================
@@ -281,7 +450,6 @@ class TestOntologyPage:
             "dataquality",
             "swrl",
             "axioms",
-            "owl",
         ],
     )
     def test_sidebar_has_section_link(self, client, section):
@@ -344,7 +512,7 @@ class TestMappingPage:
 
     @pytest.mark.parametrize(
         "section",
-        ["information", "design", "manual", "autoassign", "r2rml", "sparksql"],
+        ["information", "design", "manual", "autoassign", "sparksql"],
     )
     def test_sidebar_has_section_link(self, client, section):
         html = _html(client, "/mapping")
@@ -373,7 +541,8 @@ class TestDomainPage:
 
     @pytest.mark.parametrize(
         "section",
-        ["information", "metadata", "documents", "validation", "owl-content", "r2rml"],
+        ["information", "metadata", "documents", "validation", "owl-content",
+         "r2rml", "mytasks", "discussions"],
     )
     def test_sidebar_has_section_link(self, client, section):
         html = _html(client, "/domain")
@@ -382,11 +551,55 @@ class TestDomainPage:
         assert found, f"Sidebar link for section '{section}' not found"
 
     @pytest.mark.parametrize(
-        "section_id", ["information-section", "metadata-section", "validation-section"]
+        "section_id",
+        ["information-section", "metadata-section", "validation-section",
+         "audit-section", "mytasks-section", "discussions-section"],
     )
     def test_section_div_exists(self, client, section_id):
         html = _html(client, "/domain")
         assert _find(_tags(html), id_=section_id) is not None
+
+    def test_audit_section_link_and_script(self, client):
+        html = _html(client, "/domain")
+        tags = _tags(html)
+        assert any(t == "a" and a.get("data-section") == "audit" for t, a in tags)
+        assert any("domain-audit.js" in src for src in _script_srcs(html))
+
+    def test_no_dead_runs_section(self):
+        """The Domain menu has no Runs item, so the section was unreachable.
+        Left in, it would render analytics history on a page about the
+        domain record."""
+        html = Path("src/front/templates/domain.html").read_text(encoding="utf-8")
+        assert 'id="runs-section"' not in html
+
+    def test_run_details_modal_and_script_survive(self, client):
+        """domain-audit.js reuses showRunDetailsObj to expand build entries
+        in the audit timeline, so the script and the modal must stay even
+        though the section is gone."""
+        html = _html(client, "/domain")
+        assert any("domain-runs.js" in src for src in _script_srcs(html))
+        assert _find(_tags(html), id_="runDetailsModal") is not None
+
+    def test_collaboration_section_assets_loaded(self, client):
+        """The new Domain → Collaboration timeline ships its own JS module
+        and a container the script populates."""
+        html = _html(client, "/domain")
+        assert any(
+            "domain-collaboration.js" in src for src in _script_srcs(html)
+        )
+        assert _find(_tags(html), id_="domainDiscussionsContainer") is not None
+        assert _find(_tags(html), id_="domainMyTasksContainer") is not None
+
+    def test_kpi_band(self, client):
+        """The current-domain KPI / health band, moved here from the Home
+        page, sits at the top of Domain → General."""
+        html = _html(client, "/domain")
+        assert _find(_tags(html), id_="domainKpiPanel") is not None
+        for kpi_id in (
+            "kpiEntities", "kpiRelationships", "kpiMappings",
+            "kpiQuality", "kpiStatus", "kpiVersion",
+        ):
+            assert _find(_tags(html), id_=kpi_id) is not None
 
 
 # =====================================================
@@ -397,7 +610,7 @@ class TestDomainPage:
 class TestDigitalTwinPage:
     def test_title(self, client):
         html = _html(client, "/dtwin/")
-        assert "Digital Twin" in _title_text(html)
+        assert "Knowledge Graph" in _title_text(html)
 
     def test_sidebar_present(self, client):
         html = _html(client, "/dtwin/")
@@ -415,6 +628,12 @@ class TestDigitalTwinPage:
     def test_sigmagraph_section_present(self, client):
         html = _html(client, "/dtwin/")
         assert _find(_tags(html), id_="sigmagraph-section") is not None
+
+    def test_runs_section_present(self, client):
+        """Runs lives on the Knowledge Graph page, which is the only menu
+        that declares it."""
+        html = _html(client, "/dtwin/")
+        assert _find(_tags(html), id_="runs-section") is not None
 
     def test_sigma_script_loaded(self, client):
         html = _html(client, "/dtwin/")

@@ -52,7 +52,7 @@ def create_external_api_app() -> FastAPI:
     app.include_router(api_v1_router, prefix=API_V1_PREFIX, tags=["API v1"])
     app.include_router(domains_router, prefix=API_V1_PREFIX, tags=["Domain"])
     app.include_router(
-        dt_api_router, prefix=API_DIGITALTWIN_PREFIX, tags=["Digital Twin"]
+        dt_api_router, prefix=API_DIGITALTWIN_PREFIX, tags=["Knowledge Graph"]
     )
     app.include_router(graphql_router, prefix=API_GRAPHQL_PREFIX, tags=["GraphQL"])
 
@@ -65,6 +65,9 @@ def create_external_api_app() -> FastAPI:
             openapi_version=app.openapi_version,
             description=app.description,
             routes=app.routes,
+            tags=EXTERNAL_OPENAPI_TAGS,
+            contact=EXTERNAL_API_CONTACT,
+            license_info=EXTERNAL_API_LICENSE_INFO,
         )
         mount_prefix = OPENAPI_PATH_PREFIX
         raw_paths = openapi_schema.get("paths") or {}

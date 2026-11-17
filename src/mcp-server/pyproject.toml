@@ -2,14 +2,64 @@
 name = "mcp-ontobricks"
 version = "1.0.0"
 description = "OntoBricks MCP Server — Knowledge graph tools for Databricks Playground"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
-    "fastmcp>=2.3.1",
+    # fastmcp>=3.4.10: post-transform component authorization was skipped on
+    # direct calls (GHSA-7xgj-8392-5q4r, Dependabot #245).
+    "fastmcp>=3.4.10",
     "httpx>=0.25.0",
     "uvicorn>=0.34.0",
     "pydantic>=2",
     "databricks-sdk>=0.20.0",
+]
+
+[tool.uv]
+constraint-dependencies = [
+    # pydantic-settings>=2.14.2: NestedSecretsSettingsSource symlink traversal
+    # (GHSA-4xgf-cpjx-pc3j) — symlinks inside secrets_dir pointing outside it were
+    # followed, enabling local file read and bypassing secrets_dir_max_size.
+    # Pulled in transitively (fastmcp/databricks-sdk). Dependabot #60/#61.
+    "pydantic-settings>=2.14.2",
+    # Security floors for transitive dependencies reported by Dependabot.
+    # cryptography 50.0.0 removes the PKCS#7 Bleichenbacher oracle. The
+    # standalone MCP graph has no MLflow upper bound blocking this release.
+    "cryptography>=50.0.0",
+    # mcp>=1.30.0: unbounded StreamableHTTP session accumulation
+    # (GHSA-84m7-p3x7-pcfv / CVE-2026-59951, Dependabot #201).
+    "mcp>=1.30.0",
+    # pyasn1>=0.6.5: quadratic CPU/memory decoding BIT STRING, REAL, ANY and
+    # schemaless BER/CER/DER containers (Dependabot #313-#316). Transitive
+    # via pyasn1-modules/rsa (google-auth).
+    "pyasn1>=0.6.5",
+    # certifi>=2026.10.19 removes a compromised root certificate
+    # (GHSA-6q48-6c7w-9gw2, Dependabot #209).
+    "certifi>=2026.10.19",
+    # fastmcp-slim>=3.4.10: post-transform component authorization was
+    # skipped on direct calls (GHSA-7xgj-8392-5q4r, Dependabot #246).
+    # Transitive alt distribution of fastmcp.
+    "fastmcp-slim>=3.4.10",
+    # opentelemetry-api>=1.45.1: unbounded tracestate parsing
+    # (GHSA-xcq7-p3pf-p88h, Dependabot #244). Transitive via fastmcp.
+    "opentelemetry-api>=1.45.1",
+    # pyjwt>=2.15.0: HMAC/JWK confusion series + RecursionError + options-dict
+    # mutation (GHSA-gvp8-978c-rx2q). Transitive via databricks-sdk.
+    "pyjwt>=2.15.0",
+    # urllib3 2.8.0: proxy TLS override, unbounded chunk-size line, Deflate loop.
+    "urllib3>=2.8.0",
+    # anyio 4.14.2: TLSStream IDNA 2003 spoofing + process-pool stderr stall.
+    "anyio>=4.14.2",
+    # authlib>=1.9.1: empty HMAC key JWS/JWT forgery (GHSA-8m4g-j4wp-wgcg)
+    # plus the 1.9.0 JAR/SSRF / nonce / audience / alg-confusion series.
+    "authlib>=1.9.1",
+    # dnspython>=2.9.0: from_wire_parser() excessive CPU (GHSA-45c3-73f7-pv4m).
+    "dnspython>=2.9.0",
+    # joserfc>=1.7.6: unbounded JWE General JSON `recipients` array causes
+    # CPU exhaustion via repeated RSA private-key decryption (Dependabot
+    # #309, high) and a compact-JWS size guard that allocated
+    # attacker-controlled segments before rejecting them (Dependabot #310,
+    # medium). Transitive via authlib/fastmcp-slim.
+    "joserfc>=1.7.6",
 ]
 
 [project.scripts]
@@ -21,3 +71,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["server"]
+
+[dependency-groups]
+dev = [
+    "anyio>=4.14.2",
+    "pytest>=9.1.0",
+    "pytest-asyncio>=1.4.0",
+]

@@ -250,7 +250,7 @@ class HomeService:
     ) -> Dict[str, Any]:
         """Get detailed validation status.
 
-        Digital Twin graph status and artefact existence are served from the
+        Knowledge Graph graph status and artefact existence are served from the
         session cache when available (populated after each successful build).
         On a cache miss the values are fetched live and then cached.
 
@@ -273,7 +273,7 @@ class HomeService:
             # cache to avoid replaying a stale failure ("table not found")
             # across page loads.
             dt.get_or_fetch_dt_existence(settings, force_refresh=True),
-            run_blocking(Domain(domain).count_documents_in_volume, settings),
+            run_blocking(Domain(domain).count_documents, settings),
         )
 
         all_classes = domain.get_classes()
@@ -382,8 +382,7 @@ class HomeService:
         }
 
         # Metadata table count (in-session, no I/O)
-        _dom = domain._data.get("domain") or domain._data.get("project") or {}
-        metadata = _dom.get("metadata", {})
+        metadata = domain._data["domain"].get("metadata", {})
         metadata_table_count = len(metadata.get("tables", [])) if metadata else 0
 
         # Document count: live list of UC documents path (same rules as domain documents list)
@@ -423,7 +422,7 @@ class HomeService:
             "unmapped_entities": unmapped_entities,
             "unmapped_relationships": unmapped_relationships,
             "unmapped_attributes": unmapped_attributes,
-            # Digital Twin status (summary + detail)
+            # Knowledge Graph status (summary + detail)
             "dtwin": dtwin_detail,
             # Warehouse status
             "warehouse": {"warehouse_id": warehouse_id},
@@ -454,7 +453,7 @@ class HomeService:
         ts_status: Dict[str, Any],
         dt_exist: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Derive a three-state Digital Twin indicator.
+        """Derive a three-state Knowledge Graph indicator.
 
         Delegates to :meth:`DigitalTwin.compute_dtwin_indicator`.
         """
@@ -472,35 +471,37 @@ class HomeService:
 
         The navbar only displays domain identity, SQL Warehouse status,
         and the (optionally customised) brand logo, so this intentionally
-        skips the expensive Digital Twin and validation I/O that used to
+        skips the expensive Knowledge Graph and validation I/O that used to
         run here. Those checks are available on the validation page
         (``/validate/detailed``) and the DT Sync page
         (``/dtwin/sync/info``).
         """
         from back.objects.domain.Domain import Domain
-        from back.core.helpers import get_databricks_host_and_token
-        from back.objects.registry import RegistryCfg
+        from back.core.helpers import resolve_app_registry_context
         from back.objects.session import global_config_service
 
         logger.debug("Building navbar state")
         domain_data = Domain(domain, settings).get_domain_info()
 
-        custom_logo = ""
+        branding_payload = {}
         try:
-            host, token = get_databricks_host_and_token(domain, settings)
-            registry_cfg = RegistryCfg.from_domain(domain, settings).as_dict()
-            custom_logo = global_config_service.get_navbar_logo(
+            host, token, registry_cfg = resolve_app_registry_context(settings)
+            branding_payload = global_config_service.get_ui_branding(
                 host, token, registry_cfg
             )
         except Exception as e:
             # Branding is non-critical — never fail navbar rendering for it.
-            logger.debug("Could not resolve custom navbar logo: %s", e)
+            logger.debug("Could not resolve navbar branding: %s", e)
+
+        logo_url = str(branding_payload.get("logo_url", "") or "")
+        app_title = str(branding_payload.get("app_title", "") or "")
 
         return {
             "domain": domain_data,
             "warehouse": {"warehouse_id": warehouse_id},
             "branding": {
-                "logo_url": custom_logo or "",
-                "is_custom": bool(custom_logo),
+                "logo_url": logo_url,
+                "is_custom": bool(branding_payload.get("is_custom_logo")),
+                "app_title": app_title,
             },
         }

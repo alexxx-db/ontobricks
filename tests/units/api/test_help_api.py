@@ -9,6 +9,9 @@ Covers the router introduced at ``src/api/routers/internal/help.py``:
 
 The suite exercises the happy path plus the hardening:
 
+- every catalogued doc slug returns 200 with markdown (no 404 in production),
+- catalogued markdown files and referenced ``images/`` assets exist on disk,
+- deploy bundle config ships ``docs/`` to Databricks,
 - unknown slugs → 404,
 - bad image filenames (path traversal / wrong extension) → 404,
 - valid known assets that may not exist on disk → 404 (never 500).
@@ -16,10 +19,63 @@ The suite exercises the happy path plus the hardening:
 
 from __future__ import annotations
 
+import re
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import unquote
+
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
+from api.routers.internal.help import _DOC_INDEX, _docs_dir
 from shared.fastapi.main import app
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_HTML_IMG_SRC_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
+
+
+def _all_help_slugs() -> list[str]:
+    return list(_DOC_INDEX.keys())
+
+
+def _iter_catalogued_markdown_paths() -> list[tuple[str, Path]]:
+    docs_dir = Path(_docs_dir())
+    return [
+        (slug, docs_dir / _DOC_INDEX[slug]["file"])
+        for slug in _all_help_slugs()
+    ]
+
+
+def _normalize_help_asset_ref(raw: str) -> tuple[str, str] | None:
+    """Return ``(subdir, filename)`` for Help Center asset refs, else ``None``."""
+    ref = raw.strip().split("#", 1)[0].strip()
+    if not ref or ref.startswith(("http://", "https://", "data:", "/")):
+        return None
+    ref = ref.replace("\\", "/").lstrip("./")
+    if ref.startswith("docs/"):
+        ref = ref[len("docs/") :]
+    elif ref.startswith("documentation/"):
+        # Legacy markdown paths from before the documentation/ → docs/ rename.
+        ref = ref[len("documentation/") :]
+    for subdir in ("images", "screenshots"):
+        prefix = f"{subdir}/"
+        if ref.startswith(prefix):
+            return subdir, unquote(ref[len(prefix) :])
+    return None
+
+
+def _collect_help_asset_refs(markdown: str) -> set[tuple[str, str]]:
+    refs: set[tuple[str, str]] = set()
+    for pattern in (_MD_IMAGE_RE, _HTML_IMG_SRC_RE):
+        for match in pattern.finditer(markdown):
+            normalized = _normalize_help_asset_ref(match.group(1))
+            if normalized:
+                refs.add(normalized)
+    return refs
 
 
 @pytest.fixture
@@ -40,6 +96,33 @@ class TestHelpDocsIndex:
             for doc in cat["docs"]:
                 assert {"slug", "title"}.issubset(doc.keys())
 
+    def test_index_uses_audience_categories(self, client):
+        """Help sidebar groups pages by audience, not a flat Guides dump."""
+        response = client.get("/api/help/docs")
+        assert response.status_code == 200
+        ids = [cat["id"] for cat in response.json()["categories"]]
+        assert ids == ["start", "using", "platform", "ops", "about"]
+
+    def test_satellite_docs_are_folded_into_host_guides(self):
+        """Thin satellite pages live as sections of their host guide, not as files."""
+        docs_dir = Path(_docs_dir())
+        folded = {
+            "features.md": ("user-guide.md", "## Feature inventory"),
+            "data-access.md": ("architecture.md", "## Data access engine map"),
+            "code_organization.md": ("development.md", "## Code map"),
+            "optimizations.md": ("backend.md", "### Graph query optimizations"),
+            "deploy-checklist.md": ("deployment.md", "## Deployment checklist"),
+            "dab-reference.md": ("deployment.md", "## Asset Bundle reference"),
+            "sizing.md": ("deployment.md", "## Production sizing questionnaire"),
+            "uc-mcp-connection-genie-one.md": (
+                "mcp.md",
+                "## Register the MCP in Unity Catalog and Genie One",
+            ),
+        }
+        for satellite, (host, heading) in folded.items():
+            assert not (docs_dir / satellite).exists(), satellite
+            assert heading in (docs_dir / host).read_text(encoding="utf-8"), host
+
     def test_index_slugs_are_unique(self, client):
         response = client.get("/api/help/docs")
         slugs = [
@@ -48,6 +131,277 @@ class TestHelpDocsIndex:
             for doc in cat["docs"]
         ]
         assert len(slugs) == len(set(slugs))
+
+    def test_index_matches_server_catalog(self, client):
+        """Sidebar index must mirror the allow-list in help.py."""
+        response = client.get("/api/help/docs")
+        assert response.status_code == 200
+        indexed = {
+            doc["slug"]: doc["title"]
+            for cat in response.json()["categories"]
+            for doc in cat["docs"]
+        }
+        expected = {slug: meta["title"] for slug, meta in _DOC_INDEX.items()}
+        assert indexed == expected
+
+    def test_small_guides_are_grouped_into_category_files(self):
+        """Backend and advanced-feature topics live as sections of category guides."""
+        docs_dir = Path(_docs_dir())
+        grouped = {
+            "lakebase-graphdb.md": ("backend.md", "## Lakebase graph store"),
+            "neo4j-requirements.md": ("backend.md", "## Neo4j backend"),
+            "graphdb-integration.md": ("backend.md", "## Engine integration"),
+            "ontology_specifics.md": ("advanced_features.md", "## Ontology specifics"),
+            "import-export.md": (
+                "advanced_features.md",
+                "## Registry import and export",
+            ),
+            "cohort_discovery.md": ("advanced_features.md", "## Cohort discovery"),
+        }
+        for old, (host, heading) in grouped.items():
+            assert not (docs_dir / old).exists(), old
+            assert heading in (docs_dir / host).read_text(encoding="utf-8"), host
+
+    def test_category_guides_are_catalogued(self, client):
+        """Backend and advanced-feature guides must be reachable from Help Center."""
+        response = client.get("/api/help/docs")
+        slugs = {
+            doc["slug"]
+            for cat in response.json()["categories"]
+            for doc in cat["docs"]
+        }
+        assert {"backend", "advanced-features", "development"} <= slugs
+
+        backend = client.get("/api/help/docs/backend").json()["markdown"]
+        assert "Neo4j" in backend and "Aura" in backend and "Lakebase" in backend
+        advanced = client.get("/api/help/docs/advanced-features").json()["markdown"]
+        assert "Cohort" in advanced and "registry_transfer" in advanced
+
+
+class TestHelpCatalogIntegrity:
+    def test_guides_start_with_current_table_of_contents(self):
+        """Every guide opens with a generated TOC; regenerate with `make docs-toc`."""
+        docs_dir = Path(_docs_dir())
+        for slug, path in _iter_catalogued_markdown_paths():
+            if path.name == "README.md":
+                continue
+            text = path.read_text(encoding="utf-8")
+            toc_at = text.find("<!-- toc -->")
+            first_h2 = re.search(r"^## ", text, re.MULTILINE)
+            assert toc_at != -1, f"{slug}: missing table of contents"
+            assert first_h2 and toc_at < first_h2.start(), f"{slug}: TOC must come first"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(_REPO_ROOT / "scripts" / "_internal" / "_docs-toc.py"),
+                "--check",
+                str(docs_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert completed.returncode == 0, "Stale TOC, run `make docs-toc`:\n" + completed.stdout
+
+    def test_docs_directory_exists(self):
+        docs_dir = Path(_docs_dir())
+        assert docs_dir.is_dir(), f"Help Center docs directory missing: {docs_dir}"
+
+    def test_all_catalogued_doc_files_exist_on_disk(self):
+        missing = [
+            f"{slug} -> {path.name}"
+            for slug, path in _iter_catalogued_markdown_paths()
+            if not path.is_file()
+        ]
+        assert not missing, "Catalogued Help Center files missing on disk:\n" + "\n".join(
+            missing
+        )
+
+    @pytest.mark.parametrize("slug", _all_help_slugs())
+    def test_catalogued_slug_returns_200(self, client, slug):
+        response = client.get(f"/api/help/docs/{slug}")
+        assert response.status_code == 200, (
+            f"/api/help/docs/{slug} returned {response.status_code}; "
+            "deploy bundle must ship docs/*.md"
+        )
+        body = response.json()
+        assert body["slug"] == slug
+        assert body["title"] == _DOC_INDEX[slug]["title"]
+        assert body["file"] == _DOC_INDEX[slug]["file"]
+        assert body.get("markdown", "").strip(), f"{slug} markdown must not be empty"
+
+    def test_referenced_help_images_exist_and_are_served(self, client):
+        docs_dir = Path(_docs_dir())
+        missing_on_disk: list[str] = []
+        failed_api: list[str] = []
+
+        for slug, md_path in _iter_catalogued_markdown_paths():
+            markdown = md_path.read_text(encoding="utf-8")
+            for subdir, name in _collect_help_asset_refs(markdown):
+                if subdir != "images":
+                    continue
+                disk_path = docs_dir / subdir / name
+                label = f"{slug}: {subdir}/{name}"
+                if not disk_path.is_file():
+                    missing_on_disk.append(label)
+                    continue
+                response = client.get(f"/api/help/docs/{subdir}/{name}")
+                if response.status_code != 200:
+                    failed_api.append(f"{label} -> HTTP {response.status_code}")
+
+        assert not missing_on_disk, (
+            "Referenced Help Center images missing on disk:\n"
+            + "\n".join(missing_on_disk)
+        )
+        assert not failed_api, (
+            "Referenced Help Center images failed API fetch:\n"
+            + "\n".join(failed_api)
+        )
+
+
+class TestHelpDeployBundle:
+    def test_databricksignore_does_not_exclude_documentation_tree(self):
+        ignore_path = _REPO_ROOT / ".databricksignore"
+        blocked = {
+            line.strip()
+            for line in ignore_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        # Help Center markdown lives under docs/ and is served at
+        # /api/help/docs/*, so docs/ must NOT be excluded from the bundle.
+        assert "docs/" not in blocked
+        assert "*.md" not in blocked
+        # CLI 0.298 applies bare and slash-anchored patterns recursively.
+        assert "README.md" not in blocked
+        assert "/README.md" not in blocked
+
+    def test_databricks_yml_includes_documentation_for_help_center(self):
+        bundle_path = _REPO_ROOT / "databricks.yml"
+        bundle = yaml.safe_load(bundle_path.read_text(encoding="utf-8"))
+        includes = bundle.get("sync", {}).get("include", [])
+        excludes = bundle.get("sync", {}).get("exclude", [])
+        assert "docs/**" in includes
+        assert "docs/" not in excludes
+        assert "*.md" not in excludes
+        assert "README.md" not in excludes
+        assert "/README.md" not in excludes
+
+    # docs/ content that is NOT part of the Help Center runtime set (catalogued
+    # *.md + images/ + screenshots/) must be kept out of the deployed bundle,
+    # in both databricks.yml sync.exclude and .databricksignore.
+    _NON_RUNTIME_DOCS = {
+        "docs/sphinx/",
+        "docs/superpowers/",
+        "docs/diagrams/",
+        "docs/pr47-neo4j-demo/",
+    }
+
+    def test_bundle_excludes_non_runtime_docs(self):
+        bundle = yaml.safe_load(
+            (_REPO_ROOT / "databricks.yml").read_text(encoding="utf-8")
+        )
+        excludes = set(bundle.get("sync", {}).get("exclude", []))
+        blocked = {
+            line.strip()
+            for line in (_REPO_ROOT / ".databricksignore")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        assert self._NON_RUNTIME_DOCS <= excludes, (
+            "databricks.yml must exclude internal docs/ content: missing "
+            f"{self._NON_RUNTIME_DOCS - excludes}"
+        )
+        assert self._NON_RUNTIME_DOCS <= blocked, (
+            ".databricksignore must block internal docs/ content: missing "
+            f"{self._NON_RUNTIME_DOCS - blocked}"
+        )
+        # Guard the inverse: never exclude a catalogued Help Center doc by its
+        # explicit docs/<file> path.
+        for doc in _DOC_INDEX.values():
+            docs_path = f"docs/{doc['file']}"
+            assert docs_path not in excludes
+            assert docs_path not in blocked
+            assert docs_path not in self._NON_RUNTIME_DOCS
+
+    _NON_RUNTIME_ROOT = {
+        ".github/",
+        ".planning/",
+        "ci/",
+        "licenses/",
+        "changelogs/",
+        "resources/",
+        "databricks.yml",
+        "pytest.ini",
+        "commitlint.config.js",
+        "mypy_baseline.txt",
+        "/CONTRIBUTORS.md",
+        "src/.coding_rules.md",
+    }
+
+    def test_bundle_excludes_non_runtime_repo_meta(self):
+        """DAB only honours sync.exclude (+ .gitignore), not .databricksignore."""
+        bundle = yaml.safe_load(
+            (_REPO_ROOT / "databricks.yml").read_text(encoding="utf-8")
+        )
+        excludes = set(bundle.get("sync", {}).get("exclude", []))
+        assert self._NON_RUNTIME_ROOT <= excludes, (
+            "databricks.yml must exclude non-runtime repo meta: missing "
+            f"{self._NON_RUNTIME_ROOT - excludes}"
+        )
+        # MCP and the graph-analytics job live in the same workspace files tree.
+        assert "src/mcp-server/" not in excludes
+        assert "src/jobs/" not in excludes
+        assert "app.yaml.template" not in excludes
+        assert "/app.yaml.template" not in excludes
+        assert "src/mcp-server/app.yaml.template" not in excludes
+
+    def test_gitignore_does_not_drop_the_digitaltwin_build_package(self):
+        """DAB applies .gitignore. A bare ``build/`` pattern matches
+        ``src/back/objects/digitaltwin/build/`` and the app fails to import."""
+        import subprocess
+
+        gitignore = (_REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        active = {
+            line.strip()
+            for line in gitignore.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        assert "build/" not in active, (
+            ".gitignore 'build/' is recursive and strips the TwinGraphBuild "
+            "package from the Apps workspace; use '/build/' for dist artifacts"
+        )
+        pkg = "src/back/objects/digitaltwin/build/__init__.py"
+        tracked = subprocess.check_output(
+            ["git", "ls-files", pkg], cwd=_REPO_ROOT, text=True
+        ).strip()
+        assert tracked == pkg
+
+    def test_deploy_rechecks_boot_modules_the_snapshot_can_skip(self):
+        """DAB incremental sync trusts ``.databricks/.../sync-snapshots``.
+        If a local path is in the snapshot but missing on the workspace
+        (rename with unchanged mtime, failed upload), ``bundle deploy``
+        skips it and the app boots with ModuleNotFoundError. Step 6b
+        must probe those modules, not only run.py."""
+        text = (_REPO_ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
+        match = re.search(r"_CRITICAL_SYNCED_FILES=\((.*?)\)", text, re.S)
+        assert match, "_CRITICAL_SYNCED_FILES missing from scripts/deploy.sh"
+        critical = set(re.findall(r'"([^"]+)"', match.group(1)))
+        collab = _REPO_ROOT / "src/back/objects/registry/collab"
+        missing = [
+            str(path.relative_to(_REPO_ROOT))
+            for path in sorted(collab.glob("*.py"))
+            if str(path.relative_to(_REPO_ROOT)) not in critical
+        ]
+        assert not missing, (
+            "deploy.sh step 6b must re-check collab modules so a stale "
+            f"sync snapshot cannot skip them: {missing}"
+        )
+        twin_init = "src/back/objects/digitaltwin/build/__init__.py"
+        assert twin_init in critical, (
+            "deploy.sh step 6b must re-check digitaltwin.build after the "
+            "gitignore /build/ miss"
+        )
 
 
 class TestHelpDocFetch:
@@ -58,19 +412,6 @@ class TestHelpDocFetch:
         # OntoBricks-wide error envelope: {error, message, detail, request_id}.
         assert body["error"] == "not_found"
         assert body["message"] == "Doc not found"
-
-    def test_known_slug_returns_markdown_or_404(self, client):
-        """A catalogued slug returns either the markdown (200) or a 404 if
-        the underlying file is absent on disk -- never 500."""
-        index = client.get("/api/help/docs").json()
-        slug = index["categories"][0]["docs"][0]["slug"]
-        response = client.get(f"/api/help/docs/{slug}")
-        assert response.status_code in (200, 404)
-        if response.status_code == 200:
-            body = response.json()
-            assert body["slug"] == slug
-            assert "markdown" in body
-            assert "title" in body
 
 
 class TestHelpAssetGuards:

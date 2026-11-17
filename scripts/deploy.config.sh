@@ -6,222 +6,176 @@
 # (`FOO=bar make deploy`) so CI can drive deployments without
 # committing per-environment changes.
 #
-# Workflow:
-#
-#   1. To change a default permanently, edit the matching
-#      `DEFAULT_*` literal in section 0 below.
-#   2. To override for one run, prefix the command:
-#      `WAREHOUSE_ID=abc make deploy`.
-#   3. Then run `make deploy` (or `scripts/deploy.sh` directly).
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  TO DEPLOY A NEW INSTANCE (keeps existing apps):                │
+# │    1. Set DEFAULT_INSTANCE_ID (e.g. "07x").                     │
+# │    2. Set DEFAULT_LAKEBASE_DATABASE (created if missing).       │
+# │    3. Optionally set DEFAULT_DATABRICKS_PROFILE if you use a    │
+# │       non-default Databricks CLI profile.                       │
+# │    4. Optionally set DEFAULT_LAKEBASE_SCHEMA if you want a      │
+# │       specific schema name (defaults to app-name slug).         │
+# │    5. Optionally set DEFAULT_REGISTRY_SCHEMA if the UC schema   │
+# │       differs from the app-name slug.                           │
+# │                                                                  │
+# │  App name + DAB target are derived from INSTANCE_ID so each     │
+# │  instance gets its own Terraform state (no destroy/rename).     │
+# │  The Lakebase db-… resource segment is resolved automatically.  │
+# └─────────────────────────────────────────────────────────────────┘
 #
 # Sections:
-#
-#   0. Defaults         — literal default values for every variable
-#                         (`DEFAULT_*`). Edit here to change a default
-#                         permanently. Not exported (config-internal).
-#   1. Apps             — names of the FastAPI app + its MCP companion
-#   2. DAB target       — which `databricks.yml` target to deploy
-#   3. DAB vars         — overrides for `databricks.yml > variables:`
-#                         (warehouse, registry catalog/schema/volume,
-#                         Lakebase project / branch / database / schema)
-#   4. Runtime fallbacks — values rendered into `app.yaml` from
-#                          `app.yaml.template` at deploy time. These
-#                          are used when the corresponding DAB
-#                          resource isn't bound (local dev, MCP).
-#
-# Notes:
-# - Sections 1-4 each follow the same pattern:
-#     `export FOO="${FOO:-$DEFAULT_FOO}"`
-#   This means: use the caller's `FOO` if it's already set/non-empty,
-#   otherwise fall back to `DEFAULT_FOO` from section 0.
-# - Section 3 (DAB vars) drive the BOUND resources Databricks Apps
-#   actually wires up at runtime — `${var.warehouse_id}`, the volume
-#   securable path, the Lakebase Postgres database path.
-# - Section 4 are the static fallbacks baked into `app.yaml`. The DAB
-#   binding always wins when present; the fallback is only consulted
-#   when the resource is unbound (e.g. MCP API calls, local
-#   `python run.py`). They can intentionally diverge from section 3
-#   if you keep separate registries for prod-bound vs. local.
-# - To add a new variable:
-#     a. Add `DEFAULT_NAME="…"` to section 0 below.
-#     b. Add `export NAME="${NAME:-$DEFAULT_NAME}"` to the matching
-#        section (1-4).
-#     c. If it maps to `databricks.yml`, add a `--var=` line to
-#        `scripts/deploy.sh > _dab_var_overrides`.
-#     d. If it maps to `app.yaml`, add `${NAME}` in
-#        `app.yaml.template` and let the renderer handle it.
+#   0a. Instance identity  — change these per deployment.
+#   0b. Workspace constants — set once per workspace.
+#   0c. Derived defaults   — auto-computed; do not edit.
+#   1.  Apps               — exports for the app names
+#   2.  DAB target         — which `databricks.yml` target to deploy
+#   3.  DAB vars           — values for `databricks.yml > variables:`
+#   4.  Runtime fallbacks  — values rendered into `app.yaml` at deploy time
 
-# ── 0. Defaults ─────────────────────────────────────────────────────
-# Literal default values. Edit a value here to change the project-wide
-# default permanently. These are plain assignments (no export, no
-# `:-` fallback) — they're config-internal, not meant to leak to
-# subprocesses or to be env-overridden themselves. Override the
-# matching `FOO` from the environment instead (see header).
+# ── 0a. Instance identity ────────────────────────────────────────────
+# THE ONLY LINE YOU NEED TO CHANGE to create a new deployment.
+# Lowercase alphanumeric + hyphens only (becomes part of the app name
+# and the DAB target: ``dev-lakebase-<id>``).
+# Env-overridable: ``DEFAULT_INSTANCE_ID=080 make deploy``.
+DEFAULT_INSTANCE_ID="${DEFAULT_INSTANCE_ID:-abacus}"
 
-# 1. Apps
-DEFAULT_APP_NAME="ontobricks-030"
-DEFAULT_MCP_APP_NAME="mcp-ontobricks"
+# Optional: force a DAB target instead of the auto ``ontobricks-<id>``.
+# Use only to keep managing a pre-INSTANCE_ID deploy whose local state
+# still lives under the unsuffixed ``ontobricks``.
+#DEFAULT_DAB_TARGET="ontobricks"
+
+# ── 0b. Workspace constants ──────────────────────────────────────────
+# Set once for your workspace. Shared across all instances deployed here.
+
+# Databricks CLI profile (`databricks auth profiles`). Leave empty to use
+# the CLI default profile. Exported as DATABRICKS_CONFIG_PROFILE for all
+# `databricks` invocations when this file is sourced (make deploy, bootstrap, …).
+DEFAULT_DATABRICKS_PROFILE="${DEFAULT_DATABRICKS_PROFILE-demo-build}"
+
+# SQL Warehouse. Leave empty to use the workspace Serverless Starter Warehouse
+# (resolved at deploy time). A set id is never replaced.
+# demo-genesis-warehouse (serverless PRO). Must stay explicit: the Serverless
+# Starter Warehouse fallback in this workspace does not start.
+DEFAULT_WAREHOUSE_ID="337986b7fa599984"
+
+# Unity Catalog
+DEFAULT_REGISTRY_CATALOG="genie_agents"
+# UC schema for the registry Delta objects (Knowledge Graph builds)
+DEFAULT_REGISTRY_SCHEMA="ontobricks"
+
+# Lakebase Autoscaling project + branch
+# New dedicated project, created by setup-lakebase.sh (instances API) if missing.
+# Fallback (app_managed sync only): "payment-integration".
+DEFAULT_LAKEBASE_PROJECT="ontobricks-abacus"
+DEFAULT_LAKEBASE_BRANCH="production"
+# Postgres database (datname) on the shared Lakebase instance — the value of
+# status.postgres_database from list-databases (underscores OK). Do NOT copy the
+# hyphenated database_id from the resource path name; those differ when the
+# datname contains underscores (API uses hyphens only in database_id / RFC-1123).
+# Each app gets its own SCHEMA inside this database.
+DEFAULT_LAKEBASE_DATABASE="ontobricks_registry"
+# Postgres schema inside the Lakebase database, Each instance should have its own schema for isolation.
+DEFAULT_LAKEBASE_SCHEMA="ontobricks_registry"
+# Example — reuse existing schema: DEFAULT_LAKEBASE_SCHEMA="ontobricks_demo"
+
+# ── 0c. Derived defaults (auto-computed — do NOT edit) ────────────────
+DEFAULT_APP_NAME="ontobricks-${DEFAULT_INSTANCE_ID}"
+DEFAULT_MCP_APP_NAME="mcp-${DEFAULT_APP_NAME}"
+
+# DAB resource keys (static identifiers in databricks.yml). Same keys are
+# fine across instances — isolation comes from a distinct DAB *target*
+# (and therefore a distinct ``.databricks/bundle/<target>/`` tfstate),
+# not from renaming these keys.
 DEFAULT_APP_RESOURCE_KEY="ontobricks_dev_app"
 DEFAULT_MCP_APP_RESOURCE_KEY="mcp_ontobricks_app"
 
-# 2. DAB target
-DEFAULT_DAB_TARGET="dev-lakebase"
+# Per-instance DAB target → separate local Terraform state.
+# Always Lakebase (registry is Postgres). Override with an explicit
+# DAB_TARGET=… / DEFAULT_DAB_TARGET=… only when you still manage a
+# pre-INSTANCE_ID deploy under unsuffixed ``dev-lakebase``.
+DEFAULT_DAB_TARGET="${DEFAULT_DAB_TARGET:-dev-lakebase-${DEFAULT_INSTANCE_ID}}"
 
-# 3. DAB variable overrides
-DEFAULT_WAREHOUSE_ID="d2096aa075ad44a3"
-DEFAULT_REGISTRY_CATALOG="benoit_cayla"
-DEFAULT_REGISTRY_SCHEMA="ontobricks_demo"
-DEFAULT_REGISTRY_VOLUME="registry"
-DEFAULT_LAKEBASE_PROJECT="ontobricks-demo2"
-DEFAULT_LAKEBASE_BRANCH="production"
-# get this value with databricks postgres list-databases "projects/{DEFAULT_LAKEBASE_PROJECT}/branches/{DEFAULT_LAKEBASE_BRANCH}" -o json
-DEFAULT_LAKEBASE_DATABASE_RESOURCE_SEGMENT="db-v6vc-8ibz5oeigo"
-DEFAULT_LAKEBASE_REGISTRY_SCHEMA="ontobricks_demo"
-
-# 3b. Lakebase GRANT bootstrap (registry side)
-# Only the database needs a literal default — instance and schema track
-# LAKEBASE_PROJECT and LAKEBASE_REGISTRY_SCHEMA respectively.
-DEFAULT_LAKEBASE_BOOTSTRAP_DATABASE="ontobricks_demo"
-
-# 3c. Lakebase GRANT bootstrap (Graph DB side)
-# Set these when the Graph DB lives on a DIFFERENT Lakebase Autoscaling
-# project / branch / Postgres database than the registry.  Leave empty
-# to reuse the registry bootstrap values (same project, branch, and DB).
-DEFAULT_LAKEBASE_GRAPH_PROJECT=""    # empty = same as LAKEBASE_PROJECT
-DEFAULT_LAKEBASE_GRAPH_BRANCH=""     # empty = same as LAKEBASE_BRANCH
-DEFAULT_LAKEBASE_GRAPH_DATABASE=""   # empty = same as LAKEBASE_BOOTSTRAP_DATABASE
-
-# 4. app.yaml runtime fallbacks
-DEFAULT_APP_SQL_WAREHOUSE_FALLBACK="66e8366e84d57752"
-DEFAULT_APP_DATABRICKS_CATALOG="main"
-DEFAULT_APP_DATABRICKS_SCHEMA="default"
-DEFAULT_APP_TRIPLESTORE_TABLE="benoit_cayla.ontobricks.default_triplestore"
-DEFAULT_APP_REGISTRY_CATALOG="benoit_cayla"
-DEFAULT_APP_REGISTRY_SCHEMA="ontobricks"
-DEFAULT_APP_REGISTRY_VOLUME="OntoBricksRegistry"
+# ── 0d. app.yaml runtime fallback literals ───────────────────────────
+DEFAULT_APP_TRIPLESTORE_TABLE_NAME="default_triplestore"
 DEFAULT_APP_MLFLOW_TRACKING_URI="databricks"
 
+# ── 0e. Databricks CLI profile ───────────────────────────────────────
+# Override for one-off runs: DATABRICKS_CONFIG_PROFILE=my-profile make deploy
+if [[ -n "${DATABRICKS_CONFIG_PROFILE:-$DEFAULT_DATABRICKS_PROFILE}" ]]; then
+    export DATABRICKS_CONFIG_PROFILE="${DATABRICKS_CONFIG_PROFILE:-$DEFAULT_DATABRICKS_PROFILE}"
+fi
+
 # ── 1. Apps ─────────────────────────────────────────────────────────
-# The FastAPI UI app and its MCP companion server.
-# APP_NAME / MCP_APP_NAME are passed to databricks.yml as
-# --var=app_name / --var=mcp_app_name, so this file is the single
-# source of truth for both the DAB resource name and the CLI lookups.
+export INSTANCE_ID="${INSTANCE_ID:-$DEFAULT_INSTANCE_ID}"
 export APP_NAME="${APP_NAME:-$DEFAULT_APP_NAME}"
 export MCP_APP_NAME="${MCP_APP_NAME:-$DEFAULT_MCP_APP_NAME}"
-
-# DAB resource keys (rarely change — they're identifiers in
-# `databricks.yml > resources.apps`, not the deployed app names).
+# MCP app service-principal client id for UI identity swap (#208).
+# Looked up from the existing MCP app in deploy.sh before yaml render.
+export MCP_SP_CLIENT_ID="${MCP_SP_CLIENT_ID:-}"
+# Workspace group granted CAN_USE on both apps. "users" = every workspace
+# user (fine for a dev sandbox). Set to a real group for regulated installs
+# that must scope app access.
+export APP_ACCESS_GROUP="${APP_ACCESS_GROUP:-users}"
 export APP_RESOURCE_KEY="${APP_RESOURCE_KEY:-$DEFAULT_APP_RESOURCE_KEY}"
 export MCP_APP_RESOURCE_KEY="${MCP_APP_RESOURCE_KEY:-$DEFAULT_MCP_APP_RESOURCE_KEY}"
 
 # ── 2. DAB target ───────────────────────────────────────────────────
-# `dev`           : Volume-only registry backend.
-# `dev-lakebase`  : Volume + Lakebase Autoscaling Postgres binding
-#                   (default — required for the Postgres registry).
+# Auto: ``dev-lakebase-<INSTANCE_ID>``. Legacy unsuffixed ``dev-lakebase``
+# still works when forced via ``DAB_TARGET=dev-lakebase make deploy``
+# (uses the static target in databricks.yml; no generated instance target).
 export DAB_TARGET="${DAB_TARGET:-$DEFAULT_DAB_TARGET}"
 
 # ── 3. DAB variable overrides (databricks.yml > variables:) ─────────
-# Passed to `databricks bundle deploy` as `--var=key=value`. Override
-# the defaults declared in `databricks.yml` so that file stays a
-# pure declaration of structure, not configuration.
+# A quoted "#oldid" leftover is not a warehouse id — treat it as unset.
+if [[ "${WAREHOUSE_ID:-}" == \#* ]]; then
+    unset WAREHOUSE_ID
+fi
 export WAREHOUSE_ID="${WAREHOUSE_ID:-$DEFAULT_WAREHOUSE_ID}"
 
-# Unity Catalog Volume securable: the deployed app gets WRITE_VOLUME
-# on `<REGISTRY_CATALOG>.<REGISTRY_SCHEMA>.<REGISTRY_VOLUME>`.
+# Unity Catalog registry catalog/schema (Delta objects for KG builds).
 export REGISTRY_CATALOG="${REGISTRY_CATALOG:-$DEFAULT_REGISTRY_CATALOG}"
+# Env-overridable so `scripts/update-deployed-app.sh` can pin the schema it
+# read back from a live app. `make deploy` `unset`s REGISTRY_SCHEMA first, so
+# the routine deploy still always uses DEFAULT_REGISTRY_SCHEMA.
 export REGISTRY_SCHEMA="${REGISTRY_SCHEMA:-$DEFAULT_REGISTRY_SCHEMA}"
-export REGISTRY_VOLUME="${REGISTRY_VOLUME:-$DEFAULT_REGISTRY_VOLUME}"
 
-# Lakebase Autoscaling project / branch / database. The bundle
-# composes the full Apps `postgres:` resource paths from these.
-# `LAKEBASE_DATABASE_RESOURCE_SEGMENT` is the `db-…` id from
-# `databricks postgres list-databases` — NOT the `datname` /
-# `status.postgres_database`. See `databricks.yml` lines 110-156
-# for the full caveat.
+# Lakebase project / branch.
 export LAKEBASE_PROJECT="${LAKEBASE_PROJECT:-$DEFAULT_LAKEBASE_PROJECT}"
 export LAKEBASE_BRANCH="${LAKEBASE_BRANCH:-$DEFAULT_LAKEBASE_BRANCH}"
-export LAKEBASE_DATABASE_RESOURCE_SEGMENT="${LAKEBASE_DATABASE_RESOURCE_SEGMENT:-$DEFAULT_LAKEBASE_DATABASE_RESOURCE_SEGMENT}"
 
-# Lakebase Postgres schema OntoBricks writes the registry into.
-# Mirrored into `app.yaml > LAKEBASE_SCHEMA` (section 4) so the
-# runtime knows where to look.
-export LAKEBASE_REGISTRY_SCHEMA="${LAKEBASE_REGISTRY_SCHEMA:-$DEFAULT_LAKEBASE_REGISTRY_SCHEMA}"
+# Lakebase Postgres datname and schema — always taken from the file (not
+# from the shell environment) so stale exports never bleed through.
+export LAKEBASE_DATABASE="${DEFAULT_LAKEBASE_DATABASE}"
+export LAKEBASE_SCHEMA="${DEFAULT_LAKEBASE_SCHEMA}"
 
-# ── 3b. Lakebase GRANT bootstrap (psql) ─────────────────────────────
-# Inputs to `scripts/bootstrap-lakebase-perms.sh`, called by
-# `deploy.sh` after the bundle deploy on `dev-lakebase`. Instance
-# and schema intentionally track LAKEBASE_PROJECT /
-# LAKEBASE_REGISTRY_SCHEMA from section 3 — the bootstrap targets
-# the same bound resource by default. Only the database has its own
-# literal (DEFAULT_LAKEBASE_BOOTSTRAP_DATABASE) because it diverges
-# from the bound resource path on some setups.
-export LAKEBASE_BOOTSTRAP_INSTANCE="${LAKEBASE_BOOTSTRAP_INSTANCE:-$LAKEBASE_PROJECT}"
-export LAKEBASE_BOOTSTRAP_BRANCH="${LAKEBASE_BOOTSTRAP_BRANCH:-$LAKEBASE_BRANCH}"
-export LAKEBASE_BOOTSTRAP_DATABASE="${LAKEBASE_BOOTSTRAP_DATABASE:-$DEFAULT_LAKEBASE_BOOTSTRAP_DATABASE}"
-export LAKEBASE_BOOTSTRAP_SCHEMA="${LAKEBASE_BOOTSTRAP_SCHEMA:-$LAKEBASE_REGISTRY_SCHEMA}"
-
-# Graph DB bootstrap — fall back to registry values when not explicitly set.
-# Override these when the Graph DB is bound to a separate Lakebase project.
-export LAKEBASE_GRAPH_PROJECT="${LAKEBASE_GRAPH_PROJECT:-$DEFAULT_LAKEBASE_GRAPH_PROJECT}"
-export LAKEBASE_GRAPH_BRANCH="${LAKEBASE_GRAPH_BRANCH:-$DEFAULT_LAKEBASE_GRAPH_BRANCH}"
-export LAKEBASE_GRAPH_DATABASE="${LAKEBASE_GRAPH_DATABASE:-$DEFAULT_LAKEBASE_GRAPH_DATABASE}"
-# Triple-table schema (Postgres graph schema) — where companion + graph tables live.
-export LAKEBASE_GRAPH_SCHEMA="${LAKEBASE_GRAPH_SCHEMA:-ontobricks_graph}"
-# Sync-table Postgres schema created by Lakebase to mirror the UC registry namespace.
-# Defaults to the registry catalog schema (LAKEBASE_REGISTRY_SCHEMA equivalent in the
-# graph DB).  Override if your UC registry schema segment differs from the registry
-# Postgres schema name.  Set to "" to skip the sync-schema grant (not needed when
-# sync_mode = app_managed).
-export LAKEBASE_SYNC_SCHEMA="${LAKEBASE_SYNC_SCHEMA:-}"
+# db-… resource segment — resolved by deploy.sh from LAKEBASE_DATABASE
+# via the Databricks API. Exposed here so it can be overridden in CI
+# without re-running the API lookup (e.g. LAKEBASE_DATABASE_RESOURCE_SEGMENT=db-xxx make deploy).
+export LAKEBASE_DATABASE_RESOURCE_SEGMENT="${LAKEBASE_DATABASE_RESOURCE_SEGMENT:-}"
 
 # ── 4. app.yaml runtime fallbacks ───────────────────────────────────
-# Templated into `app.yaml` from `app.yaml.template` at deploy time.
-# Only consulted when the matching DAB resource is unbound.
 
-# DBSQL warehouse fallback for MCP / session-less API calls.
-export APP_SQL_WAREHOUSE_FALLBACK="${APP_SQL_WAREHOUSE_FALLBACK:-$DEFAULT_APP_SQL_WAREHOUSE_FALLBACK}"
+# MCP companion URL (leave empty for local dev).
+export APP_ONTOBRICKS_URL="${APP_ONTOBRICKS_URL:-}"
 
-# Default Unity Catalog catalog/schema for ad-hoc operations.
-export APP_DATABRICKS_CATALOG="${APP_DATABRICKS_CATALOG:-$DEFAULT_APP_DATABRICKS_CATALOG}"
-export APP_DATABRICKS_SCHEMA="${APP_DATABRICKS_SCHEMA:-$DEFAULT_APP_DATABRICKS_SCHEMA}"
+# DBSQL warehouse fallback.
+export APP_SQL_WAREHOUSE_FALLBACK="${APP_SQL_WAREHOUSE_FALLBACK:-$WAREHOUSE_ID}"
 
-# Default fully-qualified Delta triplestore table (catalog.schema.table)
-# used when no domain session is active.
-export APP_TRIPLESTORE_TABLE="${APP_TRIPLESTORE_TABLE:-$DEFAULT_APP_TRIPLESTORE_TABLE}"
+# Default triplestore table.
+export APP_TRIPLESTORE_TABLE="${APP_TRIPLESTORE_TABLE:-${REGISTRY_CATALOG}.${REGISTRY_SCHEMA}.${DEFAULT_APP_TRIPLESTORE_TABLE_NAME}}"
 
-# Registry runtime fallbacks — used when the Volume resource is not
-# bound (typically local dev). These can intentionally point at a
-# different volume than the DAB-bound one in section 3.
-export APP_REGISTRY_CATALOG="${APP_REGISTRY_CATALOG:-$DEFAULT_APP_REGISTRY_CATALOG}"
-export APP_REGISTRY_SCHEMA="${APP_REGISTRY_SCHEMA:-$DEFAULT_APP_REGISTRY_SCHEMA}"
-export APP_REGISTRY_VOLUME="${APP_REGISTRY_VOLUME:-$DEFAULT_APP_REGISTRY_VOLUME}"
+# Registry catalog/schema runtime fallbacks (local dev / MCP without bound resource).
+export APP_REGISTRY_CATALOG="${APP_REGISTRY_CATALOG:-$REGISTRY_CATALOG}"
+export APP_REGISTRY_SCHEMA="${APP_REGISTRY_SCHEMA:-$REGISTRY_SCHEMA}"
 
-# Lakebase Postgres schema (tracks LAKEBASE_REGISTRY_SCHEMA from
-# section 3 by default — must match the schema actually GRANTed by
-# `bootstrap-lakebase-perms.sh`).
-export APP_LAKEBASE_SCHEMA="${APP_LAKEBASE_SCHEMA:-$LAKEBASE_REGISTRY_SCHEMA}"
-
-# Lakebase Postgres database name — must match the actual ``postgres_database``
-# of the bound ``db-…`` resource (i.e. the datname, not the schema name).
-# Use LAKEBASE_BOOTSTRAP_DATABASE which tracks the real datname.
-export APP_LAKEBASE_DATABASE="${APP_LAKEBASE_DATABASE:-$LAKEBASE_BOOTSTRAP_DATABASE}"
-
-# Lakebase project (autoscaling instance name) — informational in deployed app.
+# Lakebase runtime values rendered into app.yaml — always from file.
+export APP_LAKEBASE_SCHEMA="${LAKEBASE_SCHEMA}"
+export APP_LAKEBASE_DATABASE="${LAKEBASE_DATABASE}"
 export APP_LAKEBASE_PROJECT="${APP_LAKEBASE_PROJECT:-$LAKEBASE_PROJECT}"
-
-# Lakebase branch deployed to (used by LakebaseAuth host-resolution
-# fallback when PGHOST is not injected — e.g. local dev without binding).
 export APP_LAKEBASE_BRANCH="${APP_LAKEBASE_BRANCH:-$LAKEBASE_BRANCH}"
 
-# Lakebase managed-synced: UC catalog for the Lakeflow synced-table registration.
-# Leave empty to let OntoBricks auto-resolve the catalog from the registry
-# Volume config (recommended — the SP receives ALL_PRIVILEGES on the registry
-# catalog at deploy time via scripts/bootstrap-app-permissions.sh).
-# Override with a shared catalog name only if your registry catalog is not
-# accessible to the app service principal in production.
-# NOTE: intentionally NOT using ${APP_SYNC_UC_CATALOG:-} here so that a
-# stale shell export from a previous deploy never bleeds through.
-export APP_SYNC_UC_CATALOG=""
+# Lakebase managed-synced UC catalog (leave empty to auto-resolve).
+# Intentionally NOT using :- so stale exports never bleed through.
+export APP_SYNC_UC_CATALOG="genie_agents"
 
-# MLflow tracking URI (`databricks` = workspace tracking server).
+# MLflow tracking URI.
 export APP_MLFLOW_TRACKING_URI="${APP_MLFLOW_TRACKING_URI:-$DEFAULT_APP_MLFLOW_TRACKING_URI}"

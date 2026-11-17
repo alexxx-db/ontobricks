@@ -4,7 +4,7 @@
  *
  * Re-uses the .assistant-* DOM class family for bubbles / thinking /
  * input styling (see /static/ontology/css/ontology-assistant.css), but
- * runs embedded inside the Digital Twin sidebar section -- no floating
+ * runs embedded inside the Knowledge Graph sidebar section -- no floating
  * popup, no FAB.
  *
  * Talks to POST /dtwin/assistant/chat which drives the
@@ -56,16 +56,33 @@
     // Markdown rendering
     // =====================================================
 
-    function renderMarkdown(text) {
-        if (typeof marked !== 'undefined' && marked.parse) {
-            try {
-                marked.setOptions({ breaks: true, gfm: true });
-                return marked.parse(text);
-            } catch (_) { /* fall through */ }
+    const UNREADABLE_REPLY = "I couldn't display that answer. Please try again.";
+
+    function _extractReadableParts(value) {
+        if (typeof value === 'string') return value.trim() ? [value] : [];
+        if (Array.isArray(value)) {
+            return value.flatMap(function (item) {
+                return _extractReadableParts(item);
+            });
         }
-        return String(text)
-            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-            .replace(/\n/g, '<br>');
+        if (value && typeof value === 'object') {
+            const type = value.type;
+            if (type && type !== 'text' && type !== 'output_text') return [];
+            for (const key of ['text', 'content', 'value']) {
+                if (Object.prototype.hasOwnProperty.call(value, key)) {
+                    return _extractReadableParts(value[key]);
+                }
+            }
+        }
+        return [];
+    }
+
+    function readableMessage(value) {
+        if (typeof value === 'string' && value.trim()) return value;
+        const parts = _extractReadableParts(value)
+            .map(function (part) { return part.trim(); })
+            .filter(Boolean);
+        return parts.length ? parts.join('\n\n') : UNREADABLE_REPLY;
     }
 
     // =====================================================
@@ -88,7 +105,7 @@
         a.classList.add('graph-chat-entity-link');
         a.setAttribute(
             'title',
-            'Open in the Knowledge Graph viewer'
+            'Open in the Graph Viewer viewer'
         );
         a.setAttribute('target', '_self');
         a.setAttribute('rel', 'noopener');
@@ -210,7 +227,7 @@
         if (isUser) {
             body.textContent = text;
         } else {
-            body.innerHTML = renderMarkdown(text);
+            body.innerHTML = renderMarkdown(readableMessage(text));
             enhanceEntityLinks(body);
         }
 
@@ -253,6 +270,169 @@
         return wrap;
     }
 
+    // =====================================================
+    // Pending action confirm / cancel card
+    //
+    // Actions are never auto-confirmed and typed chat text (e.g. "yes")
+    // is never treated as confirmation -- the only way to invoke a
+    // pending action is an explicit click on the Confirm button below,
+    // which POSTs the one-time server-minted token.
+    // =====================================================
+
+    /**
+     * Pure helper: turn a raw `pending_action` payload (from the SSE
+     * `done` event) into a small, display-ready model. Returns null for
+     * anything that isn't usable (e.g. missing token).
+     */
+    function buildPendingActionCardModel(pending) {
+        if (!pending || typeof pending !== 'object') return null;
+        const token = String(pending.token || '').trim();
+        if (!token) return null;
+        return {
+            token: token,
+            entityLabel: String(pending.entity_label || pending.entity_uri || 'this entity'),
+            action: String(pending.action || 'action'),
+            description: pending.description ? String(pending.description) : '',
+            expiresInSec: Number.isFinite(pending.expires_in_sec) ? pending.expires_in_sec : null,
+        };
+    }
+
+    /**
+     * Format a `/dtwin/nodes/action/confirm` response as a short markdown
+     * message, mirroring the server-side `format_node_action_response`.
+     */
+    function formatActionResultText(data) {
+        if (!data || !data.success) {
+            const msg = data && (data.message || (typeof data.error === 'string' ? data.error : null));
+            return msg || 'Could not invoke the action.';
+        }
+        const lines = [
+            'Action: ' + (data.action || ''),
+            'Entity: ' + (data.entity_local_id || '') + '  (' + (data.class_name || 'Unknown') + ')',
+            '',
+        ];
+        const rows = Array.isArray(data.rows) ? data.rows : [];
+        if (!rows.length) {
+            lines.push('Completed — no result rows returned.');
+            return lines.join('\n');
+        }
+        lines.push('Result (' + rows.length + ' row' + (rows.length !== 1 ? 's' : '') + '):');
+        rows.forEach(function (row) {
+            const parts = Object.keys(row).map(function (k) { return k + ': ' + row[k]; });
+            lines.push('  ' + parts.join('  |  '));
+        });
+        return lines.join('\n');
+    }
+
+    function _setPendingCardStatus(card, text, kind) {
+        const statusEl = card.querySelector('.graph-chat-pending-action-status');
+        if (!statusEl) return;
+        statusEl.textContent = text;
+        statusEl.classList.remove('is-success', 'is-error');
+        if (kind) statusEl.classList.add(kind);
+    }
+
+    function _disablePendingCardButtons(card) {
+        card.querySelectorAll('button').forEach(function (btn) { btn.disabled = true; });
+    }
+
+    async function confirmPendingAction(card, model) {
+        _disablePendingCardButtons(card);
+        _setPendingCardStatus(card, 'Running…');
+        card.classList.add('is-resolved');
+
+        let data = {};
+        try {
+            const resp = await fetch('/dtwin/nodes/action/confirm', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ token: model.token }),
+            });
+            data = await resp.json().catch(function () { return {}; });
+            if (!resp.ok && data.success === undefined) data.success = false;
+        } catch (err) {
+            data = { success: false, message: 'Network error: ' + err.message };
+        }
+
+        const text = formatActionResultText(data);
+        appendMessage('assistant', text);
+        conversationHistory.push({ role: 'assistant', content: text });
+
+        _setPendingCardStatus(card, data.success ? 'Confirmed' : 'Failed', data.success ? 'is-success' : 'is-error');
+    }
+
+    function cancelPendingAction(card, model) {
+        card.remove();
+        fetch('/dtwin/nodes/action/cancel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ token: model.token }),
+        }).catch(function () { /* best effort -- server TTL still expires the token */ });
+    }
+
+    /**
+     * Build the Confirm / Cancel card DOM for a `pending_action` payload.
+     * Returns null when the payload isn't usable (see buildPendingActionCardModel).
+     */
+    function buildPendingActionCard(pending) {
+        const model = buildPendingActionCardModel(pending);
+        if (!model) return null;
+
+        const card = document.createElement('div');
+        card.className = 'graph-chat-pending-action';
+        card.setAttribute('data-token', model.token);
+
+        const header = document.createElement('div');
+        header.className = 'graph-chat-pending-action-header';
+        header.innerHTML = '<i class="bi bi-exclamation-diamond-fill"></i><span>Confirm action</span>';
+        card.appendChild(header);
+
+        const body = document.createElement('div');
+        body.className = 'graph-chat-pending-action-body';
+        const nameLine = document.createElement('div');
+        nameLine.className = 'graph-chat-pending-action-name';
+        const code = document.createElement('code');
+        code.textContent = model.action;
+        nameLine.appendChild(document.createTextNode('Run '));
+        nameLine.appendChild(code);
+        nameLine.appendChild(document.createTextNode(' on ' + model.entityLabel));
+        body.appendChild(nameLine);
+        if (model.description) {
+            const desc = document.createElement('div');
+            desc.className = 'graph-chat-pending-action-desc';
+            desc.textContent = model.description;
+            body.appendChild(desc);
+        }
+        card.appendChild(body);
+
+        const actions = document.createElement('div');
+        actions.className = 'graph-chat-pending-action-actions';
+
+        const confirmBtn = document.createElement('button');
+        confirmBtn.type = 'button';
+        confirmBtn.className = 'graph-chat-pending-action-confirm';
+        confirmBtn.textContent = 'Confirm';
+        confirmBtn.addEventListener('click', function () { confirmPendingAction(card, model); });
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'graph-chat-pending-action-cancel';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.addEventListener('click', function () { cancelPendingAction(card, model); });
+
+        actions.appendChild(confirmBtn);
+        actions.appendChild(cancelBtn);
+        card.appendChild(actions);
+
+        const status = document.createElement('div');
+        status.className = 'graph-chat-pending-action-status';
+        card.appendChild(status);
+
+        return card;
+    }
+
     function appendError(text) {
         const container = messagesEl();
         if (!container) return;
@@ -276,6 +456,41 @@
         container.scrollTop = container.scrollHeight;
     }
 
+    /**
+     * Inline advisory shown in the chat when the server reports resource
+     * pressure (blocking thread pool saturated). Nudges the user toward a
+     * larger Databricks App instance instead of appearing to hang.
+     */
+    function appendResourceAdvisory(text) {
+        const container = messagesEl();
+        if (!container) return;
+        const div = document.createElement('div');
+        div.className = 'alert alert-warning py-2 px-3 small graph-chat-resource-advisory d-flex align-items-start';
+        const icon = document.createElement('i');
+        icon.className = 'bi bi-exclamation-triangle-fill me-2 mt-1';
+        const span = document.createElement('span');
+        span.textContent = text;
+        div.appendChild(icon);
+        div.appendChild(span);
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+    }
+
+    /**
+     * Surface the resource-pressure advisory both inline (in the chat) and via
+     * the global NotificationCenter toast, when the server flags it.
+     */
+    function maybeShowResourcePressure(event) {
+        if (!event || !event.resource_pressure) return;
+        const msg = event.resource_advice ||
+            'OntoBricks is under heavy load; responses may be slow. Consider ' +
+            'upgrading the Databricks App instance size.';
+        appendResourceAdvisory(msg);
+        if (typeof window.showNotification === 'function') {
+            try { window.showNotification(msg, 'warning'); } catch (_) { /* best effort */ }
+        }
+    }
+
     function showThinking() {
         const container = messagesEl();
         if (!container) return;
@@ -292,6 +507,154 @@
     function hideThinking() {
         const t = el('chatThinking');
         if (t) t.remove();
+    }
+
+    // =====================================================
+    // Streaming bubble helpers
+    // =====================================================
+
+    /**
+     * Create a bot message bubble in "streaming" mode.
+     * Returns an object with { div, stepsEl, bodyEl } for live updates.
+     */
+    function createStreamingBubble() {
+        const container = messagesEl();
+        if (!container) return null;
+        hideWelcome();
+
+        const div = document.createElement('div');
+        div.className = 'assistant-msg bot-msg';
+        div.id = 'chatStreamingBubble';
+
+        const avatar = document.createElement('div');
+        avatar.className = 'assistant-msg-avatar';
+        avatar.innerHTML = OB_ICON_SVG;
+
+        const body = document.createElement('div');
+        body.className = 'assistant-msg-body';
+
+        // Live step tracker shown while the agent is running
+        const stepsEl = document.createElement('div');
+        stepsEl.className = 'graph-chat-stream-steps';
+        stepsEl.innerHTML =
+            '<div class="assistant-thinking-dots"><span></span><span></span><span></span></div>' +
+            '<span class="graph-chat-stream-status">Starting…</span>';
+        body.appendChild(stepsEl);
+
+        div.appendChild(avatar);
+        div.appendChild(body);
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+
+        return { div, stepsEl, bodyEl: body };
+    }
+
+    /**
+     * Update the streaming bubble with a step event received from the SSE stream.
+     */
+    function updateStreamingBubble(bubble, event) {
+        if (!bubble) return;
+        const { stepsEl } = bubble;
+        if (!stepsEl) return;
+        const container = messagesEl();
+
+        const statusEl = stepsEl.querySelector('.graph-chat-stream-status');
+        if (event.step_type === 'tool_call') {
+            if (statusEl) statusEl.textContent = 'Calling ' + (event.tool_name || 'tool') + '…';
+        } else if (event.step_type === 'tool_result') {
+            if (statusEl) statusEl.textContent = (event.tool_name || 'tool') + ' done (' + (event.duration_ms || 0) + ' ms)';
+        }
+        if (container) container.scrollTop = container.scrollHeight;
+    }
+
+    /**
+     * Replace the streaming bubble's placeholder with the final rendered reply.
+     */
+    function finalizeStreamingBubble(bubble, event) {
+        if (!bubble) return;
+        const { stepsEl, bodyEl } = bubble;
+
+        // Remove the live-steps placeholder
+        if (stepsEl && stepsEl.parentNode === bodyEl) {
+            bodyEl.removeChild(stepsEl);
+        }
+
+        // Render the final markdown reply
+        const reply = readableMessage(event.reply);
+        bodyEl.innerHTML = renderMarkdown(reply);
+        enhanceEntityLinks(bodyEl);
+
+        if (Array.isArray(event.tools) && event.tools.length) {
+            bodyEl.appendChild(buildToolTrace(event.tools));
+        }
+
+        // Actions are proposed only -- render Confirm/Cancel and wait for
+        // an explicit click. Never auto-confirm here.
+        if (event.pending_action) {
+            const card = buildPendingActionCard(event.pending_action);
+            if (card) bodyEl.appendChild(card);
+        }
+
+        const container = messagesEl();
+        if (container) container.scrollTop = container.scrollHeight;
+        return reply;
+    }
+
+    /**
+     * Turn the streaming bubble into an error state.
+     */
+    function errorStreamingBubble(bubble, message) {
+        if (!bubble) return;
+        const { stepsEl, bodyEl, div } = bubble;
+        if (stepsEl && stepsEl.parentNode === bodyEl) {
+            bodyEl.removeChild(stepsEl);
+        }
+        div.className = 'assistant-msg bot-msg error-msg';
+        div.querySelector('.assistant-msg-avatar').style.background = 'var(--bs-danger, #dc3545)';
+        div.querySelector('.assistant-msg-avatar').innerHTML = '<i class="bi bi-exclamation-triangle-fill"></i>';
+        bodyEl.textContent = message;
+    }
+
+    // =====================================================
+    // SSE stream consumer
+    // =====================================================
+
+    async function _consumeStream(bubble, response) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+
+                // SSE events are delimited by double newlines
+                const parts = buffer.split('\n\n');
+                buffer = parts.pop(); // last incomplete chunk
+
+                for (const part of parts) {
+                    const line = part.trim();
+                    if (!line.startsWith('data:')) continue;
+                    let event;
+                    try {
+                        event = JSON.parse(line.slice(5).trim());
+                    } catch (_) { continue; }
+
+                    if (event.type === 'step') {
+                        updateStreamingBubble(bubble, event);
+                    } else if (event.type === 'done') {
+                        return event; // caller handles finalization
+                    } else if (event.type === 'error') {
+                        throw new Error(event.message || 'Agent error');
+                    }
+                }
+            }
+        } finally {
+            reader.releaseLock();
+        }
+        return null;
     }
 
     // =====================================================
@@ -315,10 +678,10 @@
         appendMessage('user', text);
         conversationHistory.push({ role: 'user', content: text });
 
-        showThinking();
+        const bubble = createStreamingBubble();
 
         try {
-            const response = await fetch('/dtwin/assistant/chat', {
+            const response = await fetch('/dtwin/assistant/chat/stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -329,25 +692,32 @@
                 credentials: 'same-origin',
             });
 
-            hideThinking();
-            const data = await response.json();
+            if (!response.ok || !response.body) {
+                const errData = await response.json().catch(() => ({}));
+                const msg = (errData && (errData.message || errData.detail))
+                    || ('Request failed (' + response.status + ')');
+                errorStreamingBubble(bubble, msg);
+                return;
+            }
 
-            if (response.ok && data.success) {
-                appendMessage('assistant', data.reply || '(no reply)', {
-                    tools: data.tools || [],
-                });
+            const doneEvent = await _consumeStream(bubble, response);
+
+            if (doneEvent) {
+                const reply = finalizeStreamingBubble(bubble, doneEvent);
                 conversationHistory.push({
                     role: 'assistant',
-                    content: data.reply || '',
+                    content: reply,
                 });
+                maybeShowResourcePressure(doneEvent);
             } else {
-                const msg = (data && (data.message || data.detail))
-                    || ('Request failed (' + response.status + ')');
-                appendError(msg);
+                errorStreamingBubble(bubble, 'Stream ended without a final response.');
             }
         } catch (err) {
-            hideThinking();
-            appendError('Network error: ' + err.message);
+            if (bubble) {
+                errorStreamingBubble(bubble, 'Network error: ' + err.message);
+            } else {
+                appendError('Network error: ' + err.message);
+            }
         } finally {
             isSending = false;
             const inp2 = inputEl();
@@ -391,10 +761,13 @@
         hideWelcome();
         conversationHistory = [];
         messages.forEach(function (m) {
-            if (!m || typeof m.content !== 'string') return;
+            if (!m || !Object.prototype.hasOwnProperty.call(m, 'content')) return;
             const role = m.role === 'assistant' ? 'assistant' : 'user';
-            appendMessage(role, m.content);
-            conversationHistory.push({ role: role, content: m.content });
+            const content = role === 'assistant'
+                ? readableMessage(m.content)
+                : String(m.content || '');
+            appendMessage(role, content);
+            conversationHistory.push({ role: role, content: content });
         });
     }
 
@@ -557,4 +930,10 @@
     });
 
     window.initGraphChat = init;
+    window.chatSendMessage = function (text) { sendMessage(text); };
+    window.appendChatAssistantMessage = function (text) {
+        const content = readableMessage(text);
+        appendMessage('assistant', content);
+        conversationHistory.push({ role: 'assistant', content: content });
+    };
 })();

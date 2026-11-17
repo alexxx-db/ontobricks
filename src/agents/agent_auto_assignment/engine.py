@@ -69,7 +69,7 @@ and relationships to SQL queries against Databricks tables.
 
 TOOLS
 You have six tools:
-  • get_metadata           – get imported table schemas (full names, columns, types) — no UC query
+  • get_metadata           – get imported table/view/metric-view schemas (full names, object_kind, columns, types, roles) — no UC query
   • get_documents_context   – get imported domain documents to enrich domain context — no UC query
   • get_ontology           – get entities (with attributes) and relationships to map
   • execute_sql            – run a SQL query to validate it and see columns + sample data
@@ -94,7 +94,9 @@ SQL RULES FOR ENTITIES (CRITICAL)
 • Always use full table names from get_metadata (catalog.schema.table).
 • The FIRST column MUST be aliased AS ID (the entity identifier).
 • The SECOND column MUST be aliased AS Label (human-readable name).
-• Additional columns for each data-property attribute (use original column names).
+• If the entity has attributes (non-empty "attributes" list), add one column per \
+attribute after ID and Label.
+• If the entity has NO attributes, select ONLY ID and Label — no extra columns.
 • If the same column serves as both an alias and an attribute, include it twice: \
 once with the alias (AS ID) and once with its original name.
 • Add WHERE <id_column> IS NOT NULL to filter null keys.
@@ -102,16 +104,44 @@ once with the alias (AS ID) and once with its original name.
 • Do NOT use ORDER BY, CTEs, or subqueries unless absolutely necessary.
 • Write simple, flat SELECT statements.
 
+METRIC VIEW SOURCES (CRITICAL)
+If get_metadata reports object_kind "metric_view", that source is a Unity Catalog \
+metric view — never query it with SELECT *. Project dimension columns directly and \
+wrap EACH measure column in MEASURE(): \
+`SELECT <dim1>, <dim2>, MEASURE(<measure>) AS <measure> FROM <table> \
+GROUP BY <dim1>, <dim2>`. Only columns whose role is "measure" go inside \
+MEASURE(); role "dimension" columns are projected raw and listed in GROUP BY. \
+Never use a measure as ID, Label, source_id, or target_id — those must be \
+dimensions (or expressions over dimensions). A dimension-only metric view is \
+projected without GROUP BY. Honour the same ID AS ID / Label AS Label aliases \
+on top of that projection (ID must be a dimension).
+
+COLUMN NAME QUOTING (CRITICAL)
+• In SQL, ALWAYS wrap EVERY source column name in backticks: \
+`customer_id`, `name`, `first_name`, `column name`, `my-col`.
+• Alias names (after AS) must NEVER be backtick-quoted: write AS ID, AS Label, \
+AS customer_name — NOT AS `ID`, NOT AS `Label`.
+• When a source column name contains spaces or non-alphanumeric characters, alias \
+it to a safe snake_case name: `customer name` AS customer_name.
+• The values you pass to submit_entity_mapping for id_column, label_column, and \
+attribute_mappings values are the alias names (no backticks). \
+Example: id_column="ID", label_column="Label", attribute_mappings={"name": "name"}.
+• Never pass a value with backticks to id_column, label_column, source_id_column, \
+target_id_column, or attribute_mappings — always use the plain alias name.
+
 SQL RULES FOR RELATIONSHIPS (CRITICAL)
 • SELECT exactly 2 columns: source identifier AS source_id, target identifier AS target_id.
 • If both columns are in the SAME table, query only that table (no joins).
 • Do NOT add LIMIT or ORDER BY.
+• Apply the same always-backtick-quote rule as for entity SQL.
 
 ATTRIBUTE MAPPING
 • In submit_entity_mapping, provide attribute_mappings: a JSON object mapping each \
 ontology attribute name to the corresponding SQL column name.
 • Match by name similarity (e.g. ontology "firstName" → column "first_name").
-• Map ALL attributes from the ontology entity to available columns.
+• Map ONLY attributes listed in the entity's "attributes" list from get_ontology. \
+If that list is empty, submit attribute_mappings: {} and do NOT add extra SQL columns.
+• NEVER invent attribute mappings for columns not listed as ontology attributes.
 
 GENERAL RULES
 • Process ALL entities and ALL relationships — do not skip any.

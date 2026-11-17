@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Ontology Design - OntoBricks{% endblock %}
+{% block title %}{{ brand_page_title('Ontology Design') }}{% endblock %}
 
 {% block extra_css %}
 <!-- Ontology page specific styles -->
@@ -24,6 +24,7 @@
 {% block content %}
 <!-- Ontology Core Module (shared state across all partials) -->
 <script src="{{ url_for('static', filename='global/js/ontology-core.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='global/js/ontology-inheritance.js') }}?v={{ asset_version }}"></script>
 
 <div class="container-fluid px-0">
     <div class="sidebar-layout">
@@ -41,7 +42,7 @@
                 {% include "partials/ontology/_ontology_wizard.html" %}
             </div>
             
-            <!-- Information Section - Default view -->
+            <!-- General section (id remains information) — default view -->
             <div id="information-section" class="sidebar-section active">
                 {% include "partials/ontology/_ontology_information.html" %}
             </div>
@@ -86,7 +87,7 @@
                 {% include "partials/ontology/_ontology_business_rules.html" %}
             </div>
 
-            <!-- Cohort Discovery — DESIGN (Run/preview lives in Digital Twin) -->
+            <!-- Cohort Discovery — DESIGN (Run/preview lives in Knowledge Graph) -->
             <div id="cohorts-section" class="sidebar-section">
                 {% include "partials/ontology/_ontology_cohorts.html" %}
             </div>
@@ -112,6 +113,8 @@
     </div>
 </div>
 
+{% include "partials/ontology/_ontology_entity_import_modal.html" %}
+
 <!-- OntoViz library for Design section -->
 <script src="{{ url_for('static', filename='global/ontoviz/ontoviz.js') }}?v={{ asset_version }}"></script>
 
@@ -120,22 +123,24 @@
 
 <!-- Ontology modules (extracted from partials) -->
 <script src="{{ url_for('static', filename='ontology/js/ontology-map.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='ontology/js/ontology-entity-import.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-shared-panels.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-entities.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-relationships.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='ontology/js/ontology-conditions.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-dataquality.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-axioms.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-swrl.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-business-rules.js') }}?v={{ asset_version }}"></script>
-<!-- Cohort Discovery design UI (same module powers the Digital Twin run page) -->
+<!-- Cohort Discovery design UI (same module powers the Knowledge Graph run page) -->
 <script src="{{ url_for('static', filename='query/js/query-cohorts.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-owl-content.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-information.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-import.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-groups.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='global/js/task-progress-ui.js') }}?v={{ asset_version }}"></script>
+<script src="{{ url_for('static', filename='ontology/js/ontology-wizard-review.js') }}?v={{ asset_version }}"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-wizard.js') }}?v={{ asset_version }}"></script>
-<!-- Markdown rendering for assistant chat -->
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="{{ url_for('static', filename='ontology/js/ontology-assistant.js') }}?v={{ asset_version }}"></script>
 
 <script src="{{ url_for('static', filename='ontology/js/ontology-pitfalls.js') }}?v={{ asset_version }}"></script>

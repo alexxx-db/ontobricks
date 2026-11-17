@@ -13,6 +13,11 @@ import time as _time
 
 from back.core.logging import get_logger
 from shared.config.constants import APP_VERSION
+from shared.fastapi.ui_branding import (
+    brand_page_title as _brand_page_title,
+    get_request_ui_branding,
+    render_ui_branding_css_vars,
+)
 
 logger = get_logger(__name__)
 
@@ -122,6 +127,27 @@ def is_app_mode() -> bool:
     return _is_app()
 
 
+@pass_context
+def ui_branding_for(context: dict) -> dict:
+    """Return request-scoped UI branding with defaults as fallback."""
+    request: Request = context.get("request")
+    return get_request_ui_branding(request)
+
+
+@pass_context
+def brand_page_title(context: dict, page_label: str = "") -> str:
+    """Compose browser title using configured app title."""
+    request: Request = context.get("request")
+    return _brand_page_title(get_request_ui_branding(request), page_label)
+
+
+@pass_context
+def ui_branding_css_vars(context: dict) -> str:
+    """Render runtime brand CSS custom properties for first paint."""
+    request: Request = context.get("request")
+    return render_ui_branding_css_vars(get_request_ui_branding(request))
+
+
 # Add custom globals to Jinja2 environment
 templates.env.globals["url_for"] = url_for
 templates.env.globals["range"] = range_filter
@@ -129,6 +155,9 @@ templates.env.globals["get_user_email"] = get_user_email
 templates.env.globals["get_user_role"] = get_user_role
 templates.env.globals["get_user_domain_role"] = get_user_domain_role
 templates.env.globals["is_app_mode"] = is_app_mode
+templates.env.globals["ui_branding_for"] = ui_branding_for
+templates.env.globals["brand_page_title"] = brand_page_title
+templates.env.globals["ui_branding_css_vars"] = ui_branding_css_vars
 
 # Menu configuration available in all templates as {{ menu_config }}
 from front.config import get_menu_config, get_menu_by_id
@@ -152,21 +181,39 @@ templates.env.filters["random"] = random_filter
 # ===========================================
 
 
-def triplestore_page_context(domain_session, settings=None) -> dict:
-    """Build the triplestore-related template context shared by dtwin and domain pages.
+def home_redirect_if_unloaded(domain_session):
+    """Return a 303 to Home when the session has no loaded domain, else None.
 
-    Returns dict with ``view_table``, ``graph_name``, ``triplestore_cache``, and
-    ``graph_engine`` (currently always ``lakebase``).
+    Workspace HTML routes (Domain, Ontology, Mapping, Knowledge Graph) call
+    this before rendering so a bookmark or stale URL never paints an empty
+    workspace. Settings / About / Home stay reachable without a domain.
     """
-    from back.core.helpers import effective_view_table, effective_graph_name
-    from back.core.triplestore.TripleStoreFactory import TripleStoreFactory
+    from fastapi.responses import RedirectResponse
 
-    _raw = TripleStoreFactory._resolve_graph_engine(domain_session, settings) or "lakebase"
-    graph_engine = _raw if _raw == "lakebase" else "lakebase"
+    from back.objects.domain import WorkspacePresence
+
+    if WorkspacePresence.is_loaded(domain_session):
+        return None
+    return RedirectResponse("/", status_code=303)
+
+
+def triplestore_page_context(domain_session, settings=None) -> dict:
+    """Build the triplestore-related template context shared by dtwin and domain pages."""
+    from back.core.helpers import effective_view_table, effective_graph_name, effective_databricks_table
+    from back.core.graphdb.GraphDBFactory import GraphDBFactory
+
+    triple_store_backend = (
+        GraphDBFactory._resolve_triple_store_backend(domain_session, settings)
+        or "lakebase"
+    )
+    _raw = GraphDBFactory._resolve_graph_engine(domain_session, settings) or "lakebase"
+    graph_engine = _raw
 
     return {
         "view_table": effective_view_table(domain_session),
         "graph_name": effective_graph_name(domain_session),
+        "data_table": effective_databricks_table(domain_session, settings),
         "triplestore_cache": (domain_session.triplestore or {}).get("stats", {}),
         "graph_engine": graph_engine,
+        "triple_store_backend": triple_store_backend,
     }

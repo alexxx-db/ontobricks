@@ -2,28 +2,20 @@
 
 from __future__ import annotations
 
-import re
-import time
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set
 
-from back.core.errors import (
-    InfrastructureError,
-    NotFoundError,
-    OntoBricksError,
-    ValidationError,
-)
-from back.core.helpers import sql_escape as escape_sql_value, extract_local_name, is_databricks_app
-from back.core.logging import get_logger
-from back.core.w3c.rdf_utils import uri_local_name
 from back.objects.digitaltwin.constants import RDF_TYPE, RDFS_LABEL
 from back.objects.digitaltwin.models import DomainSnapshot
-from back.objects.session import get_domain
-
-logger = get_logger(__name__)
-
-# Session TTL for ``domain.triplestore.stats`` sections (status, dt_existence, aggregate stats).
-_TS_STATS_CACHE_TTL_SECONDS = 300
+from back.objects.digitaltwin.cache.TwinStoreCache import (
+    _TS_STATS_CACHE_TTL_SECONDS as _TS_STATS_CACHE_TTL_SECONDS,
+)
+from back.objects.digitaltwin.quality.SqlQualityChecks import SqlQualityChecks
+from back.objects.digitaltwin.quality.QualitySqlBuilder import QualitySqlBuilder
+from back.objects.digitaltwin.TwinBackgroundTasks import TwinBackgroundTasks
+from back.objects.digitaltwin.query.TwinMapping import TwinMapping
+from back.objects.digitaltwin.TwinAnalytics import TwinAnalytics
+from back.objects.digitaltwin.TwinResolve import TwinResolve
+from back.objects.session import get_domain  # tests patch DigitalTwin.get_domain
 
 
 class DigitalTwin:
@@ -37,6 +29,7 @@ class DigitalTwin:
     RDF_TYPE = RDF_TYPE
     RDFS_LABEL = RDFS_LABEL
     DomainSnapshot = DomainSnapshot
+    _SQL_ERROR_MAX_CHARS = SqlQualityChecks._SQL_ERROR_MAX_CHARS
 
     def __init__(self, domain) -> None:
         self._domain = domain
@@ -47,77 +40,18 @@ class DigitalTwin:
 
     @staticmethod
     def _normalize_base_uri(uri: str) -> str:
-        """Ensure base_uri ends with exactly one '/' separator."""
-        return uri.rstrip("/").rstrip("#") + "/"
+        return TwinMapping._normalize_base_uri(uri)
 
     @staticmethod
     def _safe_class_label(class_label: str, class_uri: str) -> str:
-        """Return a non-empty sanitized class label for use in URI templates.
+        return TwinMapping._safe_class_label(class_label, class_uri)
 
-        Falls back to the local name extracted from class_uri when class_label
-        is empty, preventing double-slash URIs like base_uri//{id}.
-        """
-        name = (class_label or "").strip().replace(" ", "_")
-        if name:
-            return name
-        if class_uri:
-            name = extract_local_name(class_uri).strip()
-            if name:
-                return name.replace(" ", "_")
-        return "Entity"
-
-    # ------------------------------------------------------------------
-    # SQL column extraction
-    # ------------------------------------------------------------------
-
-    _SELECT_CLAUSE_RE = re.compile(
-        r"SELECT\s+(?:DISTINCT\s+)?(.*?)\s+FROM\s",
-        re.IGNORECASE | re.DOTALL,
-    )
-    _ALIAS_RE = re.compile(r"\bAS\s+(\w+)\s*$", re.IGNORECASE)
+    _SELECT_CLAUSE_RE = TwinMapping._SELECT_CLAUSE_RE
+    _ALIAS_RE = TwinMapping._ALIAS_RE
 
     @staticmethod
     def _extract_select_columns(sql_query: str) -> Set[str] | None:
-        """Extract output column names from a SELECT query.
-
-        For ``SELECT col1 AS A, col2 AS B FROM ...`` returns ``{"A", "B"}``.
-        For ``SELECT col1, col2 FROM ...`` returns ``{"col1", "col2"}``.
-        Returns ``None`` when the SELECT clause cannot be parsed reliably.
-        """
-        if not sql_query:
-            return None
-        m = DigitalTwin._SELECT_CLAUSE_RE.search(sql_query)
-        if not m:
-            return None
-
-        raw_cols = m.group(1)
-        depth = 0
-        parts: list[str] = []
-        current: list[str] = []
-        for ch in raw_cols:
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            elif ch == "," and depth == 0:
-                parts.append("".join(current).strip())
-                current = []
-                continue
-            current.append(ch)
-        parts.append("".join(current).strip())
-
-        columns: set[str] = set()
-        for part in parts:
-            if not part or part == "*":
-                return None
-            alias_m = DigitalTwin._ALIAS_RE.search(part)
-            if alias_m:
-                columns.add(alias_m.group(1))
-            else:
-                token = part.rsplit(".", 1)[-1].strip().strip('`"')
-                if token:
-                    columns.add(token)
-        return columns if columns else None
+        return TwinMapping._extract_select_columns(sql_query)
 
     # ------------------------------------------------------------------
     # VIEW error diagnostics
@@ -129,132 +63,8 @@ class DigitalTwin:
         entity_mappings: Dict[str, Any],
         relationship_mappings: list | None = None,
     ) -> str:
-        """Parse a VIEW creation error and enrich it with mapping context.
-
-        Extracts unresolved column names from Databricks error messages, then
-        searches entity and relationship mappings to identify which entity,
-        source table, and attribute mapping caused the problem.
-
-        Returns an enriched error string suitable for user-facing task messages.
-        """
-        # --- Permission errors (UC MANAGE / SELECT / USAGE missing) -----------
-        perm_match = re.search(
-            r"PERMISSION_DENIED:\s*([^\n]+)", error_msg, re.IGNORECASE
-        )
-        if perm_match:
-            perm_detail = perm_match.group(1).strip().rstrip(".")
-            return (
-                f"Permission denied while creating the VIEW.\n"
-                f"  Detail: {perm_detail}\n"
-                f"  Fix: Grant the required privilege to the Databricks App service "
-                f"principal (typically MANAGE on the target object or its parent "
-                f"schema, and SELECT on all source tables). "
-                f"If an object with the target name already exists as a TABLE, drop "
-                f"it first — CREATE OR REPLACE VIEW cannot overwrite a TABLE."
-            )
-
-        # --- Missing source table / view -------------------------------------
-        tbl_match = re.search(
-            r"TABLE_OR_VIEW_NOT_FOUND[^`']*"
-            r"((?:`[^`]+`|'[^']+')"
-            r"(?:\.(?:`[^`]+`|'[^']+')){0,2})",
-            error_msg,
-        )
-        if tbl_match:
-            missing = tbl_match.group(1)
-            return (
-                f"Source table or view not found: {missing}.\n"
-                f"  Fix: Verify the catalog/schema/table exists and the app service "
-                f"principal has SELECT on it."
-            )
-
-        # --- Column-resolution errors ----------------------------------------
-        col_match = re.search(r"name `([^`]+)` cannot be resolved", error_msg)
-        if not col_match:
-            col_match = re.search(
-                r"Column '([^']+)' does not exist", error_msg, re.IGNORECASE
-            )
-        if not col_match:
-            logger.warning(
-                "diagnose_view_error: unrecognized database error format: %s",
-                error_msg,
-            )
-            truncated = error_msg.strip()
-            if len(truncated) > 500:
-                truncated = truncated[:500] + " …"
-            return (
-                "VIEW creation failed with an unrecognized database error.\n"
-                f"  Detail: {truncated}\n"
-                "  Fix: Check source tables, column mappings and warehouse "
-                "permissions. Full traceback is available in the server logs."
-            )
-
-        bad_column = col_match.group(1)
-
-        suggestions_match = re.search(
-            r"Did you mean one of the following\?\s*\[([^\]]+)\]", error_msg
-        )
-        suggested = suggestions_match.group(1).strip() if suggestions_match else ""
-
-        for class_uri, mapping in (entity_mappings or {}).items():
-            local_name = extract_local_name(class_uri)
-            source = (
-                mapping.get("sql_query") or mapping.get("table") or "unknown"
-            ).strip()
-
-            if mapping.get("id_column") == bad_column:
-                return (
-                    f"Column '{bad_column}' not found in source for entity '{local_name}'.\n"
-                    f"  Entity: {local_name} ({class_uri})\n"
-                    f"  Source: {source}\n"
-                    f"  Role: id_column\n"
-                    + (f"  Available columns: {suggested}\n" if suggested else "")
-                    + f"  Fix: Update the ID column mapping for '{local_name}' to use a valid column name."
-                )
-            if mapping.get("label_column") == bad_column:
-                return (
-                    f"Column '{bad_column}' not found in source for entity '{local_name}'.\n"
-                    f"  Entity: {local_name} ({class_uri})\n"
-                    f"  Source: {source}\n"
-                    f"  Role: label_column\n"
-                    + (f"  Available columns: {suggested}\n" if suggested else "")
-                    + f"  Fix: Update the label column mapping for '{local_name}' to use a valid column name."
-                )
-            for pred_uri, pred_info in mapping.get("predicates", {}).items():
-                if pred_info.get("column") == bad_column:
-                    attr_name = extract_local_name(pred_uri)
-                    return (
-                        f"Column '{bad_column}' not found in source for entity '{local_name}'.\n"
-                        f"  Entity: {local_name} ({class_uri})\n"
-                        f"  Source: {source}\n"
-                        f"  Attribute: {attr_name}\n"
-                        + (f"  Available columns: {suggested}\n" if suggested else "")
-                        + f"  Fix: Update the attribute mapping '{attr_name}' for '{local_name}' to use a valid column name."
-                    )
-
-        for rel in relationship_mappings or []:
-            rel_name = rel.get("property", "unknown")
-            source = (rel.get("sql_query") or "unknown").strip()
-            for key in ("source_column", "target_column"):
-                if rel.get(key) == bad_column:
-                    return (
-                        f"Column '{bad_column}' not found in source for relationship '{rel_name}'.\n"
-                        f"  Relationship: {rel_name}\n"
-                        f"  Source: {source}\n"
-                        f"  Role: {key}\n"
-                        + (f"  Available columns: {suggested}\n" if suggested else "")
-                        + f"  Fix: Update the {key} for relationship '{rel_name}' to use a valid column name."
-                    )
-
-        logger.warning(
-            "diagnose_view_error: column '%s' not found in mappings; raw DB message: %s",
-            bad_column,
-            error_msg,
-        )
-        return (
-            f"Column '{bad_column}' not found in any source table.\n"
-            + (f"  Available columns: {suggested}\n" if suggested else "")
-            + "  See server logs for the full database error message."
+        return TwinMapping.diagnose_view_error(
+            error_msg, entity_mappings, relationship_mappings
         )
 
     # ------------------------------------------------------------------
@@ -265,779 +75,94 @@ class DigitalTwin:
     def augment_mappings_from_config(
         entity_mappings, mapping_config, base_uri, ontology_config=None
     ):
-        """Augment R2RML mappings with data from mapping_config to ensure all attributes are included.
-
-        Args:
-            entity_mappings: dict of entity class URIs to mapping info
-            mapping_config: mapping configuration from session
-            base_uri: base URI for the ontology
-            ontology_config: ontology configuration (used to skip excluded classes)
-
-        Returns:
-            dict: Augmented entity mappings
-        """
-        base_uri = DigitalTwin._normalize_base_uri(base_uri)
-
-        if not mapping_config:
-            return entity_mappings
-
-        ontology_config = ontology_config or {}
-        all_dsm = (mapping_config or {}).get(
-            "entities", (mapping_config or {}).get("data_source_mappings", [])
+        return TwinMapping.augment_mappings_from_config(
+            entity_mappings, mapping_config, base_uri, ontology_config
         )
-        excluded_class_uris = {
-            m.get("ontology_class") for m in all_dsm if m.get("excluded")
-        }
-
-        data_source_mappings = mapping_config.get(
-            "entities", mapping_config.get("data_source_mappings", [])
-        )
-
-        for dsm in data_source_mappings:
-            class_uri = dsm.get("ontology_class", "")
-            class_label = dsm.get("ontology_class_label", "")
-            sql_query = dsm.get("sql_query", "").strip()
-            id_column = dsm.get("id_column", "")
-            label_column = dsm.get("label_column", "")
-            attribute_mappings = dsm.get("attribute_mappings", {})
-
-            if not class_uri or not sql_query:
-                continue
-
-            if class_uri in excluded_class_uris:
-                continue
-
-            full_class_uri = (
-                class_uri if class_uri.startswith("http") else f"{base_uri}{class_uri}"
-            )
-
-            sanitized_label = DigitalTwin._safe_class_label(class_label, class_uri)
-
-            if full_class_uri not in entity_mappings:
-                entity_mappings[full_class_uri] = {
-                    "table": None,
-                    "id_column": id_column,
-                    "label_column": label_column,
-                    "uri_template": f"{base_uri}{sanitized_label}/{{"
-                    + id_column
-                    + "}}",
-                    "sql_query": sql_query,
-                    "predicates": {},
-                }
-
-            mapping = entity_mappings[full_class_uri]
-
-            if not mapping.get("sql_query") and sql_query:
-                mapping["sql_query"] = sql_query
-
-            if label_column and not mapping.get("label_column"):
-                mapping["label_column"] = label_column
-
-            if (
-                label_column
-                and "http://www.w3.org/2000/01/rdf-schema#label"
-                not in mapping.get("predicates", {})
-            ):
-                mapping.setdefault("predicates", {})[
-                    "http://www.w3.org/2000/01/rdf-schema#label"
-                ] = {"type": "column", "column": label_column}
-
-            available_cols = DigitalTwin._extract_select_columns(sql_query)
-
-            for attr_name, column_name in attribute_mappings.items():
-                if not column_name:
-                    continue
-                if available_cols and column_name not in available_cols:
-                    logger.warning(
-                        "Entity '%s': skipping attribute '%s' — column '%s' "
-                        "is not in the source output columns %s. "
-                        "Likely aliased away in the SQL query.",
-                        class_label or class_uri,
-                        attr_name,
-                        column_name,
-                        sorted(available_cols),
-                    )
-                    continue
-                pred_uri = f"{base_uri}{attr_name.replace(' ', '_')}"
-                mapping.setdefault("predicates", {})[pred_uri] = {
-                    "type": "column",
-                    "column": column_name,
-                }
-
-        # Final pass: remove ALL predicate columns (including R2RML-sourced)
-        # that reference raw columns not visible through the CTE aliases.
-        for class_uri, mapping in entity_mappings.items():
-            src_sql = (mapping.get("sql_query") or "").strip()
-            avail = DigitalTwin._extract_select_columns(src_sql)
-            if not avail:
-                continue
-
-            local_name = extract_local_name(class_uri)
-            bad_preds = [
-                pred_uri
-                for pred_uri, info in mapping.get("predicates", {}).items()
-                if info.get("type") == "column"
-                and info.get("column")
-                and info["column"] not in avail
-            ]
-            for pred_uri in bad_preds:
-                col = mapping["predicates"][pred_uri]["column"]
-                attr = extract_local_name(pred_uri)
-                logger.warning(
-                    "Entity '%s': removing predicate '%s' — column '%s' "
-                    "is not available in source output columns %s.",
-                    local_name,
-                    attr,
-                    col,
-                    sorted(avail),
-                )
-                del mapping["predicates"][pred_uri]
-
-            all_columns = set()
-            if mapping.get("id_column"):
-                all_columns.add(mapping["id_column"])
-            if mapping.get("label_column"):
-                all_columns.add(mapping["label_column"])
-            for pred_info in mapping.get("predicates", {}).values():
-                if pred_info.get("type") == "column" and pred_info.get("column"):
-                    all_columns.add(pred_info["column"])
-            source = (src_sql or mapping.get("table") or "unknown").strip()
-            logger.info(
-                "Entity '%s' mapped columns: [%s] from source: %s",
-                local_name,
-                ", ".join(sorted(all_columns)),
-                source,
-            )
-
-        return entity_mappings
 
     @staticmethod
     def augment_relationships_from_config(
         relationship_mappings, mapping_config, base_uri, ontology_config=None
     ):
-        """Augment relationship mappings from mapping_config.
-
-        Args:
-            relationship_mappings: list of relationship mappings
-            mapping_config: mapping configuration from session
-            base_uri: base URI for the ontology
-            ontology_config: ontology configuration for fallback class lookup
-
-        Returns:
-            list: Augmented relationship mappings
-        """
-        base_uri = DigitalTwin._normalize_base_uri(base_uri)
-
-        ontology_config = ontology_config or {}
-        if not mapping_config:
-            return relationship_mappings
-
-        all_dsm = (mapping_config or {}).get(
-            "entities", (mapping_config or {}).get("data_source_mappings", [])
+        return TwinMapping.augment_relationships_from_config(
+            relationship_mappings, mapping_config, base_uri, ontology_config
         )
-        excluded_entity_uris = {
-            m.get("ontology_class") for m in all_dsm if m.get("excluded")
-        }
-        excluded_class_names = set()
-        for c in ontology_config.get("classes", []):
-            if c.get("uri") in excluded_entity_uris:
-                excluded_class_names.add(c.get("name") or c.get("localName") or "")
-
-        all_rm = (mapping_config or {}).get(
-            "relationships", (mapping_config or {}).get("relationship_mappings", [])
-        )
-        excluded_prop_uris = {m.get("property") for m in all_rm if m.get("excluded")}
-        for p in ontology_config.get("properties", []):
-            if (
-                p.get("domain") in excluded_class_names
-                or p.get("range") in excluded_class_names
-            ):
-                if p.get("uri"):
-                    excluded_prop_uris.add(p["uri"])
-
-        rel_configs = mapping_config.get(
-            "relationships", mapping_config.get("relationship_mappings", [])
-        )
-        data_source_mappings = mapping_config.get(
-            "entities", mapping_config.get("data_source_mappings", [])
-        )
-
-        entity_lookup = {}
-        for dsm in data_source_mappings:
-            class_uri = dsm.get("ontology_class", "")
-            class_label = dsm.get("ontology_class_label", "")
-            id_column = dsm.get("id_column", "")
-
-            full_uri = (
-                class_uri if class_uri.startswith("http") else f"{base_uri}{class_uri}"
-            )
-
-            sanitized_label = DigitalTwin._safe_class_label(class_label, class_uri)
-            entity_info = {
-                "uri_base": f"{base_uri}{sanitized_label}/",
-                "id_column": id_column,
-            }
-
-            entity_lookup[class_label] = entity_info
-            entity_lookup[class_label.lower()] = entity_info
-            entity_lookup[sanitized_label] = entity_info
-            entity_lookup[class_uri] = entity_info
-            entity_lookup[full_uri] = entity_info
-
-            local_name = extract_local_name(class_uri)
-            if local_name:
-                entity_lookup[local_name] = entity_info
-
-        ontology_property_lookup = {}
-        ontology_classes = ontology_config.get("classes", [])
-        for prop in ontology_config.get("properties", []) or ontology_config.get(
-            "object_properties", []
-        ):
-            prop_uri = prop.get("uri", "")
-            prop_label = prop.get("label", "") or prop.get("name", "")
-            domain = prop.get("domain", "") or prop.get("source", "")
-            range_val = prop.get("range", "") or prop.get("target", "")
-
-            domain_label = ""
-            for cls in ontology_classes:
-                if (
-                    cls.get("uri") == domain
-                    or cls.get("name") == domain
-                    or cls.get("label") == domain
-                ):
-                    domain_label = cls.get("label", "") or cls.get("name", "")
-                    break
-
-            range_label = ""
-            for cls in ontology_classes:
-                if (
-                    cls.get("uri") == range_val
-                    or cls.get("name") == range_val
-                    or cls.get("label") == range_val
-                ):
-                    range_label = cls.get("label", "") or cls.get("name", "")
-                    break
-
-            prop_info = {"domain_label": domain_label, "range_label": range_label}
-
-            if prop_uri:
-                ontology_property_lookup[prop_uri] = prop_info
-            if prop_label:
-                ontology_property_lookup[prop_label] = prop_info
-
-        for rel in rel_configs:
-            sql_query = rel.get("sql_query", "").strip()
-            predicate_uri = rel.get("property", "")
-            predicate_label = rel.get("property_label", "")
-            source_class = rel.get("source_class", "")
-            target_class = rel.get("target_class", "")
-            source_class_label = rel.get("source_class_label", "")
-            target_class_label = rel.get("target_class_label", "")
-            source_column = rel.get("source_id_column", "")
-            target_column = rel.get("target_id_column", "")
-
-            if not sql_query or not source_column or not target_column:
-                continue
-
-            if predicate_uri in excluded_prop_uris:
-                continue
-
-            if predicate_uri and predicate_uri.startswith(("http://", "https://")):
-                if not predicate_uri.startswith(base_uri):
-                    local = extract_local_name(predicate_uri)
-                    predicate_uri = f"{base_uri}{local.replace(' ', '_')}"
-            elif predicate_uri:
-                predicate_uri = f"{base_uri}{predicate_uri.replace(' ', '_')}"
-            elif predicate_label:
-                predicate_uri = f"{base_uri}{predicate_label.replace(' ', '_')}"
-            else:
-                predicate_uri = f"{base_uri}relatesTo"
-
-            rel_domain = rel.get("domain", "")
-            rel_range = rel.get("range", "")
-            direction = rel.get("direction", "forward")
-
-            source_label = source_class_label or extract_local_name(source_class) or ""
-            target_label = target_class_label or extract_local_name(target_class) or ""
-
-            if not source_label:
-                source_label = extract_local_name(
-                    rel_range if direction == "reverse" else rel_domain
-                )
-            if not target_label:
-                target_label = extract_local_name(
-                    rel_domain if direction == "reverse" else rel_range
-                )
-
-            if not source_label or not target_label:
-                prop_info = (
-                    ontology_property_lookup.get(predicate_uri)
-                    or ontology_property_lookup.get(predicate_label)
-                    or {}
-                )
-                if not source_label:
-                    source_label = prop_info.get("domain_label", "")
-                if not target_label:
-                    target_label = prop_info.get("range_label", "")
-
-            source_local = extract_local_name(source_class)
-            source_info = (
-                entity_lookup.get(source_class)
-                or entity_lookup.get(source_label)
-                or entity_lookup.get(source_label.lower() if source_label else "")
-                or entity_lookup.get(
-                    source_label.replace(" ", "_") if source_label else ""
-                )
-                or (entity_lookup.get(source_local) if source_local else None)
-                or (entity_lookup.get(source_local.lower()) if source_local else None)
-                or {
-                    "uri_base": f"{base_uri}{source_label.replace(' ', '_') if source_label else 'Entity'}/",
-                    "id_column": source_column,
-                }
-            )
-
-            target_local = extract_local_name(target_class)
-            target_info = (
-                entity_lookup.get(target_class)
-                or entity_lookup.get(target_label)
-                or entity_lookup.get(target_label.lower() if target_label else "")
-                or entity_lookup.get(
-                    target_label.replace(" ", "_") if target_label else ""
-                )
-                or (entity_lookup.get(target_local) if target_local else None)
-                or (entity_lookup.get(target_local.lower()) if target_local else None)
-                or {
-                    "uri_base": f"{base_uri}{target_label.replace(' ', '_') if target_label else 'Entity'}/",
-                    "id_column": target_column,
-                }
-            )
-
-            subject_template = source_info["uri_base"] + "{" + source_column + "}"
-            object_template = target_info["uri_base"] + "{" + target_column + "}"
-
-            existing_rel = None
-            for r in relationship_mappings:
-                if (
-                    r.get("predicate") == predicate_uri
-                    and r.get("sql_query") == sql_query
-                ):
-                    existing_rel = r
-                    break
-
-            if existing_rel:
-                old_subj = existing_rel.get("subject_template", "")
-                old_obj = existing_rel.get("object_template", "")
-                if (
-                    "/Source/" in old_subj
-                    or "/Target/" in old_subj
-                    or "/Entity/" in old_subj
-                    or "/UnknownEntity/" in old_subj
-                ):
-                    existing_rel["subject_template"] = subject_template
-                if (
-                    "/Source/" in old_obj
-                    or "/Target/" in old_obj
-                    or "/Entity/" in old_obj
-                    or "/UnknownEntity/" in old_obj
-                ):
-                    existing_rel["object_template"] = object_template
-            else:
-                relationship_mappings.append(
-                    {
-                        "predicate": predicate_uri,
-                        "sql_query": sql_query,
-                        "subject_template": subject_template,
-                        "object_template": object_template,
-                        "subject_column": source_column,
-                        "object_column": target_column,
-                    }
-                )
-
-        return relationship_mappings
 
     # ------------------------------------------------------------------
     # Triplestore cache (instance methods -- use self._domain)
     # ------------------------------------------------------------------
 
     def get_ts_cache(self, section: str) -> Optional[dict]:
-        """Read a cached triplestore section (e.g. ``'stats'``, ``'status'``) from the domain.
+        from back.objects.digitaltwin.cache.TwinStoreCache import TwinStoreCache
 
-        Returns ``None`` when the section is missing or the cache is older than
-        :data:`_TS_STATS_CACHE_TTL_SECONDS`.
+        return TwinStoreCache(self._domain).get_ts_cache(section)
 
-        Each section now carries its own ``_ts`` timestamp so that refreshing
-        one section (e.g. ``status``) does not inadvertently extend the TTL of
-        another (e.g. ``dt_existence``), which would cause stale cross-section
-        data to appear fresh and produce contradictory UI badges.
-        """
-        ts = self._domain.triplestore or {}
-        stats = ts.get("stats", {})
-        if not isinstance(stats, dict):
-            return None
-        entry = stats.get(section)
-        if not isinstance(entry, dict):
-            return None
-
-        # Per-section timestamp (preferred).
-        section_ts = entry.get("_ts")
-        if section_ts is not None:
-            if (time.time() - float(section_ts)) > _TS_STATS_CACHE_TTL_SECONDS:
-                return None
-            return {k: v for k, v in entry.items() if k != "_ts"}
-
-        # Fallback: shared timestamp written by older code paths.
-        shared_ts = ts.get("_ts_cache_timestamp")
-        if shared_ts is None:
-            return None
-        if (time.time() - float(shared_ts)) > _TS_STATS_CACHE_TTL_SECONDS:
-            return None
-        return entry
 
     def set_ts_cache(self, section: str, data: dict):
-        """Write a cached triplestore section and persist to session.
+        from back.objects.digitaltwin.cache.TwinStoreCache import TwinStoreCache
 
-        Each section is stored with its own ``_ts`` timestamp so that sections
-        expire independently (prevents stale ``dt_existence`` from surviving a
-        fresh ``status`` write that bumps the shared clock).
-        """
-        ts = self._domain.triplestore
-        if "stats" not in ts:
-            ts["stats"] = {}
-        ts["stats"][section] = {**data, "_ts": time.time()}
-        # Keep the shared key for any legacy readers.
-        ts["_ts_cache_timestamp"] = time.time()
-        self._domain.save()
+        return TwinStoreCache(self._domain).set_ts_cache(section, data)
 
-    async def get_or_fetch_graph_status(self, settings) -> Dict[str, Any]:
-        """Return graph triplestore status from session cache, or fetch live and cache."""
-        cached = self.get_ts_cache("status")
-        if cached:
-            logger.debug("get_or_fetch_graph_status: serving from cache")
-            return cached
-        logger.debug("get_or_fetch_graph_status: cache miss — fetching live")
-        result = await self.fetch_graph_triplestore_status(settings)
-        self.set_ts_cache("status", result)
-        return result
+
+    def clear_ts_cache(self, section: str) -> None:
+        from back.objects.digitaltwin.cache.TwinStoreCache import TwinStoreCache
+
+        return TwinStoreCache(self._domain).clear_ts_cache(section)
+
+
+    async def get_or_fetch_graph_status(
+        self, settings, force_refresh: bool = False
+    ) -> Dict[str, Any]:
+        from back.objects.digitaltwin.cache.TwinStoreCache import TwinStoreCache
+
+        return await TwinStoreCache(self._domain).get_or_fetch_graph_status(settings, force_refresh)
+
 
     async def get_or_fetch_dt_existence(
         self, settings, force_refresh: bool = False
     ) -> Dict[str, Any]:
-        """Return DT artefact existence from session cache, or fetch live and cache.
+        from back.objects.digitaltwin.cache.TwinStoreCache import TwinStoreCache
 
-        ``force_refresh=True`` bypasses the session cache. Pages that must show
-        the *current* state of Lakebase (Build, Cockpit) pass this so a stale
-        ``lakebase_table_exists=False`` poisoned by a transient Postgres
-        timeout does not survive across navigations.
+        return await TwinStoreCache(self._domain).get_or_fetch_dt_existence(settings, force_refresh)
 
-        Unknown results (``lakebase_table_exists is None`` — probe failed) are
-        never cached: caching a transient failure as if it were a confirmed
-        absence is the bug this whole pathway exists to prevent.
-        """
-        if not force_refresh:
-            cached = self.get_ts_cache("dt_existence")
-            if cached:
-                logger.debug("get_or_fetch_dt_existence: serving from cache")
-                return cached
-            logger.debug("get_or_fetch_dt_existence: cache miss — fetching live")
-        else:
-            logger.debug("get_or_fetch_dt_existence: force_refresh — fetching live")
 
-        result = await self.fetch_digital_twin_existence(settings)
-        if result.get("lakebase_table_exists") is not None:
-            self.set_ts_cache("dt_existence", result)
-        else:
-            logger.debug(
-                "get_or_fetch_dt_existence: probe inconclusive (%s) — not caching",
-                result.get("lakebase_check_error") or "unknown",
-            )
-        return result
+    def pending_dt_existence(self, settings) -> Dict[str, Any]:
+        from back.objects.digitaltwin.cache.TwinStoreCache import TwinStoreCache
+
+        return TwinStoreCache(self._domain).pending_dt_existence(settings)
+
 
     # ------------------------------------------------------------------
     # Schedule sync (instance method)
     # ------------------------------------------------------------------
 
     def sync_last_build_from_schedule(self, settings) -> None:
-        """Pull the latest successful scheduled-build timestamp into the session."""
-        domain = self._domain
-        try:
-            folder = domain.domain_folder
-            if not folder:
-                return
-            from back.objects.registry import get_scheduler, RegistryCfg
+        from back.objects.digitaltwin.cache.TwinStoreCache import TwinStoreCache
 
-            scheduler = get_scheduler()
-            if not scheduler._started:
-                return
-            from back.core.helpers import get_databricks_host_and_token
+        return TwinStoreCache(self._domain).sync_last_build_from_schedule(settings)
 
-            host, token = get_databricks_host_and_token(domain, settings)
-            registry_cfg = RegistryCfg.from_domain(domain, settings).as_dict()
-            if not host or not registry_cfg.get("catalog"):
-                return
-            from back.objects.session import global_config_service
-
-            cfg = global_config_service.load(host, token, registry_cfg)
-            schedules = cfg.get("schedules") or {}
-            sched = schedules.get(folder)
-            if not sched:
-                return
-            if sched.get("last_status") != "success":
-                return
-            sched_ts = sched.get("last_run", "")
-            if sched_ts and sched_ts > (domain.last_build or ""):
-                logger.info(
-                    "Syncing last_build from schedule: %s -> %s",
-                    domain.last_build or "(empty)",
-                    sched_ts,
-                )
-                domain.last_build = sched_ts
-                domain.save()
-        except Exception as exc:
-            logger.debug("sync_last_build_from_schedule: %s", exc)
 
     # ------------------------------------------------------------------
-    # Live Digital Twin status (instance methods)
+    # Live Knowledge Graph status (instance methods)
     # ------------------------------------------------------------------
 
     async def fetch_graph_triplestore_status(self, settings) -> Dict[str, Any]:
-        """Live graph backend row count and paths."""
-        from back.core.helpers import (
-            effective_graph_name,
-            effective_view_table,
-            run_blocking,
-        )
-        from back.core.triplestore import get_triplestore
+        from back.objects.digitaltwin.cache.TwinStoreCache import TwinStoreCache
 
-        domain = self._domain
-        try:
-            graph_name = effective_graph_name(domain)
-            view_table = effective_view_table(domain)
-            graph_store = get_triplestore(domain, settings, backend="graph")
-            graph_ok = False
-            graph_count = 0
-            graph_path = None
-            if graph_store:
-                try:
-                    exists = await run_blocking(graph_store.table_exists, graph_name)
-                    if exists:
-                        gs = await run_blocking(graph_store.get_status, graph_name)
-                        graph_count = int(gs.get("count", 0) or 0)
-                        graph_ok = graph_count > 0
-                        graph_path = gs.get("path")
-                except Exception as e:
-                    logger.warning("Graph status check failed: %s", e)
+        return await TwinStoreCache(self._domain).fetch_graph_triplestore_status(settings)
 
-            build_stamp = (domain.triplestore or {}).get("build_last_update")
-            result: Dict[str, Any] = {
-                "success": True,
-                "has_data": graph_ok,
-                "count": graph_count,
-                "view_table": view_table,
-                "graph_name": graph_name,
-            }
-            if build_stamp and graph_ok:
-                result["last_modified"] = build_stamp
-            if graph_path:
-                result["path"] = graph_path
-            if not graph_ok:
-                result["reason"] = (
-                    "Graph does not exist yet" if not graph_count else "Graph is empty"
-                )
-            return result
-        except Exception as e:
-            logger.exception("fetch_graph_triplestore_status failed: %s", e)
-            raise InfrastructureError(
-                "Could not load graph triplestore status.",
-                detail=str(e),
-            ) from e
 
     @staticmethod
     def resolve_graph_engine(domain: Any, settings: Any) -> str:
-        """Return the globally configured graph DB engine.
+        """Return the graph DB engine resolved from the per-domain backend choice.
 
-        Currently always resolves to ``"lakebase"`` — the only registered
-        engine.  Future engines plug in via ``back/core/graphdb/<engine>/``
-        and update :class:`back.core.graphdb.GraphDBFactory`.
+        The selection lives in ``DomainSession.info['graph_backend']`` (Domain
+        → General → Knowledge Graph tab) and maps to a concrete engine
+        (``lakebase`` or ``neo4j``) via
+        :class:`back.core.graphdb.GraphDBFactory`.
         """
-        from back.core.triplestore.TripleStoreFactory import TripleStoreFactory
+        from back.core.graphdb.GraphDBFactory import GraphDBFactory
 
-        raw = TripleStoreFactory._resolve_graph_engine(domain, settings) or "lakebase"
-        return raw if raw == "lakebase" else "lakebase"
-
-    async def fetch_digital_twin_existence(self, settings) -> Dict[str, Any]:
-        """Live checks for SQL view, snapshot table, and graph artefacts.
-
-        Lakebase: Postgres triple table existence/count (no Volume archive).
-        """
-        from back.core.helpers import (
-            effective_graph_name,
-            effective_view_table,
-            run_blocking,
-        )
-        from back.core.triplestore import get_triplestore
-
-        domain = self._domain
-        graph_engine = DigitalTwin.resolve_graph_engine(domain, settings)
-        view_table = effective_view_table(domain)
-        graph_name = effective_graph_name(domain)
-        last_built = domain.last_build or None
-        last_update = domain.last_update or None
-
-        result: Dict[str, Any] = {
-            "view_exists": None,
-            "graph_engine": graph_engine,
-            "graph_has_data": None,
-            "lakebase_table_exists": None,
-            "lakebase_synced_uc_exists": None,
-            "lakebase_check_error": None,
-            "view_table": view_table,
-            "graph_name": graph_name,
-            "graph_display": "",
-            "last_update": last_update,
-            "last_built": last_built,
-            "view_check_error": None,
-            "triple_count": 0,
-        }
-
-        async def _check_view() -> tuple[Optional[bool], Optional[str]]:
-            if not view_table:
-                return None, "No view name resolved (domain.delta.catalog/schema/name missing)"
-            if "." not in view_table:
-                return None, f"Resolved view name is not fully qualified: {view_table}"
-            try:
-                view_store = get_triplestore(domain, settings, backend="view")
-                if not view_store:
-                    return None, (
-                        "No SQL warehouse available "
-                        "(set domain.databricks.sql_warehouse_id or settings.databricks_warehouse_id)"
-                    )
-                exists = await run_blocking(view_store.table_exists, view_table)
-                logger.info(
-                    "DT existence: VIEW %s -> exists=%s", view_table, exists
-                )
-                return exists, None
-            except Exception as e:
-                logger.warning(
-                    "DT existence: VIEW %s check failed: %s", view_table, e
-                )
-                return None, f"View check failed: {e}"
-
-        view_ok, view_err = await _check_view()
-
-        result["view_exists"] = view_ok
-        result["view_check_error"] = view_err
-
-        exists_tbl: Optional[bool] = None
-        cnt = 0
-        display = ""
-        lk_database = ""
-        lk_schema = ""
-        lk_table = ""
-        lk_sync_mode = "app_managed"
-        lk_synced_uc = ""
-        lk_check_error: Optional[str] = None
-
-        # --- Resolve config without needing a Postgres connection ---
-        try:
-            from back.core.triplestore import TripleStoreFactory
-            from back.core.graphdb.lakebase.LakebaseFlatStore import (
-                resolve_sync_uc_fallback_catalog,
-                resolve_lakebase_graph_schema,
-            )
-            from back.core.graphdb.lakebase._companion_ddl import synced_phy
-
-            engine_config = TripleStoreFactory._resolve_graph_engine_config(
-                domain, settings
-            ) or {}
-            lk_sync_mode = str(engine_config.get("sync_mode") or "app_managed").strip() or "app_managed"
-
-            # Populate schema/table from config so the card shows values even without Postgres
-            schema_raw = str(engine_config.get("schema") or "").strip()
-            lk_schema = resolve_lakebase_graph_schema(domain, settings, schema_raw)
-            if graph_name:
-                from back.core.graphdb.lakebase.LakebaseBase import LakebaseBase
-                lk_table = LakebaseBase.physical_table_id(graph_name)
-
-            # Compute UC sync FQN (managed_synced only)
-            if lk_sync_mode == "managed_synced":
-                catalog = str(engine_config.get("sync_uc_catalog") or "").strip()
-                if not catalog:
-                    catalog = resolve_sync_uc_fallback_catalog(domain, settings)
-                uc_schema = lk_schema  # always equals the graph schema
-                if catalog and uc_schema:
-                    lk_synced_uc = f"{catalog}.{uc_schema}.{synced_phy(graph_name)}"
-        except Exception as e:
-            logger.warning("DT existence: lakebase config resolution failed: %s", e)
-
-        # --- Live Postgres check (optional — enriches display, may be unavailable) ---
-        try:
-            graph_store = get_triplestore(domain, settings, backend="graph")
-            if graph_store:
-                lk_schema_live = getattr(graph_store, "graph_schema", "") or ""
-                tbl_fn = getattr(graph_store, "physical_table_id", None)
-                lk_table_live = tbl_fn(graph_name) if callable(tbl_fn) else ""
-                db_fn = getattr(graph_store, "_effective_database_display", None)
-                lk_database = db_fn() if callable(db_fn) else ""
-                if lk_schema_live:
-                    lk_schema = lk_schema_live
-                if lk_table_live:
-                    lk_table = lk_table_live
-                if getattr(graph_store, "is_synced", False) and not lk_synced_uc:
-                    try:
-                        fallback_cat = resolve_sync_uc_fallback_catalog(domain, settings)
-                        lk_synced_uc = graph_store.synced_uc_name(
-                            graph_name, fallback_catalog=fallback_cat
-                        )
-                    except Exception:
-                        pass
-                exists_tbl = await run_blocking(graph_store.table_exists, graph_name)
-                if exists_tbl:
-                    gs = await run_blocking(graph_store.get_status, graph_name)
-                    cnt = int(gs.get("count", 0) or 0)
-                    dbpart = str(gs.get("database") or "").strip()
-                    schpart = str(gs.get("schema") or "").strip()
-                    if dbpart:
-                        lk_database = dbpart
-                    if schpart:
-                        lk_schema = schpart
-                    parts = [p for p in (dbpart, schpart, lk_table) if p]
-                    display = " · ".join(parts) if parts else lk_table
-        except Exception as e:
-            logger.warning("DT existence: lakebase graph check failed: %s", e)
-            lk_check_error = str(e)
-        result["triple_count"] = cnt
-        # Preserve the tri-state: True=present, False=absent, None=unknown
-        # (probe failed/timed out). Caller must NOT cache unknown results.
-        if exists_tbl is None:
-            result["graph_has_data"] = None
-        else:
-            result["graph_has_data"] = bool(exists_tbl and cnt > 0)
-        result["lakebase_table_exists"] = exists_tbl
-        result["lakebase_check_error"] = lk_check_error
-        result["graph_display"] = display or ""
-        result["lakebase_database"] = lk_database
-        result["lakebase_schema"] = lk_schema
-        result["lakebase_table"] = lk_table
-        result["lakebase_sync_mode"] = lk_sync_mode
-        result["lakebase_synced_uc"] = lk_synced_uc
-
-        # Check whether the UC synced table actually exists in Unity Catalog
-        if lk_synced_uc:
-            try:
-                view_store_uc = get_triplestore(domain, settings, backend="view")
-                if view_store_uc:
-                    uc_exists = await run_blocking(view_store_uc.table_exists, lk_synced_uc)
-                    result["lakebase_synced_uc_exists"] = uc_exists
-                    logger.info(
-                        "DT existence: synced UC table %s -> exists=%s",
-                        lk_synced_uc, uc_exists,
-                    )
-            except Exception as e:
-                logger.warning(
-                    "DT existence: synced UC table %s check failed: %s", lk_synced_uc, e
-                )
-
-        return result
+        return GraphDBFactory._resolve_graph_engine(domain, settings) or "lakebase"
 
     # ------------------------------------------------------------------
     # SPARQL execution pipeline (instance method)
@@ -1050,175 +175,26 @@ class DigitalTwin:
         limit: int,
         settings,
     ) -> Dict[str, Any]:
-        """Execute a SPARQL query on Databricks using R2RML mapping."""
-        from shared.config.constants import DEFAULT_BASE_URI
-        from back.core.w3c import sparql
-        from back.core.helpers import get_databricks_client, run_blocking
-
-        domain = self._domain
-        try:
-            client = get_databricks_client(domain, settings)
-
-            if not client:
-                raise ValidationError(
-                    "Databricks is not configured. Please configure your Databricks connection in Settings."
-                )
-
-            if not client.warehouse_id:
-                raise ValidationError(
-                    "No SQL warehouse configured. Please configure your Databricks connection in Settings."
-                )
-
-            if not client.host or not client.warehouse_id:
-                missing = []
-                if not client.host:
-                    missing.append("host")
-                if not client.warehouse_id:
-                    missing.append("warehouse_id")
-                raise ValidationError(
-                    f'Databricks configuration incomplete. Missing: {", ".join(missing)}.'
-                )
-
-            if not client.has_valid_auth():
-                raise ValidationError("Databricks authentication not configured.")
-
-            entity_mappings, relationship_mappings = sparql.extract_r2rml_mappings(
-                r2rml_content
-            )
-            base_uri = domain.ontology.get("base_uri", DEFAULT_BASE_URI)
-
-            entity_mappings = DigitalTwin.augment_mappings_from_config(
-                entity_mappings, domain.assignment, base_uri, domain.ontology
-            )
-            relationship_mappings = DigitalTwin.augment_relationships_from_config(
-                relationship_mappings, domain.assignment, base_uri, domain.ontology
-            )
-
-            if not entity_mappings and not relationship_mappings:
-                raise ValidationError("No valid R2RML TriplesMap found.")
-
-            result = sparql.translate_sparql_to_spark(
-                sparql_query, entity_mappings, limit, relationship_mappings
-            )
-            if not result.get("success"):
-                raise ValidationError(
-                    result.get("message") or "SPARQL translation failed."
-                )
-
-            spark_sql = result["sql"]
-            select_vars = result["variables"]
-
-            try:
-                results = await run_blocking(client.execute_query, spark_sql)
-            except Exception as e:
-                logger.exception("Databricks query execution failed: %s", e)
-                error_msg = str(e)
-                if "NoneType" in error_msg or "request" in error_msg:
-                    raise InfrastructureError(
-                        "Databricks connection failed. Please verify your configuration.",
-                        detail=error_msg,
-                    ) from e
-                raise InfrastructureError(
-                    "Spark SQL execution failed.",
-                    detail=error_msg,
-                ) from e
-
-            if results:
-                columns = select_vars if select_vars else list(results[0].keys())
-                return {
-                    "success": True,
-                    "results": results,
-                    "columns": columns,
-                    "count": len(results),
-                    "engine": "spark",
-                    "generated_sql": spark_sql,
-                    "tables_queried": list(
-                        set(
-                            m.get("table", "")
-                            for m in entity_mappings.values()
-                            if m.get("table")
-                        )
-                    ),
-                }
-            else:
-                return {
-                    "success": True,
-                    "results": [],
-                    "columns": select_vars,
-                    "count": 0,
-                    "engine": "spark",
-                    "generated_sql": spark_sql,
-                }
-
-        except ValidationError:
-            raise
-        except InfrastructureError:
-            raise
-        except ValueError as e:
-            logger.exception("Spark query ValueError: %s", e)
-            raise ValidationError(
-                "The query or mapping configuration is invalid.",
-                detail=str(e),
-            ) from e
-        except Exception as e:
-            logger.exception("Spark query error: %s", e)
-            raise InfrastructureError(
-                "An unexpected error occurred while running the Spark query.",
-                detail=str(e),
-            ) from e
+        return await TwinMapping(self._domain).execute_spark_query(
+            sparql_query, r2rml_content, limit, settings
+        )
 
     # ------------------------------------------------------------------
     # Triplestore stats (instance method)
     # ------------------------------------------------------------------
 
     def classify_predicates(self, top_predicates: list) -> list:
-        """Classify predicates into 'attribute' or 'relationship' kinds."""
-        domain = self._domain
-        attr_predicates = {
-            RDF_TYPE,
-            RDFS_LABEL,
-            "http://www.w3.org/2000/01/rdf-schema#comment",
-            "http://www.w3.org/2000/01/rdf-schema#seeAlso",
-        }
-        rel_predicates = {"http://www.w3.org/2002/07/owl#sameAs"}
+        from back.objects.digitaltwin.quality.SqlQualityChecks import SqlQualityChecks
 
-        obj_prop_uris = set()
-        data_prop_uris = set()
-        for p in domain.get_properties():
-            p_uri = p.get("uri", "")
-            if p.get("type") == "ObjectProperty":
-                obj_prop_uris.add(p_uri)
-            else:
-                data_prop_uris.add(p_uri)
+        return SqlQualityChecks(self._domain).classify_predicates(top_predicates)
 
-        classified = []
-        for r in top_predicates:
-            uri = r["predicate"]
-            cnt = int(r["cnt"])
-            if uri in attr_predicates or uri in data_prop_uris:
-                kind = "attribute"
-            elif uri in rel_predicates or uri in obj_prop_uris:
-                kind = "relationship"
-            else:
-                kind = "relationship"
-            classified.append({"uri": uri, "count": cnt, "kind": kind})
-        return classified
 
     # ------------------------------------------------------------------
     # Backend label (instance method)
     # ------------------------------------------------------------------
 
     def effective_backend_label(self) -> str:
-        """Derive a human-readable backend label from the domain configuration."""
-        domain = self._domain
-        ts = getattr(domain, "triplestore", None) or {}
-        backend = ts.get("backend", "")
-        if backend:
-            return backend
-        delta = getattr(domain, "delta", None) or {}
-        if delta.get("catalog"):
-            return "Delta (SQL Warehouse)"
-        return "Lakebase"
+        return TwinResolve(self._domain).effective_backend_label()
 
     # ------------------------------------------------------------------
     # Data quality: private helpers (static)
@@ -1228,193 +204,40 @@ class DigitalTwin:
     def _count_class_population_sql(
         store, table: str, class_uri: str, cache: dict = None
     ) -> Optional[int]:
-        """Count distinct subjects of a given rdf:type class in the triple store."""
-        if not class_uri:
-            return None
-        if cache is None:
-            cache = {}
-        key = (table, class_uri)
-        if key in cache:
-            return cache[key]
-        try:
-            sql = (
-                f"SELECT COUNT(DISTINCT subject) AS cnt FROM {table} "
-                f"WHERE predicate = '{RDF_TYPE}' AND object = '{escape_sql_value(class_uri)}'"
-            )
-            rows = store.execute_query(sql) or []
-            total = int(rows[0]["cnt"]) if rows else 0
-            cache[key] = total
-            return total
-        except Exception:
-            return None
+        from back.objects.digitaltwin.quality.SqlQualityChecks import SqlQualityChecks
+
+        return SqlQualityChecks._count_class_population_sql(store, table, class_uri, cache)
+
 
     @staticmethod
     def _enrich_with_population(result: dict, total_population: Optional[int]) -> dict:
-        """Add total_population and pass_pct to a check result dict.
+        from back.objects.digitaltwin.quality.SqlQualityChecks import SqlQualityChecks
 
-        Uses ``violation_total`` (the true, uncapped count) when present,
-        falling back to ``len(violations)`` only when the full result set
-        was returned without truncation.
-        """
-        if total_population is not None and total_population > 0:
-            vt = result.get("violation_total")
-            violation_count = (
-                vt if vt is not None else len(result.get("violations") or [])
-            )
-            pass_pct = max(
-                0.0,
-                round(
-                    ((total_population - violation_count) / total_population) * 100,
-                    1,
-                ),
-            )
-            if violation_count > 0:
-                pass_pct = min(pass_pct, 99.9)
-            result["total_population"] = total_population
-            result["pass_pct"] = pass_pct
-            if violation_count > 0:
-                result["message"] = (
-                    f"{violation_count} violations found — "
-                    f"{pass_pct}% pass on {total_population} entities"
-                )
-        return result
+        return SqlQualityChecks._enrich_with_population(result, total_population)
+
 
     @staticmethod
-    def _count_violations_sql(store, sql: str) -> Optional[int]:
-        """Run a ``COUNT(*)`` over a violation SQL to get the true total.
+    def _sql_error_detail(exc: Exception) -> str:
+        from back.objects.digitaltwin.quality.SqlQualityChecks import SqlQualityChecks
 
-        Only called when the ``LIMIT``-ed result hit the cap, so the
-        extra round-trip only happens when needed.
-        """
-        try:
-            count_sql = f"SELECT COUNT(*) AS cnt FROM ({sql.rstrip().rstrip(';')})"
-            rows = store.execute_query(count_sql)
-            if rows:
-                return int(rows[0].get("cnt", 0))
-        except Exception as exc:
-            logger.warning("COUNT(*) fallback failed: %s", exc)
-        return None
+        return SqlQualityChecks._sql_error_detail(exc)
+
 
     @staticmethod
-    def _apply_sql_violation_limit(store, sql: str, violation_limit, row_mapper=None):
-        """Execute a violation SQL with optional LIMIT, count the true total, and truncate.
+    def _failed_check_result(
+        name: str, category: str, check_id, sql: str, exc: Exception
+    ) -> dict:
+        from back.objects.digitaltwin.quality.SqlQualityChecks import SqlQualityChecks
 
-        Returns ``(violations, violation_total, status, message)`` or raises
-        on unrecoverable query errors.
+        return SqlQualityChecks._failed_check_result(name, category, check_id, sql, exc)
 
-        *row_mapper* converts raw rows to violation dicts.  Defaults to
-        identity (pass rows through unchanged).
-        """
-        unlimited_sql = sql
-        if violation_limit is not None:
-            sql = sql.rstrip().rstrip(";") + f" LIMIT {violation_limit + 1}"
-        rows = store.execute_query(sql) or []
-        violations = [row_mapper(r) for r in rows] if row_mapper else list(rows)
-        violation_total = len(violations)
-        if violation_limit is not None and violation_total > violation_limit:
-            true_count = DigitalTwin._count_violations_sql(store, unlimited_sql)
-            if true_count is not None:
-                violation_total = true_count
-            violations = violations[:violation_limit]
-        status = "error" if violation_total > 0 else "success"
-        msg = (
-            f"{violation_total} violations found"
-            if violation_total
-            else "No violations"
-        )
-        return violations, violation_total, status, msg
 
     @staticmethod
-    def _load_predicates_from_table(store, table: str) -> set:
-        """Query distinct predicates from the triplestore table for URI resolution."""
-        try:
-            rows = store.execute_query(f"SELECT DISTINCT predicate FROM {table}") or []
-            preds = {r.get("predicate", "") for r in rows if r.get("predicate")}
-            logger.info("Loaded %d distinct predicates from %s", len(preds), table)
-            return preds
-        except Exception as exc:
-            logger.warning("Could not load predicates from %s: %s", table, exc)
-            return set()
+    def _rule_check_id(prefix: str, rule: dict, index: int) -> str:
+        from back.objects.digitaltwin.quality.SqlQualityChecks import SqlQualityChecks
 
-    @staticmethod
-    def _resolve_shape_uri_for_sql(shape: dict, available_predicates: set) -> dict:
-        """Return a shallow copy of *shape* with property_uri resolved against *available_predicates*."""
-        from back.core.w3c import resolve_prop_uri
+        return SqlQualityChecks._rule_check_id(prefix, rule, index)
 
-        prop_uri = shape.get("property_uri", "")
-        if not prop_uri or not available_predicates:
-            return shape
-
-        resolved = resolve_prop_uri(prop_uri, available_predicates)
-        if resolved != prop_uri:
-            shape = {**shape, "property_uri": resolved}
-            logger.info(
-                "SQL DQ: resolved property_uri '%s' → '%s' for shape '%s'",
-                prop_uri,
-                resolved,
-                shape.get("label", shape.get("id", "?")),
-            )
-        return shape
-
-    @staticmethod
-    def _count_class_population_graph(
-        triples: list, class_uri: str, cache: dict = None
-    ) -> Optional[int]:
-        """Count distinct subjects of a given rdf:type class from in-memory triples."""
-        if not class_uri:
-            return None
-        if cache is None:
-            cache = {}
-        if class_uri in cache:
-            return cache[class_uri]
-        subjects = set()
-        for t in triples:
-            if isinstance(t, dict):
-                s, p, o = (
-                    t.get("subject", ""),
-                    t.get("predicate", ""),
-                    t.get("object", ""),
-                )
-            else:
-                s, p, o = t
-            if p == RDF_TYPE and o == class_uri:
-                subjects.add(s)
-        total = len(subjects)
-        cache[class_uri] = total
-        return total
-
-    @staticmethod
-    def _swrl_target_class_uri(rule, base_uri, uri_map):
-        """Return the class URI of the SWRL violation subject."""
-        from back.core.reasoning.SWRLParser import SWRLParser
-
-        ante_atoms = SWRLParser.parse_atoms(rule.get("antecedent", ""))
-        cons_atoms = SWRLParser.parse_atoms(rule.get("consequent", ""))
-        class_atoms = [
-            a
-            for a in ante_atoms
-            if a["arity"] == 1 and not a.get("builtin") and not a.get("negated")
-        ]
-        if not class_atoms:
-            return None
-
-        viol_var = SWRLParser.determine_violation_subject(cons_atoms, class_atoms)
-        for ca in class_atoms:
-            if ca["args"][0] == viol_var:
-                return SWRLParser.resolve_uri(ca["name"], base_uri, uri_map)
-        return SWRLParser.resolve_uri(class_atoms[0]["name"], base_uri, uri_map)
-
-    @staticmethod
-    def _swrl_antecedent_population_sql(translator, store, table, params):
-        """Count entities matching the SWRL antecedent (the rule's scope)."""
-        try:
-            count_sql = translator.build_antecedent_count_sql(table, params)
-            if not count_sql:
-                return None
-            rows = store.execute_query(count_sql) or []
-            return int(rows[0]["cnt"]) if rows else None
-        except Exception:
-            return None
 
     # ------------------------------------------------------------------
     # Data quality: SQL checks (static -- runs in background thread)
@@ -1434,924 +257,26 @@ class DigitalTwin:
         decision_tables=None,
         aggregate_rules=None,
         violation_limit=None,
+        parallel=False,
     ):
-        """Execute SHACL shapes, SWRL, decision tables and aggregate rules as SQL against the VIEW backend."""
-        from back.core.w3c import SHACLService
+        from back.objects.digitaltwin.quality.SqlQualityChecks import SqlQualityChecks
 
-        available_predicates = DigitalTwin._load_predicates_from_table(
-            store, triplestore_table
-        )
-
-        pop_cache = {}
-        results = []
-        for idx, shape in enumerate(shapes):
-            label = shape.get("label", shape.get("id", f"Shape {idx + 1}"))
-            cat = shape.get("category", "unknown")
-            progress = int((idx / total) * 100)
-            tm.update_progress(task.id, progress, f"Check {idx + 1}/{total}: {label}")
-
-            resolved_shape = DigitalTwin._resolve_shape_uri_for_sql(
-                shape, available_predicates
-            )
-            sql = SHACLService.shape_to_sql(resolved_shape, triplestore_table)
-            if not sql:
-                results.append(
-                    {
-                        "name": label,
-                        "category": cat,
-                        "shape_id": shape.get("id"),
-                        "status": "info",
-                        "message": "Cannot translate to SQL",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-                continue
-
-            try:
-                violations, violation_total, status, msg = (
-                    DigitalTwin._apply_sql_violation_limit(
-                        store,
-                        sql,
-                        violation_limit,
-                    )
-                )
-                result = {
-                    "name": label,
-                    "category": cat,
-                    "shape_id": shape.get("id"),
-                    "status": status,
-                    "message": msg,
-                    "violations": violations,
-                    "sql": sql,
-                    "violation_total": violation_total,
-                    "severity": shape.get("severity", "sh:Violation"),
-                }
-                class_uri = shape.get("target_class_uri", "")
-                pop = DigitalTwin._count_class_population_sql(
-                    store, triplestore_table, class_uri, pop_cache
-                )
-                DigitalTwin._enrich_with_population(result, pop)
-                results.append(result)
-            except Exception as exc:
-                err = str(exc)
-                if "TABLE_OR_VIEW_NOT_FOUND" in err or "does not exist" in err.lower():
-                    tm.fail_task(
-                        task.id, f"View {triplestore_table} not found. Build first."
-                    )
-                    return
-                logger.exception("SQL DQ check '%s' failed: %s", label, exc)
-                results.append(
-                    {
-                        "name": label,
-                        "category": cat,
-                        "shape_id": shape.get("id"),
-                        "status": "warning",
-                        "message": "Query execution failed for this check.",
-                        "violations": [],
-                        "sql": sql,
-                    }
-                )
-
-        DigitalTwin._run_swrl_sql_checks(
+        return SqlQualityChecks.run_sql_checks(
             tm,
             task,
-            results,
+            shapes,
+            triplestore_table,
+            store,
+            t0,
+            total,
             swrl_rules,
             ontology,
-            triplestore_table,
-            store,
-            total,
-            violation_limit=violation_limit,
-        )
-
-        swrl_count = len(swrl_rules) if swrl_rules else 0
-        dt_count = len(decision_tables) if decision_tables else 0
-        dt_offset = len(shapes) + swrl_count
-        DigitalTwin._run_dt_sql_checks(
-            tm,
-            task,
-            results,
             decision_tables,
-            ontology,
-            triplestore_table,
-            store,
-            total,
-            dt_offset,
-            violation_limit=violation_limit,
-        )
-
-        agg_offset = dt_offset + dt_count
-        DigitalTwin._run_agg_sql_checks(
-            tm,
-            task,
-            results,
             aggregate_rules,
-            ontology,
-            triplestore_table,
-            store,
-            total,
-            agg_offset,
-            violation_limit=violation_limit,
+            violation_limit,
+            parallel=parallel,
         )
 
-        DigitalTwin.complete_dq_task(tm, task, results, time.time() - t0)
-
-    @staticmethod
-    def _run_swrl_sql_checks(
-        tm,
-        task,
-        results,
-        swrl_rules,
-        ontology,
-        triplestore_table,
-        store,
-        total,
-        violation_limit=None,
-    ):
-        if not swrl_rules:
-            return
-        from back.core.reasoning.SWRLSQLTranslator import SWRLSQLTranslator
-        from back.core.reasoning.SWRLEngine import SWRLEngine
-
-        translator = SWRLSQLTranslator()
-        ontology = ontology or {}
-        base_uri = ontology.get("base_uri", "")
-        engine = SWRLEngine(ontology=ontology)
-        uri_map = engine._build_uri_map()
-        shape_count = total - len(swrl_rules)
-        for idx, rule in enumerate(swrl_rules):
-            if not rule.get("enabled", True):
-                continue
-            label = rule.get("name", f"SWRL Rule {idx + 1}")
-            progress = int(((shape_count + idx) / total) * 100)
-            tm.update_progress(
-                task.id, progress, f"SWRL {idx + 1}/{len(swrl_rules)}: {label}"
-            )
-            params = {
-                "antecedent": rule.get("antecedent", ""),
-                "consequent": rule.get("consequent", ""),
-                "base_uri": base_uri,
-                "uri_map": uri_map,
-            }
-            sql = translator.build_violation_sql(triplestore_table, params)
-            if not sql:
-                results.append(
-                    {
-                        "name": label,
-                        "category": "structural",
-                        "shape_id": f"swrl:{rule.get('name', idx)}",
-                        "status": "info",
-                        "message": "Cannot translate to SQL",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-                continue
-            _s_mapper = lambda r: {"s": r.get("s", "")}
-            try:
-                t_rule = time.time()
-                violations, violation_total, status, msg = (
-                    DigitalTwin._apply_sql_violation_limit(
-                        store,
-                        sql,
-                        violation_limit,
-                        row_mapper=_s_mapper,
-                    )
-                )
-                elapsed_rule = time.time() - t_rule
-                result = {
-                    "name": label,
-                    "category": "structural",
-                    "shape_id": f"swrl:{rule.get('name', idx)}",
-                    "status": status,
-                    "message": msg,
-                    "violations": violations,
-                    "sql": "",
-                    "severity": "sh:Violation",
-                    "violation_total": violation_total,
-                }
-                pop = None
-                if violations:
-                    pop = DigitalTwin._swrl_antecedent_population_sql(
-                        translator, store, triplestore_table, params
-                    )
-                DigitalTwin._enrich_with_population(result, pop)
-                logger.info(
-                    "SWRL rule '%s': %d violations (%.2fs)",
-                    label,
-                    violation_total,
-                    elapsed_rule,
-                )
-                results.append(result)
-            except Exception as exc:
-                logger.exception("SWRL DQ check '%s' SQL failed: %s", label, exc)
-                results.append(
-                    {
-                        "name": label,
-                        "category": "structural",
-                        "shape_id": f"swrl:{rule.get('name', idx)}",
-                        "status": "warning",
-                        "message": "Query execution failed for this rule.",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-
-    @staticmethod
-    def _run_dt_sql_checks(
-        tm,
-        task,
-        results,
-        decision_tables,
-        ontology,
-        triplestore_table,
-        store,
-        total,
-        shape_count,
-        violation_limit=None,
-    ):
-        if not decision_tables:
-            return
-        from back.core.reasoning.DecisionTableEngine import DecisionTableEngine
-
-        engine = DecisionTableEngine()
-        ontology = ontology or {}
-        base_uri = ontology.get("base_uri", "")
-        uri_map = engine._build_uri_map(ontology)
-        for idx, dt in enumerate(decision_tables):
-            if not dt.get("enabled", True):
-                continue
-            dt_name = dt.get("name", f"Decision Table {idx + 1}")
-            progress = int(((shape_count + idx) / total) * 100)
-            tm.update_progress(
-                task.id, progress, f"DT {idx + 1}/{len(decision_tables)}: {dt_name}"
-            )
-            resolved = engine._resolve_dt(dt, uri_map, base_uri)
-            sql = engine.build_violation_sql(resolved, triplestore_table, base_uri)
-            if not sql:
-                results.append(
-                    {
-                        "name": dt_name,
-                        "category": "conformance",
-                        "shape_id": f"dt:{dt.get('name', idx)}",
-                        "status": "info",
-                        "message": "Cannot translate to SQL",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-                continue
-            _s_mapper = lambda r: {"s": r.get("s", "")}
-            try:
-                t_rule = time.time()
-                violations, violation_total, status, msg = (
-                    DigitalTwin._apply_sql_violation_limit(
-                        store,
-                        sql,
-                        violation_limit,
-                        row_mapper=_s_mapper,
-                    )
-                )
-                elapsed_rule = time.time() - t_rule
-                result = {
-                    "name": dt_name,
-                    "category": "conformance",
-                    "shape_id": f"dt:{dt.get('name', idx)}",
-                    "status": status,
-                    "message": msg,
-                    "violations": violations,
-                    "sql": sql,
-                    "severity": "sh:Violation",
-                    "violation_total": violation_total,
-                }
-                pop = None
-                if violations:
-                    class_uri = resolved.get("target_class_uri", "")
-                    pop_cache: dict = {}
-                    pop = DigitalTwin._count_class_population_sql(
-                        store, triplestore_table, class_uri, pop_cache
-                    )
-                DigitalTwin._enrich_with_population(result, pop)
-                logger.info(
-                    "DT rule '%s': %d violations (%.2fs)",
-                    dt_name,
-                    violation_total,
-                    elapsed_rule,
-                )
-                results.append(result)
-            except Exception as exc:
-                logger.exception(
-                    "Decision table DQ check '%s' SQL failed: %s", dt_name, exc
-                )
-                results.append(
-                    {
-                        "name": dt_name,
-                        "category": "conformance",
-                        "shape_id": f"dt:{dt.get('name', idx)}",
-                        "status": "warning",
-                        "message": "Query execution failed for this decision table.",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-
-    @staticmethod
-    def _run_agg_sql_checks(
-        tm,
-        task,
-        results,
-        aggregate_rules,
-        ontology,
-        triplestore_table,
-        store,
-        total,
-        shape_count,
-        violation_limit=None,
-    ):
-        if not aggregate_rules:
-            return
-        from back.core.reasoning.AggregateRuleEngine import AggregateRuleEngine
-
-        engine = AggregateRuleEngine()
-        ontology = ontology or {}
-        base_uri = ontology.get("base_uri", "")
-        pop_cache: dict = {}
-        for idx, rule in enumerate(aggregate_rules):
-            if not rule.get("enabled", True):
-                continue
-            agg_name = rule.get("name", f"Aggregate Rule {idx + 1}")
-            progress = int(((shape_count + idx) / total) * 100)
-            tm.update_progress(
-                task.id, progress, f"Agg {idx + 1}/{len(aggregate_rules)}: {agg_name}"
-            )
-            resolved = engine._resolve_rule(dict(rule), ontology)
-            sql = engine.build_sql(resolved, triplestore_table, base_uri)
-            if not sql:
-                results.append(
-                    {
-                        "name": agg_name,
-                        "category": "conformance",
-                        "shape_id": f"agg:{rule.get('name', idx)}",
-                        "status": "info",
-                        "message": "Cannot translate to SQL",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-                continue
-            _agg_mapper = lambda r: {
-                "s": r.get("s", ""),
-                "agg_val": r.get("agg_val", ""),
-            }
-            try:
-                t_rule = time.time()
-                violations, violation_total, status, msg = (
-                    DigitalTwin._apply_sql_violation_limit(
-                        store,
-                        sql,
-                        violation_limit,
-                        row_mapper=_agg_mapper,
-                    )
-                )
-                elapsed_rule = time.time() - t_rule
-                result = {
-                    "name": agg_name,
-                    "category": "conformance",
-                    "shape_id": f"agg:{rule.get('name', idx)}",
-                    "status": status,
-                    "message": msg,
-                    "violations": violations,
-                    "sql": sql,
-                    "severity": "sh:Violation",
-                    "violation_total": violation_total,
-                }
-                pop = None
-                if violations:
-                    class_uri = resolved.get("target_class_uri", "")
-                    pop = DigitalTwin._count_class_population_sql(
-                        store, triplestore_table, class_uri, pop_cache
-                    )
-                DigitalTwin._enrich_with_population(result, pop)
-                logger.info(
-                    "Agg rule '%s': %d violations (%.2fs)",
-                    agg_name,
-                    violation_total,
-                    elapsed_rule,
-                )
-                results.append(result)
-            except Exception as exc:
-                logger.exception(
-                    "Aggregate rule DQ check '%s' SQL failed: %s", agg_name, exc
-                )
-                results.append(
-                    {
-                        "name": agg_name,
-                        "category": "conformance",
-                        "shape_id": f"agg:{rule.get('name', idx)}",
-                        "status": "warning",
-                        "message": "Query execution failed for this aggregate rule.",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-
-    # ------------------------------------------------------------------
-    # Data quality: Graph checks (static -- runs in background thread)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def run_graph_checks(
-        tm,
-        task,
-        shapes,
-        store,
-        graph_name,
-        domain_snap,
-        t0,
-        total,
-        swrl_rules=None,
-        ontology=None,
-        decision_tables=None,
-        aggregate_rules=None,
-        violation_limit=None,
-    ):
-        """Execute SHACL shapes, SWRL, decision tables and aggregate rules against the graph backend."""
-        from back.core.w3c import SHACLService
-
-        tm.update_progress(task.id, 5, "Loading triples from graph...")
-        try:
-            triples = store.query_triples(graph_name)
-        except Exception as exc:
-            err = str(exc)
-            if "does not exist" in err.lower():
-                tm.fail_task(
-                    task.id, f"Graph '{graph_name}' does not exist. Run Build first."
-                )
-            else:
-                logger.exception("Error reading graph '%s': %s", graph_name, exc)
-                tm.fail_task(
-                    task.id,
-                    "Error reading the graph. Run Build again or verify your connection settings.",
-                )
-            return
-        if not triples:
-            tm.fail_task(task.id, f"Graph '{graph_name}' is empty. Run Build first.")
-            return
-        predicates_in_graph = {
-            t.get("predicate", "") for t in triples if t.get("predicate")
-        }
-        logger.info(
-            "Graph DQ: loaded %d triples from '%s' — %d distinct predicates",
-            len(triples),
-            graph_name,
-            len(predicates_in_graph),
-        )
-        logger.debug("Graph predicates: %s", sorted(predicates_in_graph))
-        tm.update_progress(
-            task.id, 15, f"Loaded {len(triples)} triples, evaluating shapes..."
-        )
-        pop_cache = {}
-        results = []
-        for idx, shape in enumerate(shapes):
-            label = shape.get("label", shape.get("id", f"Shape {idx + 1}"))
-            cat = shape.get("category", "unknown")
-            progress = 15 + int((idx / total) * 80)
-            tm.update_progress(task.id, progress, f"Check {idx + 1}/{total}: {label}")
-            logger.info(
-                "DQ shape '%s': type=%s, class_uri='%s', prop_uri='%s', params=%s",
-                label,
-                shape.get("shacl_type", ""),
-                shape.get("target_class_uri", ""),
-                shape.get("property_uri", ""),
-                shape.get("parameters", {}),
-            )
-            try:
-                violations = SHACLService.evaluate_shape_in_memory(shape, triples)
-                violation_total = len(violations)
-                if violation_limit and len(violations) > violation_limit:
-                    violations = violations[:violation_limit]
-                status = "error" if violation_total > 0 else "success"
-                msg = (
-                    f"{violation_total} violations found"
-                    if violation_total
-                    else "No violations"
-                )
-                result = {
-                    "name": label,
-                    "category": cat,
-                    "shape_id": shape.get("id"),
-                    "status": status,
-                    "message": msg,
-                    "violations": violations,
-                    "violation_total": violation_total,
-                    "sql": "",
-                    "severity": shape.get("severity", "sh:Violation"),
-                }
-                class_uri = shape.get("target_class_uri", "")
-                pop = DigitalTwin._count_class_population_graph(
-                    triples, class_uri, pop_cache
-                )
-                logger.info(
-                    "DQ shape '%s': violations=%d (showing %d), population=%s",
-                    label,
-                    violation_total,
-                    len(violations),
-                    pop,
-                )
-                DigitalTwin._enrich_with_population(result, pop)
-                results.append(result)
-            except Exception as exc:
-                logger.exception("Graph DQ check '%s' failed: %s", label, exc)
-                results.append(
-                    {
-                        "name": label,
-                        "category": cat,
-                        "shape_id": shape.get("id"),
-                        "status": "warning",
-                        "message": "Shape evaluation failed.",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-        DigitalTwin._run_swrl_graph_checks(
-            tm,
-            task,
-            results,
-            swrl_rules,
-            ontology,
-            store,
-            graph_name,
-            total,
-            triples,
-            pop_cache,
-            violation_limit=violation_limit,
-        )
-        swrl_count = len(swrl_rules) if swrl_rules else 0
-        dt_count = len(decision_tables) if decision_tables else 0
-        dt_offset = len(shapes) + swrl_count
-        DigitalTwin._run_dt_graph_checks(
-            tm,
-            task,
-            results,
-            decision_tables,
-            ontology,
-            store,
-            graph_name,
-            total,
-            dt_offset,
-            triples,
-            pop_cache,
-            violation_limit=violation_limit,
-        )
-        agg_offset = dt_offset + dt_count
-        DigitalTwin._run_agg_graph_checks(
-            tm,
-            task,
-            results,
-            aggregate_rules,
-            ontology,
-            store,
-            graph_name,
-            total,
-            agg_offset,
-            triples,
-            pop_cache,
-            violation_limit=violation_limit,
-        )
-        DigitalTwin.complete_dq_task(tm, task, results, time.time() - t0)
-
-    @staticmethod
-    def _run_swrl_graph_checks(
-        tm,
-        task,
-        results,
-        swrl_rules,
-        ontology,
-        store,
-        graph_name,
-        total,
-        triples=None,
-        pop_cache=None,
-        violation_limit=None,
-    ):
-        if not swrl_rules:
-            return
-        from back.core.reasoning.SWRLEngine import SWRLEngine
-
-        ontology = ontology or {}
-        engine = SWRLEngine(ontology=ontology)
-        translator = engine._get_translator(store, graph_name)
-        base_uri = ontology.get("base_uri", "")
-        uri_map = engine._build_uri_map()
-        tbl_sql = store.sql_table_reference(graph_name)
-        shape_count = total - len(swrl_rules)
-        if pop_cache is None:
-            pop_cache = {}
-        for idx, rule in enumerate(swrl_rules):
-            if not rule.get("enabled", True):
-                continue
-            label = rule.get("name", f"SWRL Rule {idx + 1}")
-            progress = 15 + int(((shape_count + idx) / total) * 80)
-            tm.update_progress(
-                task.id, progress, f"SWRL {idx + 1}/{len(swrl_rules)}: {label}"
-            )
-            params = {
-                "antecedent": rule.get("antecedent", ""),
-                "consequent": rule.get("consequent", ""),
-                "base_uri": base_uri,
-                "uri_map": uri_map,
-            }
-            query = translator.build_violation_sql(tbl_sql, params)
-            if not query:
-                results.append(
-                    {
-                        "name": label,
-                        "category": "structural",
-                        "shape_id": f"swrl:{rule.get('name', idx)}",
-                        "status": "info",
-                        "message": "Cannot translate to SQL",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-                continue
-            try:
-                t_rule = time.time()
-                raw_rows = store.execute_query(query) or []
-                violations = [{"s": str(r.get("s", ""))} for r in raw_rows]
-                violation_total = len(violations)
-                if violation_limit is not None and violation_total > violation_limit:
-                    violations = violations[:violation_limit]
-                elapsed_rule = time.time() - t_rule
-                status = "error" if violation_total > 0 else "success"
-                msg = (
-                    f"{violation_total} violations found"
-                    if violation_total
-                    else "No violations"
-                )
-                result = {
-                    "name": label,
-                    "category": "structural",
-                    "shape_id": f"swrl:{rule.get('name', idx)}",
-                    "status": status,
-                    "message": msg,
-                    "violations": violations,
-                    "sql": "",
-                    "severity": "sh:Violation",
-                    "violation_total": violation_total,
-                }
-                pop = None
-                if violations:
-                    class_uri = DigitalTwin._swrl_target_class_uri(
-                        rule, base_uri, uri_map
-                    )
-                    if triples is not None and class_uri:
-                        pop = DigitalTwin._count_class_population_graph(
-                            triples, class_uri, pop_cache
-                        )
-                    if pop is not None and pop < violation_total:
-                        pop = None
-                DigitalTwin._enrich_with_population(result, pop)
-                logger.info(
-                    "SWRL rule '%s': %d violations (%.2fs)",
-                    label,
-                    violation_total,
-                    elapsed_rule,
-                )
-                results.append(result)
-            except Exception as exc:
-                logger.exception("SWRL DQ check '%s' graph failed: %s", label, exc)
-                results.append(
-                    {
-                        "name": label,
-                        "category": "structural",
-                        "shape_id": f"swrl:{rule.get('name', idx)}",
-                        "status": "warning",
-                        "message": "Graph query execution failed for this rule.",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-
-    @staticmethod
-    def _run_dt_graph_checks(
-        tm,
-        task,
-        results,
-        decision_tables,
-        ontology,
-        store,
-        graph_name,
-        total,
-        shape_count,
-        triples=None,
-        pop_cache=None,
-        violation_limit=None,
-    ):
-        if not decision_tables:
-            return
-        from back.core.reasoning.DecisionTableEngine import DecisionTableEngine
-
-        engine = DecisionTableEngine()
-        ontology = ontology or {}
-        base_uri = ontology.get("base_uri", "")
-        uri_map = engine._build_uri_map(ontology)
-        tbl_sql = store.sql_table_reference(graph_name)
-        if pop_cache is None:
-            pop_cache = {}
-        for idx, dt in enumerate(decision_tables):
-            if not dt.get("enabled", True):
-                continue
-            dt_name = dt.get("name", f"Decision Table {idx + 1}")
-            progress = 15 + int(((shape_count + idx) / total) * 80)
-            tm.update_progress(
-                task.id, progress, f"DT {idx + 1}/{len(decision_tables)}: {dt_name}"
-            )
-            resolved = engine._resolve_dt(dt, uri_map, base_uri)
-            query = engine.build_violation_sql(resolved, tbl_sql, base_uri)
-            if not query:
-                results.append(
-                    {
-                        "name": dt_name,
-                        "category": "conformance",
-                        "shape_id": f"dt:{dt.get('name', idx)}",
-                        "status": "info",
-                        "message": "Cannot translate to SQL",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-                continue
-            try:
-                t_rule = time.time()
-                raw_rows = store.execute_query(query) or []
-                violations = [{"s": str(r.get("s", ""))} for r in raw_rows]
-                violation_total = len(violations)
-                if violation_limit is not None and violation_total > violation_limit:
-                    violations = violations[:violation_limit]
-                elapsed_rule = time.time() - t_rule
-                status = "error" if violation_total > 0 else "success"
-                msg = (
-                    f"{violation_total} violations found"
-                    if violation_total
-                    else "No violations"
-                )
-                result = {
-                    "name": dt_name,
-                    "category": "conformance",
-                    "shape_id": f"dt:{dt.get('name', idx)}",
-                    "status": status,
-                    "message": msg,
-                    "violations": violations,
-                    "sql": "",
-                    "severity": "sh:Violation",
-                    "violation_total": violation_total,
-                }
-                pop = None
-                if violations:
-                    class_uri = resolved.get("target_class_uri", "")
-                    if triples is not None and class_uri:
-                        pop = DigitalTwin._count_class_population_graph(
-                            triples, class_uri, pop_cache
-                        )
-                    if pop is not None and pop < violation_total:
-                        pop = None
-                DigitalTwin._enrich_with_population(result, pop)
-                logger.info(
-                    "DT rule '%s': %d violations (%.2fs)",
-                    dt_name,
-                    violation_total,
-                    elapsed_rule,
-                )
-                results.append(result)
-            except Exception as exc:
-                logger.exception(
-                    "Decision table DQ check '%s' graph failed: %s", dt_name, exc
-                )
-                results.append(
-                    {
-                        "name": dt_name,
-                        "category": "conformance",
-                        "shape_id": f"dt:{dt.get('name', idx)}",
-                        "status": "warning",
-                        "message": "Graph query execution failed for this decision table.",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-
-    @staticmethod
-    def _run_agg_graph_checks(
-        tm,
-        task,
-        results,
-        aggregate_rules,
-        ontology,
-        store,
-        graph_name,
-        total,
-        shape_count,
-        triples=None,
-        pop_cache=None,
-        violation_limit=None,
-    ):
-        if not aggregate_rules:
-            return
-        from back.core.reasoning.AggregateRuleEngine import AggregateRuleEngine
-
-        engine = AggregateRuleEngine()
-        ontology = ontology or {}
-        base_uri = ontology.get("base_uri", "")
-        tbl_sql = store.sql_table_reference(graph_name)
-        if pop_cache is None:
-            pop_cache = {}
-        for idx, rule in enumerate(aggregate_rules):
-            if not rule.get("enabled", True):
-                continue
-            agg_name = rule.get("name", f"Aggregate Rule {idx + 1}")
-            progress = 15 + int(((shape_count + idx) / total) * 80)
-            tm.update_progress(
-                task.id, progress, f"Agg {idx + 1}/{len(aggregate_rules)}: {agg_name}"
-            )
-            resolved = engine._resolve_rule(dict(rule), ontology)
-            query = engine.build_sql(resolved, tbl_sql, base_uri)
-            if not query:
-                results.append(
-                    {
-                        "name": agg_name,
-                        "category": "conformance",
-                        "shape_id": f"agg:{rule.get('name', idx)}",
-                        "status": "info",
-                        "message": "Cannot translate to SQL",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
-                continue
-            try:
-                t_rule = time.time()
-                raw_rows = store.execute_query(query) or []
-                violations = [
-                    {
-                        "s": str(r.get("s", "")),
-                        "agg_val": str(r.get("agg_val", "")),
-                    }
-                    for r in raw_rows
-                ]
-                violation_total = len(violations)
-                if violation_limit is not None and violation_total > violation_limit:
-                    violations = violations[:violation_limit]
-                elapsed_rule = time.time() - t_rule
-                status = "error" if violation_total > 0 else "success"
-                msg = (
-                    f"{violation_total} violations found"
-                    if violation_total
-                    else "No violations"
-                )
-                result = {
-                    "name": agg_name,
-                    "category": "conformance",
-                    "shape_id": f"agg:{rule.get('name', idx)}",
-                    "status": status,
-                    "message": msg,
-                    "violations": violations,
-                    "sql": "",
-                    "severity": "sh:Violation",
-                    "violation_total": violation_total,
-                }
-                pop = None
-                if violations:
-                    class_uri = resolved.get("target_class_uri", "")
-                    if triples is not None and class_uri:
-                        pop = DigitalTwin._count_class_population_graph(
-                            triples, class_uri, pop_cache
-                        )
-                    if pop is not None and pop < violation_total:
-                        pop = None
-                DigitalTwin._enrich_with_population(result, pop)
-                logger.info(
-                    "Agg rule '%s': %d violations (%.2fs)",
-                    agg_name,
-                    violation_total,
-                    elapsed_rule,
-                )
-                results.append(result)
-            except Exception as exc:
-                logger.exception(
-                    "Aggregate rule DQ check '%s' graph failed: %s", agg_name, exc
-                )
-                results.append(
-                    {
-                        "name": agg_name,
-                        "category": "conformance",
-                        "shape_id": f"agg:{rule.get('name', idx)}",
-                        "status": "warning",
-                        "message": "Graph query execution failed for this aggregate rule.",
-                        "violations": [],
-                        "sql": "",
-                    }
-                )
 
     # ------------------------------------------------------------------
     # Data quality: task completion (static)
@@ -2359,24 +284,7 @@ class DigitalTwin:
 
     @staticmethod
     def complete_dq_task(tm, task, results, duration):
-        """Finalize a data quality task with summary counts."""
-        passed = sum(1 for r in results if r["status"] == "success")
-        failed = sum(1 for r in results if r["status"] == "error")
-        warnings = sum(1 for r in results if r["status"] in ("warning", "info"))
-        tm.complete_task(
-            task.id,
-            result={
-                "results": results,
-                "summary": {
-                    "total": len(results),
-                    "passed": passed,
-                    "failed": failed,
-                    "warnings": warnings,
-                },
-                "duration_seconds": round(duration, 1),
-            },
-            message=f"Data quality checks complete: {passed} passed, {failed} failed, {warnings} warnings",
-        )
+        return TwinBackgroundTasks.complete_dq_task(tm, task, results, duration)
 
     # ------------------------------------------------------------------
     # Background task orchestration (routers stay thin)
@@ -2402,24 +310,7 @@ class DigitalTwin:
         *,
         build_kind: str = "session",
     ) -> None:
-        """Execute Digital Twin build/sync in a worker thread (TaskManager progress).
-
-        ``build_kind``:
-          * ``"session"`` — UI/internal build (diagnostics, progress callbacks,
-            session cache, volume archive, phase timings).
-          * ``"api"`` — external REST build (matches legacy ``digitaltwin.dt_build``).
-
-        All builds are full rebuilds. When the graph engine is ``lakebase`` in
-        ``managed_synced`` mode, the Lakeflow pipeline handles the data-plane
-        refresh and triples never enter this process.
-
-        Implementation lives in :class:`_BuildPipeline` (Replace Method with
-        Method Object); this static method preserves the call shape for both
-        internal callers and the external REST router.
-        """
-        from back.objects.digitaltwin._build_pipeline import _BuildPipeline
-
-        _BuildPipeline(
+        return TwinBackgroundTasks.run_build_task(
             tm,
             task_id,
             domain,
@@ -2436,7 +327,20 @@ class DigitalTwin:
             ontology_config,
             delta_cfg,
             build_kind=build_kind,
-        ).run()
+        )
+
+    @staticmethod
+    def run_adjacency_refresh_task(
+        tm,
+        task_id: str,
+        settings,
+        domain_snap: DomainSnapshot,
+        *,
+        backend: str,
+    ) -> None:
+        return TwinBackgroundTasks.run_adjacency_refresh_task(
+            tm, task_id, settings, domain_snap, backend=backend
+        )
 
     @staticmethod
     def run_data_quality_task(
@@ -2446,7 +350,6 @@ class DigitalTwin:
         domain_snap: DomainSnapshot,
         shapes: list,
         triplestore_table: str,
-        requested_backend: str,
         total: int,
         *,
         swrl_rules=None,
@@ -2457,62 +360,58 @@ class DigitalTwin:
         failure_message: str = "Data quality checks failed",
         use_exception_message_on_failure: bool = False,
     ) -> None:
-        """Run SHACL / SWRL / DT / aggregate checks inside a worker thread."""
-        import time
+        return TwinBackgroundTasks.run_data_quality_task(
+            tm,
+            task_id,
+            settings,
+            domain_snap,
+            shapes,
+            triplestore_table,
+            total,
+            swrl_rules=swrl_rules,
+            ontology_dict=ontology_dict,
+            decision_tables=decision_tables,
+            aggregate_rules=aggregate_rules,
+            violation_limit=violation_limit,
+            failure_message=failure_message,
+            use_exception_message_on_failure=use_exception_message_on_failure,
+        )
 
-        from back.core.triplestore import get_triplestore as _get_ts
+    @staticmethod
+    def run_node_shacl_task(
+        tm,
+        task_id: str,
+        settings,
+        domain_snap: DomainSnapshot,
+        entity_uri: str,
+        triplestore_table: str,
+    ) -> None:
+        return TwinBackgroundTasks.run_node_shacl_task(
+            tm, task_id, settings, domain_snap, entity_uri, triplestore_table
+        )
 
-        task_ref = SimpleNamespace(id=task_id)
-        t0 = time.time()
-        try:
-            backend = requested_backend or "view"
-            tm.start_task(
-                task_id, f"Running {total} data quality checks ({backend})..."
-            )
-
-            store = _get_ts(domain_snap, settings, backend=backend)
-            if not store:
-                tm.fail_task(task_id, f"Could not initialize {backend} backend")
-                return
-
-            if backend == "graph":
-                DigitalTwin.run_graph_checks(
-                    tm,
-                    task_ref,
-                    shapes,
-                    store,
-                    triplestore_table,
-                    domain_snap,
-                    t0,
-                    total,
-                    swrl_rules=swrl_rules,
-                    ontology=ontology_dict,
-                    decision_tables=decision_tables,
-                    aggregate_rules=aggregate_rules,
-                    violation_limit=violation_limit,
-                )
-            else:
-                DigitalTwin.run_sql_checks(
-                    tm,
-                    task_ref,
-                    shapes,
-                    triplestore_table,
-                    store,
-                    t0,
-                    total,
-                    swrl_rules=swrl_rules,
-                    ontology=ontology_dict,
-                    decision_tables=decision_tables,
-                    aggregate_rules=aggregate_rules,
-                    violation_limit=violation_limit,
-                )
-
-        except Exception as exc:
-            logger.exception("Data quality checks failed: %s", exc)
-            if use_exception_message_on_failure:
-                tm.fail_task(task_id, str(exc))
-            else:
-                tm.fail_task(task_id, failure_message)
+    @staticmethod
+    def run_metrics_task(
+        tm,
+        task_id: str,
+        domain,
+        settings,
+        graph_name: str,
+        *,
+        predicate_filter: Optional[List[str]] = None,
+        class_filter: Optional[List[str]] = None,
+        top_n: int = 100,
+    ) -> None:
+        return TwinBackgroundTasks.run_metrics_task(
+            tm,
+            task_id,
+            domain,
+            settings,
+            graph_name,
+            predicate_filter=predicate_filter,
+            class_filter=class_filter,
+            top_n=top_n,
+        )
 
     @staticmethod
     def run_inference_task(
@@ -2524,196 +423,9 @@ class DigitalTwin:
         *,
         build_kind: str = "session",
     ) -> None:
-        """Run ReasoningService phases; ``build_kind`` ``api`` enables append/materialize."""
-        import datetime as _dt
-
-        from back.core.helpers import get_databricks_client, is_uri
-        from back.core.reasoning import ReasoningService
-        from back.core.reasoning.models import ReasoningResult as _RR
-        from back.core.triplestore import get_triplestore
-
-        is_api = build_kind == "api"
-        try:
-            if is_api:
-                logger.info("API inference task %s: starting", task_id)
-            else:
-                logger.info("Reasoning task %s: starting", task_id)
-            tm.start_task(task_id)
-            tm.update_progress(task_id, 10, "Initialising triple store")
-
-            store = get_triplestore(domain_snap, settings, backend="graph")
-            if store is None:
-                if is_api:
-                    logger.info(
-                        "API inference task %s: graph store unavailable, falling back to view",
-                        task_id,
-                    )
-                else:
-                    logger.info(
-                        "Reasoning task %s: graph store unavailable, falling back to view",
-                        task_id,
-                    )
-                store = get_triplestore(domain_snap, settings, backend="view")
-            logger.info(
-                "Reasoning task %s: store=%s",
-                task_id,
-                type(store).__name__ if store else "None",
-            )
-
-            svc = ReasoningService(domain_snap, store)
-            tm.update_progress(task_id, 30, "Running inference phases")
-
-            if is_api:
-                logger.info(
-                    "API inference task %s: phases tbox=%s swrl=%s graph=%s constraints=%s "
-                    "decision_tables=%s sparql_rules=%s aggregate_rules=%s",
-                    task_id,
-                    options.get("tbox"),
-                    options.get("swrl"),
-                    options.get("graph"),
-                    options.get("constraints"),
-                    options.get("decision_tables"),
-                    options.get("sparql_rules"),
-                    options.get("aggregate_rules"),
-                )
-            else:
-                logger.info(
-                    "Reasoning task %s: running phases (tbox=%s, swrl=%s, graph=%s, "
-                    "decision_tables=%s, sparql_rules=%s, aggregate_rules=%s)",
-                    task_id,
-                    options.get("tbox"),
-                    options.get("swrl"),
-                    options.get("graph"),
-                    options.get("decision_tables"),
-                    options.get("sparql_rules"),
-                    options.get("aggregate_rules"),
-                )
-
-            def _swrl_progress(idx: int, total: int, rule_name: str) -> None:
-                pct = 30 + int((idx / max(total, 1)) * 50)
-                tm.update_progress(task_id, pct, f"SWRL {idx + 1}/{total}: {rule_name}")
-
-            result = svc.run_full_reasoning(options, progress_callback=_swrl_progress)
-            if is_api:
-                logger.info(
-                    "API inference task %s: done — %d inferred, %d violations",
-                    task_id,
-                    len(result.inferred_triples),
-                    len(result.violations),
-                )
-            else:
-                logger.info(
-                    "Reasoning task %s: phases done — %d inferred",
-                    task_id,
-                    len(result.inferred_triples),
-                )
-
-            tm.update_progress(task_id, 90, "Finalising")
-
-            result_dict = result.to_dict()
-            if not is_api:
-                result_dict.pop("violations", None)
-            result_dict["last_run"] = _dt.datetime.utcnow().isoformat()
-            result_dict["inferred_count"] = len(result.inferred_triples)
-            if is_api:
-                result_dict["violations_count"] = len(result.violations)
-
-            if is_api and options.get("append_graph") and result.inferred_triples:
-                tm.update_progress(
-                    task_id, 92, "Appending inferred triples to graph..."
-                )
-                try:
-                    graph_store = get_triplestore(
-                        domain_snap, settings, backend="graph"
-                    )
-                    if graph_store is None:
-                        logger.warning(
-                            "API inference %s: cannot append to graph — store unavailable",
-                            task_id,
-                        )
-                        result_dict["append_graph_error"] = "Graph store not available"
-                    else:
-                        append_count = ReasoningService(
-                            domain_snap, graph_store
-                        ).materialize_inferred(
-                            _RR(inferred_triples=result.inferred_triples)
-                        )
-                        result_dict["append_graph_count"] = append_count
-                        logger.info(
-                            "API inference %s: appended %d triples to graph",
-                            task_id,
-                            append_count,
-                        )
-                except Exception as ag_err:
-                    logger.exception(
-                        "API inference %s: append to graph failed: %s", task_id, ag_err
-                    )
-                    result_dict["append_graph_error"] = str(ag_err)
-
-            mat_table = (options.get("materialize_table") or "").strip()
-            if (
-                is_api
-                and options.get("materialize")
-                and mat_table
-                and len(mat_table.split(".")) == 3
-            ):
-                tm.update_progress(task_id, 95, f"Materialising to {mat_table}...")
-
-                triples = [
-                    {"subject": t.subject, "predicate": t.predicate, "object": t.object}
-                    for t in result.inferred_triples
-                    if is_uri(t.subject) and is_uri(t.predicate) and is_uri(t.object)
-                ]
-                if triples:
-                    try:
-                        client = get_databricks_client(domain_snap, settings)
-                        if client is None:
-                            logger.warning(
-                                "API inference %s: cannot materialise — no credentials",
-                                task_id,
-                            )
-                        else:
-                            count = ReasoningService.materialize_to_delta(
-                                client, mat_table, triples
-                            )
-                            result_dict["materialize_count"] = count
-                            result_dict["materialize_table"] = mat_table
-                            logger.info(
-                                "API inference %s: materialised %d triples to %s",
-                                task_id,
-                                count,
-                                mat_table,
-                            )
-                    except Exception as mat_err:
-                        logger.exception(
-                            "API inference %s: materialisation failed: %s",
-                            task_id,
-                            mat_err,
-                        )
-                        result_dict["materialize_error"] = str(mat_err)
-
-            if is_api:
-                msg = (
-                    f"Inference complete: {len(result.inferred_triples)} inferred, "
-                    f"{len(result.violations)} violations"
-                )
-            else:
-                msg = f"Inference complete: {len(result.inferred_triples)} inferred"
-
-            tm.complete_task(task_id, result=result_dict, message=msg)
-            if is_api:
-                logger.info("API inference task %s: completed", task_id)
-            else:
-                logger.info("Reasoning task %s: completed successfully", task_id)
-        except Exception as e:
-            if is_api:
-                logger.exception("API inference task %s failed: %s", task_id, e)
-            else:
-                logger.exception("Reasoning task %s failed: %s", task_id, e)
-            if is_api:
-                tm.fail_task(task_id, str(e))
-            else:
-                tm.fail_task(task_id, "Inference failed")
+        return TwinBackgroundTasks.run_inference_task(
+            tm, task_id, settings, domain_snap, options, build_kind=build_kind
+        )
 
     # ------------------------------------------------------------------
     # Legacy quality SQL builders (static)
@@ -2721,109 +433,7 @@ class DigitalTwin:
 
     @staticmethod
     def build_quality_sql(check_type: str, table: str, params: dict) -> Optional[str]:
-        """Build SQL for a quality check against the triple store table."""
-        if check_type == "cardinality":
-            return DigitalTwin._build_cardinality_sql(table, params)
-        elif check_type == "value":
-            return DigitalTwin._build_value_sql(table, params)
-        elif check_type in (
-            "functional",
-            "inverseFunctional",
-            "symmetric",
-            "asymmetric",
-            "irreflexive",
-        ):
-            return DigitalTwin._build_property_sql(table, check_type, params)
-        elif check_type == "requireLabels":
-            return DigitalTwin._build_require_labels_sql(table, params)
-        elif check_type == "noOrphans":
-            return DigitalTwin._build_no_orphans_sql(table, params)
-        elif check_type == "swrl":
-            return DigitalTwin._build_swrl_sql(table, params)
-        else:
-            return None
-
-    @staticmethod
-    def _build_cardinality_sql(table, params):
-        class_uri = escape_sql_value(params.get("class_uri", ""))
-        property_uri = escape_sql_value(params.get("property_uri", ""))
-        constraint_type = params.get("constraint_type", "")
-        cardinality_value = int(params.get("cardinality_value", 0))
-        if not class_uri or not property_uri:
-            return None
-        if constraint_type == "minCardinality":
-            having = f"HAVING COUNT(t2.object) < {cardinality_value}"
-        elif constraint_type == "maxCardinality":
-            having = f"HAVING COUNT(t2.object) > {cardinality_value}"
-        elif constraint_type == "exactCardinality":
-            having = f"HAVING COUNT(t2.object) != {cardinality_value}"
-        else:
-            return None
-        return f"SELECT t1.subject AS s, COUNT(t2.object) AS count\nFROM {table} t1\nJOIN {table} t2\n  ON t1.subject = t2.subject\n  AND t2.predicate = '{property_uri}'\nWHERE t1.predicate = '{RDF_TYPE}'\n  AND t1.object = '{class_uri}'\nGROUP BY t1.subject\n{having}"
-
-    @staticmethod
-    def _build_value_sql(table, params):
-        class_uri = escape_sql_value(params.get("class_uri", ""))
-        attribute_uri = escape_sql_value(params.get("attribute_uri", ""))
-        value_check_type = params.get("value_check_type", "")
-        check_value = escape_sql_value(params.get("check_value", ""))
-        if not class_uri or not attribute_uri:
-            return None
-        if value_check_type == "notNull":
-            return f"SELECT t1.subject AS s\nFROM {table} t1\nLEFT JOIN {table} t2\n  ON t1.subject = t2.subject\n  AND t2.predicate = '{attribute_uri}'\nWHERE t1.predicate = '{RDF_TYPE}'\n  AND t1.object = '{class_uri}'\n  AND t2.subject IS NULL"
-        filter_clause = ""
-        if value_check_type == "startsWith":
-            filter_clause = f"AND NOT LOWER(t2.object) LIKE LOWER('{check_value}%')"
-        elif value_check_type == "endsWith":
-            filter_clause = f"AND NOT LOWER(t2.object) LIKE LOWER('%{check_value}')"
-        elif value_check_type == "contains":
-            filter_clause = f"AND NOT LOWER(t2.object) LIKE LOWER('%{check_value}%')"
-        elif value_check_type == "equals":
-            filter_clause = f"AND LOWER(t2.object) != LOWER('{check_value}')"
-        elif value_check_type == "notEquals":
-            filter_clause = f"AND LOWER(t2.object) = LOWER('{check_value}')"
-        elif value_check_type == "matches":
-            filter_clause = f"AND NOT t2.object RLIKE '{check_value}'"
-        return f"SELECT t1.subject AS s, t2.object AS val\nFROM {table} t1\nJOIN {table} t2\n  ON t1.subject = t2.subject\n  AND t2.predicate = '{attribute_uri}'\nWHERE t1.predicate = '{RDF_TYPE}'\n  AND t1.object = '{class_uri}'\n  {filter_clause}"
-
-    @staticmethod
-    def _build_property_sql(table, check_type, params):
-        property_uri = escape_sql_value(params.get("property_uri", ""))
-        if not property_uri:
-            return None
-        if check_type == "functional":
-            return f"SELECT subject AS s, COUNT(object) AS count\nFROM {table}\nWHERE predicate = '{property_uri}'\nGROUP BY subject\nHAVING COUNT(object) > 1"
-        elif check_type == "inverseFunctional":
-            return f"SELECT object AS o, COUNT(subject) AS count\nFROM {table}\nWHERE predicate = '{property_uri}'\nGROUP BY object\nHAVING COUNT(subject) > 1"
-        elif check_type == "symmetric":
-            return f"SELECT t1.subject AS s, t1.object AS o\nFROM {table} t1\nLEFT JOIN {table} t2\n  ON t1.subject = t2.object\n  AND t1.object = t2.subject\n  AND t2.predicate = '{property_uri}'\nWHERE t1.predicate = '{property_uri}'\n  AND t2.subject IS NULL"
-        elif check_type == "asymmetric":
-            return f"SELECT t1.subject AS s, t1.object AS o\nFROM {table} t1\nJOIN {table} t2\n  ON t1.subject = t2.object\n  AND t1.object = t2.subject\n  AND t2.predicate = '{property_uri}'\nWHERE t1.predicate = '{property_uri}'"
-        elif check_type == "irreflexive":
-            return f"SELECT subject AS s\nFROM {table}\nWHERE predicate = '{property_uri}'\n  AND subject = object"
-        return None
-
-    @staticmethod
-    def _build_require_labels_sql(table, params):
-        return f"SELECT t1.subject AS s\nFROM {table} t1\nLEFT JOIN {table} t2\n  ON t1.subject = t2.subject\n  AND t2.predicate = '{RDFS_LABEL}'\nWHERE t1.predicate = '{RDF_TYPE}'\n  AND t2.subject IS NULL"
-
-    @staticmethod
-    def _build_no_orphans_sql(table, params):
-        return f"SELECT t1.subject AS s\nFROM {table} t1\nWHERE t1.predicate = '{RDF_TYPE}'\n  AND NOT EXISTS (\n    SELECT 1 FROM {table} t2\n    WHERE t2.subject = t1.subject\n      AND t2.predicate != '{RDF_TYPE}'\n      AND t2.predicate != '{RDFS_LABEL}'\n  )"
-
-    _swrl_sql_translator = None
-
-    @staticmethod
-    def _get_swrl_translator():
-        if DigitalTwin._swrl_sql_translator is None:
-            from back.core.reasoning import SWRLSQLTranslator
-
-            DigitalTwin._swrl_sql_translator = SWRLSQLTranslator()
-        return DigitalTwin._swrl_sql_translator
-
-    @staticmethod
-    def _build_swrl_sql(table, params):
-        return DigitalTwin._get_swrl_translator().build_violation_sql(table, params)
+        return QualitySqlBuilder.build_quality_sql(check_type, table, params)
 
     # ------------------------------------------------------------------
     # Registry / domain resolution (static -- API helpers)
@@ -2837,23 +447,13 @@ class DigitalTwin:
         registry_schema=None,
         registry_volume=None,
     ):
-        """Resolve registry location: explicit query params -> session -> env.
-
-        Always carries ``lakebase_schema`` / ``lakebase_database`` from the
-        session/env so callers that pass the dict straight to
-        ``RegistryCfg.from_dict`` get the correct Lakebase schema rather than
-        the hardcoded ``"ontobricks_registry"`` default.
-        """
-        from back.objects.registry import RegistryCfg
-
-        base = RegistryCfg.from_session(session_mgr, settings)
-        return {
-            "catalog": registry_catalog or base.catalog,
-            "schema": registry_schema or base.schema,
-            "volume": registry_volume or base.volume,
-            "lakebase_schema": base.lakebase_schema,
-            "lakebase_database": base.lakebase_database,
-        }
+        return TwinResolve.resolve_registry(
+            session_mgr,
+            settings,
+            registry_catalog,
+            registry_schema,
+            registry_volume,
+        )
 
     @staticmethod
     def resolve_domain(
@@ -2864,55 +464,23 @@ class DigitalTwin:
         registry_schema=None,
         registry_volume=None,
         domain_version=None,
+        *,
+        read_only=False,
     ):
-        """Return the session to operate on; optionally load from registry by name/version."""
-        from back.objects.registry import RegistryCfg, RegistryService
-
-        domain = get_domain(session_mgr)
-        if not domain_name:
-            return domain
-        reg = DigitalTwin.resolve_registry(
-            session_mgr, settings, registry_catalog, registry_schema, registry_volume
-        )
-        cfg = RegistryCfg.from_dict(reg)
-        if not cfg.is_configured:
-            raise ValidationError(
-                "Registry not configured — cannot resolve domain_name"
-            )
-        svc = RegistryService(cfg, DigitalTwin.uc_from_domain(domain, settings))
-        if domain_version:
-            ok, data, msg = svc.read_version(domain_name, domain_version)
-            if not ok:
-                if "not found" in msg.lower():
-                    raise NotFoundError(msg)
-                raise InfrastructureError(msg)
-            version = domain_version
-        else:
-            ok, data, version, err = svc.load_mcp_domain_data(domain_name)
-            if not ok:
-                if "not found" in err.lower() or "no versions" in err.lower():
-                    raise NotFoundError(err)
-                raise InfrastructureError(err)
-        domain.clear_generated_content()
-        domain.import_from_file(data, version=version)
-        domain.domain_folder = domain_name
-        domain.ensure_generated_content()
-        domain.save()
-        logger.info(
-            "DigitalTwin: loaded domain '%s' version %s from registry",
+        return TwinResolve.resolve_domain(
             domain_name,
-            version,
+            session_mgr,
+            settings,
+            registry_catalog,
+            registry_schema,
+            registry_volume,
+            domain_version,
+            read_only=read_only,
         )
-        return domain
 
     @staticmethod
     def uc_from_domain(domain, settings):
-        """Build a VolumeFileService from domain session credentials."""
-        from back.core.databricks import VolumeFileService
-        from back.core.helpers import get_databricks_host_and_token
-
-        host, token = get_databricks_host_and_token(domain, settings)
-        return VolumeFileService(host=host, token=token)
+        return TwinResolve.uc_from_domain(domain, settings)
 
     # ------------------------------------------------------------------
     # Misc utilities (static)
@@ -2920,61 +488,54 @@ class DigitalTwin:
 
     @staticmethod
     def is_datatype_range(range_val: str) -> bool:
-        """Return True if a property range looks like a datatype (not an object property)."""
-        low = range_val.lower()
-        return any(
-            kw in low
-            for kw in (
-                "xsd:",
-                "string",
-                "integer",
-                "decimal",
-                "date",
-                "boolean",
-                "float",
-                "double",
-                "time",
-                "long",
-                "int",
-                "short",
-                "byte",
-            )
-        )
+        return TwinResolve.is_datatype_range(range_val)
 
     @staticmethod
     def make_snapshot(domain):
-        """Create a lightweight snapshot of domain session state for background threads."""
-        from back.objects.digitaltwin.models import DomainSnapshot
-
-        return DomainSnapshot(domain)
+        return TwinResolve.make_snapshot(domain)
 
     @staticmethod
     def extract_local_id(uri: str) -> str:
-        """Extract the local entity identifier from a URI."""
-        return extract_local_name(uri) or uri
+        return TwinResolve.extract_local_id(uri)
 
     @staticmethod
     def expand_uri_aliases(store, table_name: str, uris: Set[str]) -> Set[str]:
         """Find alternate URI forms for a set of entity URIs."""
-        if not uris:
-            return uris
-        local_ids = {DigitalTwin.extract_local_id(u) for u in uris}
-        local_ids.discard("")
-        if not local_ids:
-            return uris
-        patterns = [f"%/{lid}" for lid in local_ids]
-        expanded = set(uris) | store.find_subjects_by_patterns(table_name, patterns)
-        return expanded
+        from back.objects.digitaltwin.explorer.GraphFind import GraphFind
+
+        return GraphFind.expand_uri_aliases(store, table_name, uris)
+
+    @staticmethod
+    def find_triples_bfs(
+        store: Any,
+        table: str,
+        *,
+        entity_type: Optional[str] = None,
+        search: Optional[str] = None,
+        depth: int = 1,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """Seed + BFS neighbourhood walk used by both find endpoints.
+
+        Returns a normalized payload dict (``seed_count``, ``triples``,
+        pagination fields). An empty match yields ``message`` and empty lists.
+        """
+        from back.objects.digitaltwin.explorer.GraphFind import GraphFind
+
+        return GraphFind.find_triples_bfs(
+            store,
+            table,
+            entity_type=entity_type,
+            search=search,
+            depth=depth,
+            limit=limit,
+            offset=offset,
+        )
 
     @staticmethod
     def is_owlrl_available() -> bool:
-        """Check whether the ``owlrl`` reasoning library is importable."""
-        try:
-            import owlrl as _owlrl  # noqa: F401
-
-            return True
-        except ImportError:
-            return False
+        return TwinResolve.is_owlrl_available()
 
     # ------------------------------------------------------------------
     # Community detection
@@ -2990,37 +551,84 @@ class DigitalTwin:
         class_filter: Optional[List[str]] = None,
         max_triples: int = 500_000,
     ) -> Dict[str, Any]:
-        """Run community detection on the full knowledge graph.
-
-        Delegates to :class:`CommunityDetector` from ``back.core.graph_analysis``.
-        Returns a JSON-serializable dict matching the API contract.
-        """
-        from back.core.graph_analysis import CommunityDetector, ClusterRequest
-
-        request = ClusterRequest(
+        return TwinAnalytics(self._domain).detect_clusters(
+            store,
+            graph_name,
             algorithm=algorithm,
             resolution=resolution,
             predicate_filter=predicate_filter,
             class_filter=class_filter,
             max_triples=max_triples,
         )
-        detector = CommunityDetector(store, graph_name)
-        result = detector.detect(request)
 
-        return {
-            "clusters": [
-                {"id": c.id, "members": c.members, "size": c.size}
-                for c in result.clusters
-            ],
-            "stats": {
-                "node_count": result.stats.node_count,
-                "edge_count": result.stats.edge_count,
-                "cluster_count": result.stats.cluster_count,
-                "modularity": result.stats.modularity,
-                "algorithm": result.stats.algorithm,
-                "elapsed_ms": result.stats.elapsed_ms,
-            },
-        }
+    def compute_graph_metrics(
+        self,
+        graph_name: str,
+        predicate_filter: Optional[List[str]] = None,
+        class_filter: Optional[List[str]] = None,
+        top_n: int = 100,
+        settings: Any = None,
+        on_progress: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        return TwinAnalytics(self._domain).compute_graph_metrics(
+            graph_name,
+            predicate_filter=predicate_filter,
+            class_filter=class_filter,
+            top_n=top_n,
+            settings=settings,
+            on_progress=on_progress,
+        )
+
+    @staticmethod
+    def build_job_metrics(
+        domain: Any,
+        settings: Any,
+        *,
+        source_table: str,
+        graph_name: str,
+        top_n: int = 100,
+    ) -> Any:
+        return TwinAnalytics.build_job_metrics(
+            domain,
+            settings,
+            source_table=source_table,
+            graph_name=graph_name,
+            top_n=top_n,
+        )
+
+    def load_graph_metric_series(
+        self,
+        graph_name: str,
+        metric: str,
+        settings: Any = None,
+    ) -> Dict[str, Any]:
+        return TwinAnalytics(self._domain).load_graph_metric_series(
+            graph_name, metric, settings=settings
+        )
+
+    @staticmethod
+    def analytics_output_table(output_schema: str, domain: Any, graph_name: str) -> str:
+        return TwinAnalytics.analytics_output_table(output_schema, domain, graph_name)
+
+    def interpret_graph_metrics(
+        self,
+        payload: Dict[str, Any],
+        host: str,
+        token: str,
+        endpoint_name: str,
+        base_url: str = "",
+        session_cookies: Optional[Dict[str, str]] = None,
+        session_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        return TwinAnalytics(self._domain).interpret_graph_metrics(
+            payload,
+            host,
+            token,
+            endpoint_name,
+            base_url=base_url,
+            session_cookies=session_cookies,
+            session_headers=session_headers,
+        )
 
     @staticmethod
     def compute_dtwin_indicator(
@@ -3028,79 +636,19 @@ class DigitalTwin:
         ts_status: Dict[str, Any],
         dt_exist: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Derive a three-state Digital Twin indicator from live graph and artefact checks.
-
-        Returns a dict with:
-            indicator: ``'green'`` | ``'orange'`` | ``'red'``
-            title:     tooltip text for the navbar
-            count:     triple count (0 when unknown)
-            pending:   ``True`` when no status has been fetched yet
-        """
-        if not ts_status and not dt_exist:
-            if not domain.last_build:
-                return {
-                    "indicator": "red",
-                    "title": "Digital Twin never built",
-                    "count": 0,
-                    "pending": False,
-                }
-            return {
-                "indicator": "orange",
-                "title": "Digital Twin status not yet checked",
-                "count": 0,
-                "pending": True,
-            }
-
-        graph_loaded = bool(
-            ts_status and ts_status.get("has_data") and ts_status.get("count", 0) > 0
-        )
-        count = (ts_status or {}).get("count", 0)
-
-        view_exists = (dt_exist or {}).get("view_exists")
-
-        if graph_loaded and view_exists is not False:
-            return {
-                "indicator": "green",
-                "title": f"Digital Twin active — {count:,} triples",
-                "count": count,
-                "pending": False,
-            }
-
-        if (
-            not domain.last_build
-            and not graph_loaded
-            and not view_exists
-        ):
-            return {
-                "indicator": "red",
-                "title": "Digital Twin never built",
-                "count": 0,
-                "pending": False,
-            }
-
-        parts = []
-        if view_exists is False:
-            parts.append("view missing")
-        if not graph_loaded:
-            parts.append("graph not loaded")
-        title = (
-            "Digital Twin incomplete — " + ", ".join(parts)
-            if parts
-            else "Digital Twin partially available"
-        )
-        return {"indicator": "orange", "title": title, "count": count, "pending": False}
+        return TwinAnalytics.compute_dtwin_indicator(domain, ts_status, dt_exist)
 
     # ------------------------------------------------------------------
     # Cohort discovery -- thin delegations to CohortService
     # ------------------------------------------------------------------
     #
     # The actual logic lives in
-    # :class:`back.objects.digitaltwin.CohortService.CohortService`
+    # :class:`back.objects.digitaltwin.cohort.CohortService.CohortService`
     # (Extract Class refactor).  These wrappers preserve the public
     # surface that routes and tests have been calling so far.
 
     def _cohort_service(self) -> Any:
-        from back.objects.digitaltwin.CohortService import CohortService
+        from back.objects.digitaltwin.cohort.CohortService import CohortService
 
         return CohortService(self._domain)
 
@@ -3190,17 +738,6 @@ class DigitalTwin:
             class_uri, property_uri, store, graph_name, limit=limit
         )
 
-    def cohort_explain(
-        self,
-        rule_dict: Dict[str, Any],
-        target: str,
-        store: Any,
-        graph_name: str,
-    ) -> Dict[str, Any]:
-        return self._cohort_service().explain(
-            rule_dict, target, store, graph_name
-        )
-
     def cohort_suggest_uc_target(
         self, settings: Any = None, rule_name: str = ""
     ) -> Dict[str, Any]:
@@ -3217,7 +754,7 @@ class DigitalTwin:
         target_dict: Dict[str, Any], client: Any
     ) -> Dict[str, Any]:
         """Run a 3-step read-only permission probe for a UC Delta target."""
-        from back.objects.digitaltwin.CohortService import CohortService
+        from back.objects.digitaltwin.cohort.CohortService import CohortService
 
         return CohortService.probe_uc_write(target_dict, client)
 
@@ -3235,77 +772,18 @@ class DigitalTwin:
         value: str,
         max_preview: int = 500,
     ) -> Dict[str, Any]:
-        """Seed-search phase: return a flat entity list for the filter modal.
+        """Seed-search phase: return a flat entity list for the filter modal."""
+        from back.objects.digitaltwin.explorer.GraphFilter import GraphFilter
 
-        Fetches up to *max_preview* + 1 subjects matching the criteria so the
-        caller can detect capping without an extra count query.
-
-        Returns a dict suitable for spreading into a ``{"success": True, ...}``
-        response.
-        """
-        probe_limit = max_preview + 1
-        try:
-            entity_set = store.find_seed_subjects(
-                graph_name,
-                entity_type=entity_type,
-                field=field,
-                match_type=match_type,
-                value=value,
-                limit=probe_limit,
-            )
-        except (ValidationError, InfrastructureError, NotFoundError):
-            raise
-        except Exception as e:
-            msg = str(e)
-            if "does not exist" in msg.lower():
-                raise NotFoundError(
-                    f"Graph {graph_name} does not exist. Run Build first.",
-                    detail=msg,
-                )
-            raise InfrastructureError("Error querying graph", detail=msg)
-
-        if not entity_set:
-            return {
-                "phase": "preview",
-                "seeds": [],
-                "total": 0,
-                "capped": False,
-                "message": "No entities found matching the filter criteria.",
-            }
-
-        capped = len(entity_set) > max_preview
-        preview_uris = list(entity_set)[:max_preview]
-
-        try:
-            metadata = store.get_entity_metadata(graph_name, preview_uris)
-        except (ValidationError, InfrastructureError, NotFoundError):
-            raise
-        except Exception as e:
-            raise InfrastructureError("Error fetching entity metadata", detail=str(e))
-
-        seeds = [
-            {
-                "uri": m["uri"],
-                "type": uri_local_name(m["type"]) if m["type"] else "Unknown",
-                "type_uri": m["type"],
-                "label": m["label"] or uri_local_name(m["uri"]),
-            }
-            for m in metadata
-        ]
-        seeds.sort(key=lambda s: (s["type"], s["label"]))
-
-        logger.info(
-            "Filter preview – %d seeds returned (total=%d, capped=%s)",
-            len(seeds),
-            len(entity_set),
-            capped,
+        return GraphFilter.preview(
+            store,
+            graph_name,
+            entity_type,
+            field,
+            match_type,
+            value,
+            max_preview=max_preview,
         )
-        return {
-            "phase": "preview",
-            "seeds": seeds,
-            "total": len(entity_set),
-            "capped": capped,
-        }
 
     @staticmethod
     def filter_expand(
@@ -3319,92 +797,17 @@ class DigitalTwin:
         max_triples: int = 100_000,
         max_fetch_seconds: float = 120.0,
     ) -> Dict[str, Any]:
-        """BFS-expand selected URIs and return the induced subgraph triples.
+        """BFS-expand selected URIs and return the induced subgraph triples."""
+        from back.objects.digitaltwin.explorer.GraphFilter import GraphFilter
 
-        Returns a dict suitable for spreading into a ``{"success": True, ...}``
-        response.
-        """
-        entity_set: Set[str] = set(selected_uris)
-        initial_count = len(entity_set)
-        capped = False
-
-        logger.info(
-            "Filter expand – %d selected URIs, depth=%d, max=%d",
-            initial_count,
-            depth,
-            max_entities,
+        return GraphFilter.expand(
+            store,
+            graph_name,
+            selected_uris,
+            include_rels=include_rels,
+            depth=depth,
+            max_entities=max_entities,
+            batch_size=batch_size,
+            max_triples=max_triples,
+            max_fetch_seconds=max_fetch_seconds,
         )
-
-        if include_rels and depth > 0:
-            current_level = set(entity_set)
-            for d in range(depth):
-                if not current_level or len(entity_set) >= max_entities:
-                    break
-                logger.debug(
-                    "Filter expand – level %d (%d entities so far)", d + 1, len(entity_set)
-                )
-                try:
-                    neighbors = store.expand_entity_neighbors(graph_name, current_level)
-                except Exception as e:
-                    logger.warning("Expansion query at level %d failed: %s", d + 1, e)
-                    break
-                new_entities = neighbors - entity_set
-                if not new_entities:
-                    break
-                remaining = max_entities - len(entity_set)
-                if len(new_entities) > remaining:
-                    new_entities = set(list(new_entities)[:remaining])
-                    capped = True
-                entity_set.update(new_entities)
-                if capped:
-                    break
-                current_level = new_entities
-
-        logger.info(
-            "Filter expand – fetching triples for %d entities (%d seed + %d expanded, capped=%s)",
-            len(entity_set),
-            initial_count,
-            len(entity_set) - initial_count,
-            capped,
-        )
-
-        subject_list = list(entity_set)
-        fetch_t0 = time.monotonic()
-        timeout_capped = False
-        results = []
-        try:
-            for i in range(0, len(subject_list), batch_size):
-                if (time.monotonic() - fetch_t0) > max_fetch_seconds:
-                    timeout_capped = True
-                    capped = True
-                    logger.warning(
-                        "Filter expand – capped by time budget after %d/%d entities",
-                        i,
-                        len(subject_list),
-                    )
-                    break
-                batch_rows = store.get_triples_for_subjects(
-                    graph_name, subject_list[i : i + batch_size]
-                )
-                if batch_rows:
-                    results.extend(batch_rows)
-                if len(results) >= max_triples:
-                    results = results[:max_triples]
-                    capped = True
-                    break
-        except (ValidationError, InfrastructureError, NotFoundError):
-            raise
-        except Exception as e:
-            logger.exception("Filter final query failed: %s", e)
-            raise InfrastructureError("Error fetching triples for the filter", detail=str(e))
-
-        return {
-            "phase": "expand",
-            "results": results,
-            "columns": ["subject", "predicate", "object"],
-            "count": len(results),
-            "initial_count": initial_count,
-            "expanded_count": len(entity_set),
-            "capped": capped,
-            "timeout_capped": timeout_capped,
-        }

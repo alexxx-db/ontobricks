@@ -88,6 +88,87 @@
     });
 
     /*
+     * LLM controls start fail-closed until navbar.js resolves the active
+     * domain's saved endpoint. This state is independent of native disabled
+     * ownership: page validation remains free to enable or disable controls.
+     */
+    const llmAriaState = new WeakMap();
+
+    function syncLlmControl(control, configured) {
+        if (!configured && !llmAriaState.has(control)) {
+            llmAriaState.set(control, control.getAttribute('aria-disabled'));
+            control.setAttribute('aria-disabled', 'true');
+            return;
+        }
+        if (configured && llmAriaState.has(control)) {
+            const previous = llmAriaState.get(control);
+            if (previous === null) control.removeAttribute('aria-disabled');
+            else control.setAttribute('aria-disabled', previous);
+            llmAriaState.delete(control);
+        }
+    }
+
+    function updateLlmAvailability(configured) {
+        document.body.classList.toggle('llm-unconfigured', !configured);
+        document.querySelectorAll('[data-requires-llm]').forEach((control) => {
+            syncLlmControl(control, configured);
+        });
+    }
+
+    function blockUnavailableLlmInteraction(event) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        showNotification(
+            'No LLM selected. Select one in Domain → General → AI.',
+            'warning'
+        );
+    }
+
+    function blockUnavailableLlmControl(event) {
+        if (!document.body.classList.contains('llm-unconfigured')) return;
+
+        const target = event.target;
+        if (event.type === 'keydown') {
+            const submitControl = target && target.closest
+                ? target.closest('[data-requires-llm-submit]') : null;
+            if (submitControl && document.body.contains(submitControl)
+                && event.key === 'Enter' && !event.shiftKey) {
+                blockUnavailableLlmInteraction(event);
+                return;
+            }
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+        }
+
+        const control = target && target.closest
+            ? target.closest('[data-requires-llm]') : null;
+        if (!control || !document.body.contains(control)) return;
+
+        blockUnavailableLlmInteraction(event);
+    }
+
+    function observeLlmControls() {
+        const observer = new MutationObserver((mutations) => {
+            const configured = !document.body.classList.contains('llm-unconfigured');
+            mutations.forEach((mutation) => {
+                mutation.addedNodes.forEach((node) => {
+                    if (node.nodeType !== Node.ELEMENT_NODE) return;
+                    if (node.matches('[data-requires-llm]')) {
+                        syncLlmControl(node, configured);
+                    }
+                    node.querySelectorAll('[data-requires-llm]').forEach((control) => {
+                        syncLlmControl(control, configured);
+                    });
+                });
+            });
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    document.addEventListener('click', blockUnavailableLlmControl, true);
+    document.addEventListener('keydown', blockUnavailableLlmControl, true);
+
+    /*
      * Selector matching every interactive design surface (mapping map,
      * ontology map, Business Views OntoViz canvas, …) where right-
      * click menus would trigger writes. We block ``contextmenu`` on
@@ -103,6 +184,10 @@
         if (window._readOnlyContextMenuBlockerInstalled) return;
         window._readOnlyContextMenuBlockerInstalled = true;
         document.addEventListener('contextmenu', function (event) {
+            const readOnlyNow = document.body.classList.contains('read-only-version')
+                || document.body.classList.contains('role-viewer');
+            if (!readOnlyNow) return;
+
             const target = event.target;
             if (target && target.closest
                 && target.closest(READ_ONLY_DESIGN_SURFACE_SELECTOR)) {
@@ -169,7 +254,15 @@
      * resolution and the user can do everything anyway.
      */
     function applyRoleIndicators() {
-        if (!isAppMode) return;
+        // Local-dev mode: there is no real permission resolution and every
+        // caller is treated as admin server-side. The pill is always laid out
+        // (Bootstrap's ``.d-flex`` on ``#roleNavBadgeItem`` wins over the
+        // ``display:none`` base rule), so without this we'd leave the raw
+        // ``ROLE`` placeholder on screen. Render it as ADMIN instead.
+        if (!isAppMode) {
+            showRoleNavBadge('admin');
+            return;
+        }
 
         const role = effectiveRole();
         if (!role) return;
@@ -221,6 +314,10 @@
         setBadgeTooltip(badge, combined);
     }
 
+    function clearRoleNavBadgeAnnotation() {
+        showRoleNavBadge(effectiveRole());
+    }
+
     /*
      * (Re-)bind a Bootstrap tooltip on the role pill. Tooltips are
      * rendered as HTML so we can break the role description and the
@@ -253,8 +350,9 @@
      * ``ontology-shared-panels.js`` / ``ontology-core.js`` only need a
      * single check instead of duplicating the logic per call site:
      *
-     *   - ``window.isActiveVersion === false`` → older inactive
-     *     version, set asynchronously by ``version-check.js``;
+     *   - ``window.isActiveVersion === false`` → the loaded version is
+     *     not editable (not DRAFT), set asynchronously by
+     *     ``version-check.js``;
      *   - domain-role below editor → viewer (or none) on the current
      *     domain. Admins always satisfy domain gates per the backend
      *     ``require(scope='domain')`` fall-back.
@@ -266,21 +364,51 @@
      */
     function canEditOntology() {
         if (window.isActiveVersion === false) return false;
+        // The single-editor lock: another user is editing this DRAFT
+        // version (or our lock was taken over). ``edit-lock.js`` sets
+        // ``window.editLockMode = 'view'`` in that case; it defaults to
+        // ``'edit'`` so this stays permissive until the async check runs.
+        if (window.editLockMode === 'view') return false;
+        // Editing is only allowed while the loaded version is DRAFT.
+        // ``window.versionStatus`` defaults to 'DRAFT' until
+        // ``version-check.js`` resolves it, so this stays permissive
+        // until the async check runs (mirrors ``isActiveVersion``).
+        if (window.versionStatus && window.versionStatus !== 'DRAFT') return false;
         return permissions.hasDomainRole('editor');
+    }
+
+    /*
+     * Graph refreshes rebuild data from the version's frozen design; they do
+     * not edit that design. Builders may therefore refresh IN-REVIEW and
+     * PUBLISHED versions. A live edit lock still blocks the operation because
+     * a DRAFT build first saves the editor's in-session design.
+     */
+    function canRefreshGraph() {
+        if (window.editLockMode === 'view') return false;
+        return permissions.hasDomainRole('builder');
     }
 
     window.OB = window.OB || {};
     window.OB.permissions = permissions;
     window.OB.canEditOntology = canEditOntology;
+    window.OB.canRefreshGraph = canRefreshGraph;
     window.OB.installReadOnlyContextMenuBlocker = installReadOnlyContextMenuBlocker;
     window.OB.showRoleNavBadge = showRoleNavBadge;
     window.OB.annotateRoleNavBadge = annotateRoleNavBadge;
+    window.OB.clearRoleNavBadgeAnnotation = clearRoleNavBadgeAnnotation;
+    window.OB.updateLlmAvailability = updateLlmAvailability;
 
     // ``base.html`` loads this with ``defer`` so <body> is fully parsed
     // by now, but be safe in case the load order changes.
     if (document.body) {
+        updateLlmAvailability(false);
+        observeLlmControls();
         applyRoleIndicators();
     } else {
-        document.addEventListener('DOMContentLoaded', applyRoleIndicators);
+        document.addEventListener('DOMContentLoaded', function () {
+            updateLlmAvailability(false);
+            observeLlmControls();
+            applyRoleIndicators();
+        });
     }
 })();
