@@ -53,3 +53,16 @@ Tests (cluster without network, Python 3.12, pydantic-settings unavailable):
 - tests/units/settings/test_app_yaml_template.py (Settings import stubbed,
   round-trip tests deselected): 14 passed, 6 deselected.
 - Not run: test_help_api.py, MCP tests, full suite (need app dependencies).
+
+artifact build: offline-capable path for pypi-less machines
+  - _vendor_artifact.py: new `prune` (evaluates uv export markers for the
+    fixed Apps env — offline replacement for `uv pip compile`, which needs
+    the index even for fully-pinned input), `download` and `fetch-sdists`
+    (fetch wheels/sdists straight from the URLs+sha256 in uv.lock, for
+    machines where pypi.org is refused but files.pythonhosted.org is not).
+  - build_artifact.sh: pip stays primary; lock-URL path is the fallback.
+  - deploy.sh: executable bit restored (lost in an earlier merge).
+  - DEPLOYMENT_BLOCKERS.md: excluded from the DAB sync payload.
+Tests: `make artifact` built vendor/ (120 pins) + src/mcp-server/vendor/
+  (74 pins) fully from lock URLs on a host with no pypi.org route;
+  `make artifact-check` green; 92 targeted settings/help tests pass.

@@ -128,6 +128,8 @@ sync:
     - /AGENTS.md
     - /CLAUDE.md
     - /SECURITY.md
+    # Ops notes for one workspace's deploy; not part of the app.
+    - /DEPLOYMENT_BLOCKERS.md
     - /CONTRIBUTORS.md
     - src/.coding_rules.md
     # Do NOT exclude src/mcp-server/ — both apps share one workspace files tree;

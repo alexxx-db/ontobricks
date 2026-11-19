@@ -125,7 +125,7 @@ because building them needs PyPI, and nothing in the workspace can reach PyPI.
 | Component | Role |
 | --- | --- |
 | `scripts/build_artifact.sh` | Exports `uv.lock` (main app with `--extra lakebase`), resolves for CPython 3.11 / `x86_64-manylinux_2_28`, downloads wheels with `pip download --only-binary`, builds sdist-only pins (`promise`), splits main-app wheels over 9 MiB into `.whl.partNN` chunks, writes `vendor/requirements.txt` + `lock.sha256`, then checks. `--check` verifies offline; `--force` rebuilds. |
-| `scripts/_internal/_vendor_artifact.py` | `partition` (wheel vs sdist pins), `split`, `check` (every pin has a wheel, every downloaded wheel's sha256 is in `uv.lock`, sdist-built wheels are pure Python, no file over the limit, no chunks for the MCP app). |
+| `scripts/_internal/_vendor_artifact.py` | `prune` (evaluates export markers for the Apps env, replacing `uv pip compile`), `partition` (wheel vs sdist pins), `download` / `fetch-sdists` (fetch from the URLs + sha256 in `uv.lock` when no index is reachable), `split`, `check` (every pin has a wheel, every downloaded wheel's sha256 is in `uv.lock`, sdist-built wheels are pure Python, no file over the limit, no chunks for the MCP app). |
 | `vendor_bootstrap.py` | Main app command. Reassembles chunks, installs `vendor/requirements.txt` with `--no-index --no-deps --target <tmp>/ontobricks-vendor/<lock>/site` (uv first, pip fallback), once per lock per container, then `exec`s `run.py` with that dir first on `PYTHONPATH`. |
 | `requirements.txt` (root) | Installs nothing at Apps build time (chunked wheels cannot go through pip). |
 | `src/mcp-server/requirements.txt` | `--no-index`, `--find-links ./vendor/wheels`, `-r vendor/requirements.txt` — installed by the Apps build, exactly like hello-abacus. |
@@ -351,6 +351,9 @@ inside the workspace.
 | F2 | `TestStartCommandExtras` read `--extra lakebase` from the app command; the new command has none, so `test_lakebase_extra_is_still_requested` would fail in `ci.yml`. | Reading the tests | Test now reads extras from the main-app `build_one` line of `scripts/build_artifact.sh`; new `test_command_installs_offline_then_runs_the_app`. Verified it fails against the old `uv run` command. |
 | F3 | `build_artifact.sh` used an empty bash array / `"$@"` under `set -u`, which errors on macOS's bash 3.2. | Review | `${check_flag:+"$check_flag"}` and `${1+"$@"}`. |
 | F4 | `hello-abacus/` (a separate template project) was being synced into the app's files tree. | Review of sync rules | Added to `sync.exclude` and `.databricksignore`. |
+| F5 | `scripts/deploy.sh` lost its executable bit on the way into the repo (mode 100755 → 100644). | Merge stat | `chmod +x` restored. |
+| F6 | `DEPLOYMENT_BLOCKERS.md` at the repo root syncs into the app files tree (workspace IDs, SP ids). | This document's own §8 note | Added to `sync.exclude` and `.databricksignore`. |
+| F7 | `make artifact` could not run anywhere without a `pypi.org` index — `uv pip compile` fetches the index even for fully-pinned input, and `pip download`/`pip wheel` need it too. A laptop whose egress allows `files.pythonhosted.org` but not `pypi.org` (same split seen on this Mac) could not build. | First laptop build attempt | `_vendor_artifact.py` gained `prune` (evaluates export markers for the fixed Apps env — offline replacement for `uv pip compile`), `download` and `fetch-sdists` (fetch by the URLs + sha256 already in `uv.lock`). `pip` remains the primary path; the lock-URL path is the fallback. Verified 2026-11-17: `make artifact` built 120 + 74 pins and `make artifact-check` passed on a machine with no `pypi.org` route. |
 
 Earlier, already-fixed issues on the predecessor repo (`~/ontobricks`), for
 context:

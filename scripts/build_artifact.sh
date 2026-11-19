@@ -8,9 +8,11 @@
 #   bash scripts/build_artifact.sh --force   # rebuild both
 #   bash scripts/build_artifact.sh --check   # verify only, no network (deploy.sh)
 #
-# Resolving and downloading need PyPI, so build on a machine with internet
-# access (laptop or CI) and deploy from there. Outputs are gitignored and
-# force-synced by databricks.yml:
+# Resolving is offline (markers are evaluated by the helper). Downloading
+# needs files.pythonhosted.org only: when the pypi.org index is refused the
+# wheels are fetched straight from the URLs uv.lock records. Build on a laptop
+# or CI and deploy from there. Outputs are gitignored and force-synced by
+# databricks.yml:
 #
 #   vendor/                  main app. Wheels over 9 MiB are split into
 #                            .partNN chunks (Apps rejects app files over 10 MB);
@@ -79,22 +81,35 @@ build_one() {
     rm -rf -- "$out"
     mkdir -p "$out/wheels"
 
-    # The locked runtime dependencies, resolved for the Apps platform so no
-    # environment marker is left for the container to evaluate.
+    # The locked runtime dependencies, pruned for the Apps platform so no
+    # environment marker is left for the container to evaluate. `uv pip compile`
+    # used to do this, but it contacts PyPI even though every pin is locked, so
+    # the marker evaluation happens in the helper instead (offline).
     uv export --project "$project" --frozen --no-dev --no-emit-project --no-hashes --no-header --no-annotate \
         ${1+"$@"} --output-file "$work/locked.txt" >/dev/null
-    uv pip compile "$work/locked.txt" --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
-        --no-header --no-annotate --quiet --output-file "$work/resolved.txt"
+    py "$HELPER" prune "$work/locked.txt" "$work/resolved.txt"
 
     py "$HELPER" partition "$lock" "$work/resolved.txt" "$work/binary.txt" "$work/sdist.txt"
-    "${PIP[@]}" download --quiet --disable-pip-version-check --no-deps "${PLATFORM_ARGS[@]}" \
-        --dest "$out/wheels" --requirement "$work/binary.txt"
+    # pip download resolves wheel tags via the index. When no index is
+    # reachable (pypi.org refused but files.pythonhosted.org is not), fetch the
+    # wheels straight from the URLs uv.lock already records.
+    if ! "${PIP[@]}" download --quiet --disable-pip-version-check --no-deps "${PLATFORM_ARGS[@]}" \
+        --dest "$out/wheels" --requirement "$work/binary.txt"; then
+        echo "  pip download could not reach an index; downloading wheels straight from uv.lock URLs"
+        rm -f "$out"/wheels/*.whl
+        py "$HELPER" download "$lock" "$work/binary.txt" "$out/wheels"
+    fi
     # Packages published only as an sdist (e.g. promise): build them here. The
     # check below rejects any that are not pure Python.
     : > "$out/sdist-built.txt"
     if [[ -s "$work/sdist.txt" ]]; then
-        "${PIP[@]}" wheel --quiet --disable-pip-version-check --no-deps \
-            --wheel-dir "$out/wheels" --requirement "$work/sdist.txt"
+        if ! "${PIP[@]}" wheel --quiet --disable-pip-version-check --no-deps \
+            --wheel-dir "$out/wheels" --requirement "$work/sdist.txt"; then
+            echo "  pip wheel could not reach an index; wheeling sdists straight from uv.lock URLs"
+            py "$HELPER" fetch-sdists "$lock" "$work/sdist.txt" "$work/sdists"
+            python3 -m pip wheel --quiet --disable-pip-version-check --no-deps --no-build-isolation \
+                --wheel-dir "$out/wheels" "$work"/sdists/*.tar.gz
+        fi
         sed -E 's/[=<>!~;[ ].*//' "$work/sdist.txt" > "$out/sdist-built.txt"
     fi
 

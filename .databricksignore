@@ -111,5 +111,6 @@ changelogs/
 /AGENTS.md
 /CLAUDE.md
 /SECURITY.md
+/DEPLOYMENT_BLOCKERS.md
 /CONTRIBUTORS.md
 releases/
