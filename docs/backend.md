@@ -541,7 +541,7 @@ Full deploy pipeline (called by `make deploy`). On the `dev-lakebase` target it:
 3. Deploys both apps.
 4. Starts the main app.
 5. Bootstraps app self-permissions (`bootstrap-app-permissions.sh`).
-6. Runs `bootstrap-lakebase-perms.sh` for all configured schemas.
+6. Runs `scripts/bootstrap/lakebase-perms.sh` for all configured schemas.
 
 ```bash
 make deploy                    # dev-lakebase target (default)

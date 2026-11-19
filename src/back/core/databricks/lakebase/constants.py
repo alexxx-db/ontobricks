@@ -25,6 +25,10 @@ MAX_BACKOFF_S = 16.0
 POOL_MAX_SIZE = 4
 POOL_MAX_LIFETIME_S = 45 * 60.0  # 45 min
 POOL_ACQUIRE_TIMEOUT_S = 30.0
+# Idle checkout liveness: ``conn.closed`` alone cannot see a silently dead
+# socket, so connections idle longer than this get a ``SELECT 1`` ping on
+# checkout. TCP keepalives (~25 s) bound how long the ping can block.
+POOL_PING_IDLE_S = 30.0
 
 # JWT (Postgres password) lifetime — refresh ~5 min before the 1 h expiry.
 TOKEN_TTL_S = 3300

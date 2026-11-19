@@ -123,7 +123,7 @@ _preflight_check_deploy_files() {
     _preflight_ok "required project files present"
 }
 
-# Read-only checks mirroring bootstrap-lakebase-perms.sh + registry SQL upgrades.
+# Read-only checks mirroring scripts/bootstrap/lakebase-perms.sh + registry SQL upgrades.
 # Sets _PREFLIGHT_FAILED on blocking issues. Warnings are non-fatal (e.g. schema
 # not yet initialised on a first deploy).
 _preflight_check_lakebase_bootstrap() {
@@ -162,7 +162,7 @@ _preflight_check_lakebase_bootstrap() {
     if [[ $rc -ne 0 ]]; then
         _preflight_fail "Lakebase bootstrap preflight failed — see checks above"
         _lakebase_print_diag_hints \
-            "bootstrap-lakebase-perms.sh preflight failed" \
+            "scripts/bootstrap/lakebase-perms.sh preflight failed" \
             "$project" "$branch" "$database" "${LAKEBASE_DATABASE_RESOURCE_SEGMENT:-}" \
             "${CONFIG_FILE:-scripts/deploy.config.sh}"
         return 1

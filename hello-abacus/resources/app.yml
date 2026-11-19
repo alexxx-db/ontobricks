@@ -1,0 +1,35 @@
+resources:
+  apps:
+    web:
+      name: hello-abacus${var.name_suffix}
+      description: React and FastAPI web app backed by Lakebase Postgres
+      source_code_path: ${var.app_source_code_path}
+      config:
+        # The Apps container installs requirements.txt from ./wheels before this runs.
+        command:
+          - python
+          - -m
+          - backend.runtime.server
+        env:
+          - name: ENDPOINT_NAME
+            value_from: database
+      # The union of the slices' feature.yaml manifests; scripts/check_manifests.py checks it.
+      user_api_scopes:
+        - postgres
+      # No group gets CAN_MANAGE: the deployer and the workspace's admins,
+      # workspace_admins_group among them, already hold it.
+      permissions:
+        - group_name: ${var.app_viewers_group}
+          level: CAN_USE
+        - group_name: ${var.implementers_group}
+          level: CAN_USE
+        - group_name: ${var.workspace_admins_group}
+          level: CAN_USE
+        - group_name: ${var.tenant_admins_group}
+          level: CAN_USE
+      resources:
+        - name: database
+          postgres:
+            branch: ${resources.postgres_branches.production.id}
+            database: ${resources.postgres_databases.app.id}
+            permission: CAN_CONNECT_AND_CREATE

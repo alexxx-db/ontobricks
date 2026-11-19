@@ -12,7 +12,7 @@ The canonical deploy steps are in **`README.md §Deploying / Installing`** and
 ## Pre-flight (verify before invoking make)
 
 1. `databricks --version` — CLI present.
-2. `databricks auth describe` — authenticated against the right workspace. If not, use the `databricks-authentication` skill.
+2. `databricks auth describe` — authenticated against the right workspace. If not, follow the auth steps in the `databricks-core` skill (or `databricks-setup-local` for first-time setup).
 3. `git status` — clean tree (or user has acknowledged uncommitted changes).
 4. `uv run --frozen pytest -q -m "not scenario"` — tests pass. **Do not deploy on red.**
    **Never drop `--frozen`**: a bare `uv run` performs an implicit re-resolve
@@ -40,7 +40,7 @@ The canonical deploy steps are in **`README.md §Deploying / Installing`** and
 
 ## Deploy
 
-Canonical target list (matches `documentation/deployment.md` §Makefile targets
+Canonical target list (matches `docs/deployment.md` §Makefile targets
 and the root `Makefile`). There is **no** `deploy-all` / `deploy-mcp` /
 `deploy-prod` target — MCP ships in the same DAB bundle as the main app;
 production uses a distinct `DEFAULT_INSTANCE_ID` + `make deploy`, not a
@@ -48,7 +48,7 @@ separate Make recipe.
 
 | Command | When |
 |---------|------|
-| `make deploy` | default — `scripts/deploy.sh` (target from `deploy.config.sh`, usually `dev-lakebase`); starts the main app |
+| `make deploy` | default — `scripts/deploy.sh` (target from `scripts/deploy.config.sh`, usually `dev-lakebase`); starts the main app |
 | `make deploy-volume` | volume-only target (`-t dev`) — no Lakebase postgres binding |
 | `make deploy-no-run` | deploy artifacts without `bundle run` |
 | `make deploy-dry-run` / `make deploy-check` | read-only preflight (no deploy) |
@@ -72,10 +72,10 @@ README.md). If the user runs `databricks bundle deploy` directly, run
 1. **Compute > Apps > ontobricks > Resources** — confirm `sql-warehouse` and `volume` are bound. If missing, the user must bind them manually (binding cannot be done via DAB).
 2. **Logs** — confirm startup completed cleanly.
 3. If the registry volume is empty, tell the user to open **Settings > Registry > Initialize** in the app UI.
-4. Hit `/healthz` to confirm the FastAPI app is responsive.
+4. Hit `/health` to confirm the FastAPI app is responsive.
 5. **Re-check `app_status.state` about a minute after the deploy reports success.**
    A dependency-download failure surfaces as a crash ~45s *after* "App started
-   successfully", so a single immediate `/healthz` 200 does not prove the deploy
+   successfully", so a single immediate `/health` 200 does not prove the deploy
    is healthy: `databricks apps get <app> --output json`.
 
 ## Release flow
@@ -85,7 +85,8 @@ When the user says "release vX.Y.Z" rather than just "deploy":
 1. `make test`
 2. Bump version in `pyproject.toml`
 3. `git add -A && git commit -m "Release vX.Y.Z" && git tag vX.Y.Z && git push origin main --tags`
-4. `make deploy` (or `make deploy-prod`)
+4. `make deploy` against the production instance (set `DEFAULT_INSTANCE_ID`
+   in `scripts/deploy.config.sh`; there is no `deploy-prod` target)
 5. Update the changelog (`changelog` skill).
 
 ## Don't

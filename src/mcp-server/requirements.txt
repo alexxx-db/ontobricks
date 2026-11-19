@@ -1,1 +1,7 @@
-uv
+# mcp-ontobricks — installed by the Apps build with no package index (the
+# workspace has no PyPI egress). vendor/ holds every locked dependency as a
+# wheel, built by scripts/build_artifact.sh as hello-abacus builds its
+# app_artifact/. Do NOT add `uv` or unpinned packages here.
+--no-index
+--find-links ./vendor/wheels
+-r vendor/requirements.txt

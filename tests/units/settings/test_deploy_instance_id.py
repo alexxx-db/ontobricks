@@ -61,13 +61,24 @@ def _source_config(env: dict | None = None) -> dict[str, str]:
     return out
 
 
+def _committed_instance_id() -> str:
+    """Read DEFAULT_INSTANCE_ID from deploy.config.sh — the tests assert the
+    derivation, not a particular demo workspace's id."""
+    for line in CONFIG.read_text().splitlines():
+        if line.startswith("DEFAULT_INSTANCE_ID="):
+            # DEFAULT_INSTANCE_ID="${DEFAULT_INSTANCE_ID:-abacus}"
+            return line.partition(":-")[2].rstrip('}"')
+    raise AssertionError("DEFAULT_INSTANCE_ID not found in deploy.config.sh")
+
+
 class TestInstanceIdDerivation:
     def test_default_id_yields_suffixed_lakebase_target(self):
+        iid = _committed_instance_id()
         got = _source_config()
-        assert got["INSTANCE_ID"] == "09x"
-        assert got["APP_NAME"] == "ontobricks-09x"
-        assert got["MCP_APP_NAME"] == "mcp-ontobricks-09x"
-        assert got["DAB_TARGET"] == "dev-lakebase-09x"
+        assert got["INSTANCE_ID"] == iid
+        assert got["APP_NAME"] == f"ontobricks-{iid}"
+        assert got["MCP_APP_NAME"] == f"mcp-ontobricks-{iid}"
+        assert got["DAB_TARGET"] == f"dev-lakebase-{iid}"
         # Resource keys stay static — isolation is the target, not the key.
         assert got["APP_RESOURCE_KEY"] == "ontobricks_dev_app"
         assert got["MCP_APP_RESOURCE_KEY"] == "mcp_ontobricks_app"
@@ -78,9 +89,10 @@ class TestInstanceIdDerivation:
         assert got["DAB_TARGET"] == "dev-lakebase-080"
 
     def test_legacy_target_override_keeps_unsuffixed_name(self):
+        iid = _committed_instance_id()
         got = _source_config(env={"DEFAULT_DAB_TARGET": "dev-lakebase"})
         assert got["DAB_TARGET"] == "dev-lakebase"
-        assert got["APP_NAME"] == "ontobricks-09x"
+        assert got["APP_NAME"] == f"ontobricks-{iid}"
 
     def test_dab_backend_knob_is_gone(self):
         assert "DEFAULT_DAB_BACKEND" not in CONFIG.read_text()

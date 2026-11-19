@@ -576,7 +576,7 @@ class LakebaseFlatStore(LakebaseBase):
         timeout_ms = get_graph_query_timeout_s() * 1000
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(f'SET search_path TO "{self._schema}", public')
+                cur.execute('SET search_path TO "%s", public' % self._schema.replace('"', '""'))
                 # Bound graph reads so a runaway traversal is cancelled
                 # server-side instead of pinning the pooled connection.
                 #
@@ -836,7 +836,7 @@ class LakebaseFlatStore(LakebaseBase):
         with pool.connection() as conn:
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(f'SET search_path TO "{self._schema}", public')
+                    cur.execute('SET search_path TO "%s", public' % self._schema.replace('"', '""'))
                     yield conn, cur
 
     def _copy_insert_batch_phy(self, phy: str, batch: List[Dict[str, str]]) -> int:

@@ -646,7 +646,13 @@
                                             <div class="form-check">
                                                 <input class="form-check-input" type="checkbox" id="provGrantUcCatalog">
                                                 <label class="form-check-label small" for="provGrantUcCatalog">
-                                                    Grant <code>ALL_PRIVILEGES</code> on the configured UC catalog (managed sync only)
+                                                    Grant schema-scoped readback on the configured UC catalog (managed sync only)
+                                                </label>
+                                            </div>
+                                            <div class="form-check">
+                                                <input class="form-check-input" type="checkbox" id="provGrantSuperusers">
+                                                <label class="form-check-label small" for="provGrantSuperusers">
+                                                    Promote workspace admins to <code>DATABRICKS_SUPERUSER</code> (opt-in; bypasses schema ACLs)
                                                 </label>
                                             </div>
                                         </div>

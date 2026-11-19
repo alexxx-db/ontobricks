@@ -330,7 +330,7 @@ async def initialize_registry(
 
     On the Lakebase backend this also self-serves the project/schema/UC
     grants the app + MCP service principals need (in-app port of
-    ``scripts/bootstrap-lakebase-perms.sh``); the per-SP outcome is
+    ``scripts/bootstrap/lakebase-perms.sh``); the per-SP outcome is
     returned under the ``permissions`` key.
     """
     return await run_blocking(
@@ -348,7 +348,7 @@ async def grant_registry_permissions(
 ):
     """Re-apply Lakebase grants for the registry schema to the app SPs.
 
-    Admin-only, in-app equivalent of ``scripts/bootstrap-lakebase-perms.sh``:
+    Admin-only, in-app equivalent of ``scripts/bootstrap/lakebase-perms.sh``:
     grants ``CAN_USE`` on the project, ``USAGE``/DML on the registry schema,
     and ``ALL_PRIVILEGES`` on the UC catalog to the app + MCP service
     principals. Idempotent — safe to re-run after a rebind/redeploy that

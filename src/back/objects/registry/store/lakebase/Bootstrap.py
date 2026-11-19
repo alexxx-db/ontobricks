@@ -55,7 +55,7 @@ class Bootstrap:
         though the tables exist and hold data — turning the panel
         into a misleading "not initialised, 0 rows everywhere"
         screen. Surfacing the explicit reason lets the operator
-        run ``scripts/bootstrap-lakebase-perms.sh`` and move on
+        run ``scripts/bootstrap/lakebase-perms.sh`` and move on
         instead of hunting for a phantom data loss.
         """
         try:
@@ -86,7 +86,7 @@ class Bootstrap:
                         msg = (
                             f"Role '{cur_user}' lacks USAGE on schema "
                             f"'{self._schema}' in database '{cur_db}'. "
-                            f"Run scripts/bootstrap-lakebase-perms.sh "
+                            f"Run scripts/bootstrap/lakebase-perms.sh "
                             f"-i <instance> -d {cur_db} -s {self._schema} "
                             f"-a <app-name>, or GRANT USAGE ON SCHEMA "
                             f"\"{self._schema}\" TO \"{cur_user}\" "
@@ -370,7 +370,7 @@ class Bootstrap:
     def grant_app_permissions(
         self, *, app_names: List[str], uc_catalog: str = ""
     ) -> Dict[str, Any]:
-        """In-app port of ``scripts/bootstrap-lakebase-perms.sh`` (registry schema).
+        """In-app port of ``scripts/bootstrap/lakebase-perms.sh`` (registry schema).
 
         Runs as the app's own service principal, which **owns** the
         registry schema after *Initialize* and can therefore ``GRANT`` to
@@ -452,9 +452,9 @@ class Bootstrap:
             logger.warning("Registry schema grants failed to run: %s", exc)
             warnings.append(f"Schema grants could not run ({exc}).")
 
-        # ── Unity Catalog ALL_PRIVILEGES (managed_synced readback) ───────
+        # ── Unity Catalog grants (managed_synced readback) ──────────────
         if uc_catalog:
-            g, w = grant_uc_catalog(api, uc_catalog, sp_ids)
+            g, w = grant_uc_catalog(api, uc_catalog, sp_ids, uc_schema=self._schema)
             granted.extend(g)
             warnings.extend(w)
 

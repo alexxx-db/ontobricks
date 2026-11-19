@@ -231,3 +231,28 @@ def test_test_connection_uses_inline_query():
     assert success is True
     assert "successful" in message
     execute.assert_called_once_with("SELECT 1")
+
+
+def test_poll_interval_backs_off_for_long_running_statements():
+    pending = _response(
+        {"statement_id": "stmt-1", "status": {"state": "RUNNING"}}
+    )
+    done = _response(
+        _succeeded(
+            columns=[{"name": "value", "type_name": "STRING"}],
+            data_array=[["x"]],
+        )
+    )
+    sleeps = []
+    with patch(
+        "back.core.databricks.StatementExecutionWarehouse.requests.request",
+        side_effect=[pending, pending, pending, pending, done],
+    ), patch(
+        "back.core.databricks.StatementExecutionWarehouse.time.sleep",
+        side_effect=lambda s: sleeps.append(s),
+    ):
+        rows = StatementExecutionWarehouse(_auth()).execute_query("SELECT 1")
+
+    assert rows == [{"value": "x"}]
+    # doubles from 0.2 and clamps at 1 s instead of fixed 200 ms polling
+    assert sleeps == [0.2, 0.4, 0.8, 1.0]

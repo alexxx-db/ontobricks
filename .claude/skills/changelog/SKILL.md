@@ -1,6 +1,6 @@
 ---
 name: changelog
-description: Use after any code change (feature, fix, refactor, review fixup) to update /changelogs/YYYY-MM-DD.log and run the test suite. Mandatory post-change routine — see .cursorrules.
+description: Use after any code change (feature, fix, refactor, review fixup) to update /changelogs/vX.Y.Z/<github-user>_YYYY-MM-DD.log and run the test suite. Mandatory post-change routine — see .cursorrules.
 ---
 
 # Post-change routine
@@ -11,8 +11,13 @@ specifies *what* must be present but not the exact layout.
 
 ## Procedure
 
-1. **Get today's date** — `Shell`: `date +%F` → filename `changelogs/YYYY-MM-DD.log`.
-2. **Append** if the file exists, **create** if not. One file per day, multiple sections allowed.
+1. **Resolve the path** — version from `pyproject.toml` → directory
+   `changelogs/vX.Y.Z/`; filename `<github-user>_YYYY-MM-DD.log` (github
+   username prefix, today's date via `date +%F`). Full path:
+   `changelogs/vX.Y.Z/<github-user>_YYYY-MM-DD.log`
+   (e.g. `changelogs/v0.2.1/benoitcayladbx_2026-05-20.log`).
+2. **Append** if the file exists, **create** if not. One file per user per
+   day, multiple sections allowed.
 3. **Write the section in English** (layout below). User language is irrelevant
    — `.cursor/05 §English-only artifacts`. Never write `/changelogs/` in French
    or any other language.

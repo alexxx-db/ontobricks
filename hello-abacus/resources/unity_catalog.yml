@@ -1,0 +1,18 @@
+resources:
+  schemas:
+    app_data:
+      catalog_name: ${var.catalog}
+      name: hello_abacus
+      comment: Unity Catalog data the hello-abacus app owns. Its tables hold no PHI.
+      # The viewers and implementers read the data, because the app reads as the person.
+      # The admin groups already hold ALL_PRIVILEGES on the catalog. USE CATALOG on the
+      # catalog is its owner's to grant.
+      grants:
+        - principal: ${var.app_viewers_group}
+          privileges:
+            - USE_SCHEMA
+            - SELECT
+        - principal: ${var.implementers_group}
+          privileges:
+            - USE_SCHEMA
+            - SELECT

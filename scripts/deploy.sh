@@ -159,6 +159,7 @@ IS_LAKEBASE=false
 _dab_var_overrides=(
     "--var=app_name=${APP_NAME}"
     "--var=mcp_app_name=${MCP_APP_NAME}"
+    "--var=app_access_group=${APP_ACCESS_GROUP:-users}"
     "--var=warehouse_id=${WAREHOUSE_ID}"
     "--var=registry_catalog=${REGISTRY_CATALOG}"
     "--var=registry_schema=${REGISTRY_SCHEMA}"
@@ -450,7 +451,7 @@ if $IS_LAKEBASE && $DO_BOOTSTRAP; then
         if [[ $_PREFLIGHT_WARNINGS -gt 0 ]]; then
             info "preflight passed with ${_PREFLIGHT_WARNINGS} warning(s) — review messages above."
         else
-            ok "bootstrap-lakebase-perms.sh and registry migrations ready"
+            ok "scripts/bootstrap/lakebase-perms.sh and registry migrations ready"
         fi
     fi
 fi
@@ -505,6 +506,20 @@ else
     require_file "app.yaml" "needed when --skip-app-yaml is used (nothing to render onto)"
     info "skipped (--skip-app-yaml) — using the existing app.yaml as-is"
 fi
+
+# ── 3b. Offline dependency artifact ────────────────────────────────────
+# The workspace has no PyPI egress: both apps install only the wheels
+# vendored under vendor/ and src/mcp-server/vendor/ (hello-abacus pattern).
+# Build them when a uv.lock changed (needs internet); --dry-run only checks.
+begin_step "Offline dependency artifact"
+if $DRY_RUN; then
+    bash scripts/build_artifact.sh --check \
+        || die "vendored wheels are missing or stale — run 'make artifact' on a machine that can reach PyPI."
+else
+    bash scripts/build_artifact.sh \
+        || die "building the vendored wheels failed — 'make artifact' needs uv and PyPI access."
+fi
+ok "vendor/ and src/mcp-server/vendor/ match their uv.lock"
 
 # ── 4. Validate bundle ──────────────────────────────────────────────
 begin_step "Validate bundle"
@@ -656,8 +671,11 @@ begin_step "Verify synced source"
 # already burned us that way.
 _CRITICAL_SYNCED_FILES=(
     "run.py"
+    "vendor_bootstrap.py"
+    "vendor/requirements.txt"
     "pyproject.toml"
     "src/mcp-server/pyproject.toml"
+    "src/mcp-server/vendor/requirements.txt"
     "src/mcp-server/app.yaml"
     "src/mcp-server/app.yaml.template"
     "src/back/objects/registry/collab/__init__.py"
@@ -884,7 +902,7 @@ fi
 # This script is registry-scoped: it only grants on the REGISTRY schema.
 # The graph DB is configured in-app (Settings → Graph DB) and may live in
 # a different Lakebase project, so its grants are handled by the in-app
-# "Create graph DB" flow (or a manual bootstrap-lakebase-perms.sh run
+# "Create graph DB" flow (or a manual scripts/bootstrap/lakebase-perms.sh run
 # with the explicit graph project/database/schema).
 #
 # Re-running the bootstrap is idempotent, so we do it on every
@@ -892,11 +910,14 @@ fi
 if $IS_LAKEBASE; then
     begin_step "Lakebase schema permissions"
     chmod +x scripts/bootstrap/lakebase-perms.sh
-    # Pass the registry catalog so bootstrap also grants UC ALL_PRIVILEGES —
-    # required for the SP to read back synced tables via the Lakebase API.
+    # Pass the registry catalog + UC schema so bootstrap grants the
+    # least-privilege UC set (USE_CATALOG + CREATE_SCHEMA on the catalog,
+    # USE_SCHEMA + SELECT on the sync schema) — required for the SP to read
+    # back synced tables via the Lakebase API. Synced tables register under
+    # <catalog>.<pg schema name> by convention. UC_SCHEMA env overrides.
     _UC_CATALOG_ARG=()
     if [[ -n "${REGISTRY_CATALOG:-}" ]]; then
-        _UC_CATALOG_ARG=(-c "$REGISTRY_CATALOG")
+        _UC_CATALOG_ARG=(-c "$REGISTRY_CATALOG" -S "${UC_SCHEMA:-$LAKEBASE_SCHEMA}")
     fi
 
     if ! scripts/bootstrap/lakebase-perms.sh \
@@ -910,7 +931,7 @@ if $IS_LAKEBASE; then
         echo ""
         echo "  ⚠ Lakebase permission bootstrap did not complete cleanly."
         _lakebase_print_diag_hints \
-            "bootstrap-lakebase-perms.sh failed (connection, endpoint, or schema grants)" \
+            "scripts/bootstrap/lakebase-perms.sh failed (connection, endpoint, or schema grants)" \
             "${LAKEBASE_PROJECT}" "${LAKEBASE_BRANCH}" \
             "${LAKEBASE_DATABASE}" "${LAKEBASE_DATABASE_RESOURCE_SEGMENT:-}" "${CONFIG_FILE}"
         echo "    Re-run after fixing grants:"
@@ -919,7 +940,7 @@ if $IS_LAKEBASE; then
         echo "        -b $LAKEBASE_BRANCH \\"
         echo "        -d $LAKEBASE_DATABASE \\"
         echo "        -s $LAKEBASE_SCHEMA \\"
-        echo "        ${_UC_CATALOG_ARG[*]:+-c $REGISTRY_CATALOG \\}"
+        echo "        ${_UC_CATALOG_ARG[*]:+-c $REGISTRY_CATALOG -S ${UC_SCHEMA:-$LAKEBASE_SCHEMA} \\}"
         echo "        -a $APP_NAME -a $MCP_APP_NAME"
     fi
 fi

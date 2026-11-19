@@ -521,7 +521,7 @@ class RegistrySettings:
                     exc_info=True,
                 )
             # Self-serve the Lakebase grants the app + MCP service principals
-            # need (in-app port of scripts/bootstrap-lakebase-perms.sh). The
+            # need (in-app port of scripts/bootstrap/lakebase-perms.sh). The
             # app SP owns the schema it just created, so the Postgres grants
             # always apply; CAN_USE / UC grants are best-effort. Failures are
             # surfaced in the payload, never fatal to Initialize itself.
@@ -604,7 +604,7 @@ class RegistrySettings:
     ) -> Dict[str, Any]:
         """Explicit *Repair permissions* action for the Registry page.
 
-        In-app equivalent of ``scripts/bootstrap-lakebase-perms.sh`` for the
+        In-app equivalent of ``scripts/bootstrap/lakebase-perms.sh`` for the
         registry schema: re-applies CAN_USE on the project, USAGE/DML on the
         schema, and ALL_PRIVILEGES on the UC catalog to the app + MCP service
         principals. Idempotent and safe to re-run after a rebind/redeploy.

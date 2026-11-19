@@ -1,9 +1,10 @@
 # OntoBricks — Databricks Apps deployment
-# Only install uv here. Runtime dependencies are installed by
-# `uv run --frozen --no-install-project` (app.yaml) straight from uv.lock,
-# whose wheels are pinned to files.pythonhosted.org.
 #
-# Do NOT add `-e .`: it forces a PEP 517 isolated build that downloads the
-# `hatchling` build backend. run.py already puts src/ on sys.path, so the
-# project itself never needs installing.
-uv
+# Intentionally installs nothing. The workspace has no PyPI egress, so any
+# package named here would fail the Apps build. Every runtime dependency is a
+# vendored wheel under vendor/ (scripts/build_artifact.sh, per hello-abacus),
+# installed offline by vendor_bootstrap.py, the app command in app.yaml.
+# Some of those wheels are split into chunks to stay under the Apps file size
+# limit, which is why pip cannot install them from this file at build time.
+#
+# Do NOT add `uv` or `-e .` back: both need a package index.

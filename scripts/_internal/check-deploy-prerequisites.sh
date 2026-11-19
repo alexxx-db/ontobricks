@@ -102,7 +102,7 @@ if $IS_LAKEBASE; then
     require_var LAKEBASE_BRANCH
     require_var LAKEBASE_DATABASE
     require_var LAKEBASE_SCHEMA
-    _preflight_require_cmd psql "required for bootstrap-lakebase-perms.sh — brew install libpq && brew link --force libpq"
+    _preflight_require_cmd psql "required for scripts/bootstrap/lakebase-perms.sh — brew install libpq && brew link --force libpq"
 fi
 _preflight_ok "deploy.config.sh values present"
 

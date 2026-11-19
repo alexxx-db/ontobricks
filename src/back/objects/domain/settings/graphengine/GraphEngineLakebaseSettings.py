@@ -366,7 +366,7 @@ class GraphEngineLakebaseSettings:
         Creates the Lakebase instance/project + Postgres database + graph
         schema and grants ``CAN_USE`` on the project plus schema privileges
         to the app + MCP service principals — the in-app equivalent of
-        ``scripts/setup-lakebase.sh`` + ``scripts/bootstrap-lakebase-perms.sh``.
+        ``scripts/setup-lakebase.sh`` + ``scripts/bootstrap/lakebase-perms.sh``.
 
         Runs in a worker thread tracked by the shared :class:`TaskManager`;
         the route returns a ``task_id`` the UI polls via ``GET /tasks/{id}``.
@@ -441,13 +441,11 @@ class GraphEngineLakebaseSettings:
 
         saved_cfg = lakebase_section(saved_cfg)
         sync_mode = (saved_cfg.get("sync_mode") or "app_managed").strip()
-        uc_catalog = ""
-        if (
+        uc_catalog = (saved_cfg.get("sync_uc_catalog") or "").strip() if (
             app_mode
             and bool(params.get("grant_uc_catalog"))
             and sync_mode == "managed_synced"
-        ):
-            uc_catalog = (saved_cfg.get("sync_uc_catalog") or "").strip()
+        ) else ""
 
         tm = get_task_manager()
         task = tm.create_task(
@@ -456,6 +454,7 @@ class GraphEngineLakebaseSettings:
             steps=provision_steps(
                 grant_uc=bool(uc_catalog),
                 grant_app_permissions=app_mode,
+                grant_superusers=bool(params.get("grant_superusers")),
             ),
         )
 
@@ -473,6 +472,7 @@ class GraphEngineLakebaseSettings:
                 uc_catalog=uc_catalog,
                 pg_user=pg_user,
                 operator_email=email,
+                grant_superusers=bool(params.get("grant_superusers")),
             ).run()
 
         thread = threading.Thread(target=run_provision, daemon=True)

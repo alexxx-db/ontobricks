@@ -1,0 +1,20 @@
+resources:
+  sql_warehouses:
+    warehouse:
+      name: hello-abacus${var.name_suffix}
+      warehouse_type: PRO
+      enable_serverless_compute: true
+      cluster_size: 2X-Small
+      min_num_clusters: 1
+      max_num_clusters: 1
+      auto_stop_mins: 10
+      # Users query as themselves, so each needs CAN_USE.
+      permissions:
+        - group_name: ${var.app_viewers_group}
+          level: CAN_USE
+        - group_name: ${var.implementers_group}
+          level: CAN_USE
+        - group_name: ${var.workspace_admins_group}
+          level: CAN_USE
+        - group_name: ${var.tenant_admins_group}
+          level: CAN_USE

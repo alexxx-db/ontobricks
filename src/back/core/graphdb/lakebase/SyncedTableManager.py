@@ -684,7 +684,7 @@ class SyncedTableManager:
                     f"Root causes in order of likelihood:\n"
                     f"  1. The app SP lacks CAN_USE on the Lakebase Autoscaling "
                     f"project — the /api/2.0/permissions/database-instances grant "
-                    f"used by bootstrap-lakebase-perms.sh may not apply to "
+                    f"used by scripts/bootstrap/lakebase-perms.sh may not apply to "
                     f"Autoscaling projects.  Re-run the bootstrap script and verify "
                     f"the grant appears in the project's ACL.\n"
                     f"  2. The SP lacks SELECT on the Unity Catalog table — run: "

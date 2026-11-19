@@ -1,0 +1,7 @@
+name: items
+version: 1
+summary: Create and list items, as app-owned state in Lakebase.
+ports: [identity, app_state]
+resources: [database]
+scopes: [postgres]
+source: null

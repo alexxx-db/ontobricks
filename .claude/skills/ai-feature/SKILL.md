@@ -9,7 +9,7 @@ Triggered automatically for any change under `src/agents/**`, `src/back/core/age
 
 ## Why this exists
 
-OntoBricks ships **5 production agents** (`agent_owl_generator`, `agent_ontology_assistant`, `agent_auto_assignment`, `agent_auto_icon_assign`, `agent_dtwin_chat`) with **zero eval coverage today**. A prompt regression or a tool-handler bug ships green because the existing tests only mock the LLM. This skill enforces a SPEC-first + eval-gated lifecycle so quality is observable.
+OntoBricks ships **10 agent packages** under `src/agents/` (`agent_owl_generator`, `agent_ontology_assistant`, `agent_auto_assignment`, `agent_auto_icon_assign`, `agent_dtwin_chat`, `agent_supervisor`, `agent_business_rules_generator`, `agent_cohort`, `agent_graph_interpreter`, `agent_mapping_pge`) with **uneven eval coverage** — `tests/eval/datasets/` covers most agents but run-harnesses (`tests/eval/run_*.py`) exist for only a few. A prompt regression on an uncovered path still ships green because unit tests mock the LLM. This skill enforces a SPEC-first + eval-gated lifecycle so quality is observable.
 
 ## Procedure
 
@@ -60,7 +60,7 @@ Row shape (JSON-Lines, one example per line):
 Sources:
 
 - **Hand-curated**: from product team intuition, real user requests, existing screenshots.
-- **Synthetic**: use the `databricks-synthetic-data-generation` skill to bootstrap. Tag as `tags: ["synthetic"]` so reviewers know.
+- **Synthetic**: use the `databricks-synthetic-data-gen` skill to bootstrap. Tag as `tags: ["synthetic"]` so reviewers know.
 - **Regression**: every production-trace failure that you fix gets added here. Never deleted.
 
 ### 4. Wire the eval harness
@@ -120,10 +120,8 @@ Borderline cases get the `superpowers:requesting-code-review` invocation, then a
 ## Cross-references
 
 - `.cursor/12-ai-feature-lifecycle.mdc` — the rule that gates this work.
-- §3.5 of `/Users/dermot.smyth/.claude/plans/ultrathink-perform-a-detailed-whimsical-token.md` — methodology context.
 - `src/agents/engine_base.py` — the runtime pattern to follow.
 - `tests/fixtures/http.py` — `agent_mock_transport` for unit tests.
 - `tests/fixtures/mlflow.py` — `captured_traces` for span-shape assertions.
-- `databricks-mlflow-evaluation` (plugin skill) — the harness.
-- `databricks-synthetic-data-generation` (plugin skill) — dataset cold-start.
-- `agent-evaluation` (plugin skill) — umbrella for the eval flow.
+- `databricks-mlflow-evaluation` (plugin skill) — the eval harness.
+- `databricks-synthetic-data-gen` (plugin skill) — dataset cold-start.

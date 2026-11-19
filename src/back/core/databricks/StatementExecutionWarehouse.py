@@ -23,7 +23,10 @@ logger = get_logger(__name__)
 _STATEMENTS_PATH = "/api/2.0/sql/statements"
 _INLINE_BYTE_LIMIT = 24 * 1024 * 1024
 _MAX_INITIAL_WAIT_SECONDS = 50
+# Start polling fast (short statements finish inside the first checks) and
+# back off to a 1 s cadence so long-running statements don't hammer the API.
 _POLL_INTERVAL_SECONDS = 0.2
+_POLL_INTERVAL_MAX_SECONDS = 1.0
 _TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELED", "CLOSED"}
 _INTEGER_TYPES = {"BYTE", "SHORT", "INT", "INTEGER", "LONG", "BIGINT"}
 _FLOAT_TYPES = {"FLOAT", "DOUBLE"}
@@ -79,6 +82,7 @@ class StatementExecutionWarehouse:
         deadline: float,
     ) -> Dict[str, Any]:
         statement_id = str(payload.get("statement_id") or "")
+        poll_s = _POLL_INTERVAL_SECONDS
         while self._state(payload) not in _TERMINAL_STATES:
             if not statement_id:
                 raise InfrastructureError(
@@ -91,7 +95,8 @@ class StatementExecutionWarehouse:
                     "Databricks SQL query timed out",
                     detail=f"Statement {statement_id} timed out before completion",
                 )
-            time.sleep(_POLL_INTERVAL_SECONDS)
+            time.sleep(poll_s)
+            poll_s = min(poll_s * 2, _POLL_INTERVAL_MAX_SECONDS)
             payload = self._request("GET", f"{_STATEMENTS_PATH}/{statement_id}")
         return payload
 

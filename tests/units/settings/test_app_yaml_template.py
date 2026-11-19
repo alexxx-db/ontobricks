@@ -98,13 +98,17 @@ class TestJobToggleIsOptIn:
 
 
 class TestStartCommandExtras:
-    """``uv run --extra X`` aborts when X is not a declared extra.
+    """``uv export --extra X`` aborts when X is not a declared extra.
 
-    The Neo4j driver was promoted to a core dependency, but the template kept
-    passing ``--extra neo4j``. Every deploy then installed cleanly and crashed on
-    the first line of startup with "Extra `neo4j` is not defined in the
-    optional-dependencies table" — a four-minute build to reach a one-line
+    The Neo4j driver was promoted to a core dependency, but the start command
+    kept passing ``--extra neo4j``. Every deploy then installed cleanly and
+    crashed on the first line of startup with "Extra `neo4j` is not defined in
+    the optional-dependencies table" — a four-minute build to reach a one-line
     failure that nothing checked for.
+
+    The extras now live in ``scripts/build_artifact.sh``, which vendors the
+    main app's dependencies as wheels (the workspace has no PyPI egress); the
+    app command only runs ``vendor_bootstrap.py``.
     """
 
     @staticmethod
@@ -113,12 +117,16 @@ class TestStartCommandExtras:
 
     @staticmethod
     def _requested_extras() -> list:
-        command = _render().get("command") or []
-        return [
-            command[i + 1]
-            for i, token in enumerate(command)
-            if token == "--extra" and i + 1 < len(command)
-        ]
+        script = (REPO_ROOT / "scripts" / "build_artifact.sh").read_text()
+        main_app = [ln.split() for ln in script.splitlines() if ln.startswith("build_one . ")]
+        assert len(main_app) == 1, "expected exactly one `build_one . ...` line for the main app"
+        tokens = main_app[0]
+        return [tokens[i + 1] for i, t in enumerate(tokens) if t == "--extra" and i + 1 < len(tokens)]
+
+    def test_command_installs_offline_then_runs_the_app(self):
+        """No package index at start time: no ``uv run``, only the bootstrap."""
+        assert _render().get("command") == ["python", "vendor_bootstrap.py"]
+        assert (REPO_ROOT / "vendor_bootstrap.py").is_file()
 
     def test_every_requested_extra_is_declared(self):
         declared = self._declared_extras()
